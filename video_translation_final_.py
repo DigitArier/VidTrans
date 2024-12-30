@@ -19,14 +19,14 @@ logger = logging.getLogger(__name__)
 
 # Geschwindigkeitseinstellungen
 SPEED_FACTOR_RESAMPLE_44100 = 1.25  # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
-SPEED_FACTOR_PLAYBACK = 0.8     # Geschwindigkeitsfaktor für die Wiedergabe des Videos
+SPEED_FACTOR_PLAYBACK = 0.9     # Geschwindigkeitsfaktor für die Wiedergabe des Videos
 
 # Lautstärkeanpassungen
-VOLUME_ADJUSTMENT_44100 = 1.5   # Lautstärkefaktor für 44.100 Hz (Stereo)
-VOLUME_ADJUSTMENT_VIDEO = 0.5   # Lautstärkefaktor für das Video
+VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
+VOLUME_ADJUSTMENT_VIDEO = 0.02   # Lautstärkefaktor für das Video
 
 # Dateipfade
-VIDEO_PATH = "40 Bible verses that prove the True Shape of the Earth_HD.mp4"
+VIDEO_PATH = "Man With 200 IQ Explains Hell & God_Full-HD.mp4"
 ORIGINAL_AUDIO_PATH = "original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 SAMPLE_PATH = "sample.wav"
@@ -36,7 +36,7 @@ TRANSLATION_FILE = "translation.json"
 TRANSLATED_AUDIO_WITH_PAUSES = "translated_audio_with_pauses.wav"
 RESAMPLED_AUDIO_FOR_MIXDOWN = "resampled_audio_44100.wav"
 ADJUSTED_VIDEO_PATH = "adjusted_video.mp4"
-FINAL_VIDEO_PATH = "40 Bible verses that prove the True Shape of the Earth_HD_deutsch.mp4"
+FINAL_VIDEO_PATH = "Man With 200 IQ Explains Hell & God_Full-HD_deutsch.mp4"
 
 # ============================== 
 # Hilfsfunktionen
@@ -161,8 +161,8 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
             with open(transcription_file, "r", encoding="utf-8") as file:
                 return json.load(file)
     try:
-        logger.info("Lade Whisper-Modell (large-v2)...")
-        model = whisper.load_model("large-v2")
+        logger.info("Lade Whisper-Modell (large-v3)...")
+        model = whisper.load_model("large-v3")
         logger.info("Starte Transkription...")
         result = model.transcribe(audio_file, verbose=True, language="en")
         segments = result.get("segments", [])
@@ -182,6 +182,9 @@ def translate_segments(segments, translation_file, source_lang="en", target_lang
             with open(translation_file, "r", encoding="utf-8") as file:
                 return json.load(file)
     try:
+        if not segments:
+            logger.error("Keine Segmente für die Übersetzung gefunden.")
+            return []
         model_name = f"Helsinki-NLP/opus-mt-{source_lang}-{target_lang}"
         logger.info(f"Lade Übersetzungsmodell: {model_name}")
         tokenizer = MarianTokenizer.from_pretrained(model_name)
@@ -199,7 +202,7 @@ def translate_segments(segments, translation_file, source_lang="en", target_lang
         logger.error(f"Fehler bei der Übersetzung: {e}")
         return []
 
-def text_to_speech_with_voice_cloning(segments, sample_path, output_path, speed=1.0):
+def text_to_speech_with_voice_cloning(segments, sample_path, output_path):
     """Führt die Umwandlung von Text zu Sprache durch (TTS), inklusive Stimmenklonung basierend auf sample.wav."""
     if os.path.exists(output_path):
         logger.info(f"TTS-Audio bereits vorhanden: {output_path}")
@@ -218,9 +221,7 @@ def text_to_speech_with_voice_cloning(segments, sample_path, output_path, speed=
             audio_clip = tts.tts(
                 text=translated_text,
                 speaker_wav=sample_path,
-                emotion="Neutral",
                 language="de",
-                speed=speed
             )
             clip_length = len(audio_clip) / sampling_rate
             pause_duration = max(0, duration - clip_length)
@@ -239,33 +240,52 @@ def resample_to_44100_stereo(input_path, output_path, speed_factor):
         if not ask_overwrite(output_path):
             logger.info(f"Verwende vorhandene Datei: {output_path}")
             return
+
     try:
-        audio, sr = librosa.load(input_path, sr=None, mono=False)
+        # Lade Audio in mono (falls im Original), dann dupliziere ggf. auf 2 Kanäle
+        audio, sr = librosa.load(input_path, sr=None, mono=True)
+        audio = np.vstack([audio, audio])  # Duplicate mono channel to create stereo
         logger.info(f"Original-Samplingrate: {sr} Hz")
+
         target_sr = 44100
+
+        # Resample auf 44.100 Hz
         if sr != target_sr:
-            if len(audio.shape) == 1:
-                audio = np.vstack([audio, audio])
-                logger.info("Mono-Audio wurde auf 2 Kanäle dupliziert.")
-            audio_resampled = librosa.resample(audio, orig_sr=sr, target_sr=target_sr, axis=1)
+            audio_resampled = np.vstack([
+                librosa.resample(audio[channel], orig_sr=sr, target_sr=target_sr)
+                for channel in range(audio.shape[0])
+            ])
         else:
             audio_resampled = audio
+
+        # Wiedergabegeschwindigkeit anpassen
         if speed_factor != 1.0:
-            if len(audio_resampled.shape) == 2:
-                stretched_channels = []
-                for channel_data in audio_resampled:
-                    stretched_channels.append(librosa.effects.time_stretch(channel_data, rate=speed_factor))
-                audio_stretched = np.vstack(stretched_channels)
-            else:
-                audio_stretched = librosa.effects.time_stretch(audio_resampled, rate=speed_factor)
+            stretched_channels = [
+                librosa.effects.time_stretch(audio_resampled[channel], rate=speed_factor)
+                for channel in range(audio_resampled.shape[0])
+            ]
+            audio_stretched = np.vstack(stretched_channels)
         else:
             audio_stretched = audio_resampled
-        audio_adjusted = audio_stretched * VOLUME_ADJUSTMENT_44100
-        sf.write(output_path, audio_adjusted, samplerate=target_sr)
-        logger.info(
-            f"Audio auf {target_sr} Hz (Stereo) resampled, Geschwindigkeitsfaktor={speed_factor}, "
-            f"Lautstärkeanpassung={VOLUME_ADJUSTMENT_44100}. Datei: {output_path}"
+
+        # Wandle Daten in np.int16 um und speichere als WAV mit PCM-16
+        audio_int16 = (audio_stretched * 32767).astype(np.int16)  # Convert to int16 range
+
+        # Hier format und subtype explizit angeben:
+        sf.write(
+            output_path,
+            audio_int16.T,  # Transpose to match (samples, channels) format
+            samplerate=target_sr,
+            format="WAV",
+            subtype="PCM_16"
         )
+        logger.info("\n".join([
+            f"Audio auf {target_sr} Hz (Stereo) resampled:",
+            f"- Geschwindigkeitsfaktor: {speed_factor}",
+            f"- Lautstärkeanpassung: {VOLUME_ADJUSTMENT_44100}",
+            f"- Datei: {output_path}"
+        ]))
+
     except Exception as e:
         logger.error(f"Fehler beim Resampling auf 44.100 Hz: {e}")
 
@@ -281,7 +301,7 @@ def adjust_playback_speed(video_path, adjusted_video_path, speed_factor):
         ffmpeg.input(video_path).output(
             adjusted_video_path,
             vf=f"setpts={video_speed}*PTS",
-                        af=f"atempo={audio_speed},volume={VOLUME_ADJUSTMENT_VIDEO}"
+                        af=f"atempo={audio_speed}"
         ).run(overwrite_output=True)
         logger.info(
             f"Videogeschwindigkeit angepasst (Faktor={speed_factor}) "
@@ -307,10 +327,13 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
             return
     try:
         filter_complex = (
+            f"[0:a]volume={VOLUME_ADJUSTMENT_VIDEO}[a1];"  # Reduziere die Lautstärke des Originalvideos
+            f"[1:a]volume={VOLUME_ADJUSTMENT_44100}[a2];"  # Halte die Lautstärke des TTS-Audios konstant
             "[a1][a2]amix=inputs=2:duration=longest"
         )
         video_input = ffmpeg.input(adjusted_video_path)
         audio_input = ffmpeg.input(translated_audio_path)
+
         ffmpeg.output(
             video_input.video,
             audio_input.audio,
@@ -319,7 +342,8 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
             acodec="aac",
             strict="experimental",
             filter_complex=filter_complex,
-            map="0:v"
+            map="0:v",
+            map_metadata="-1"
         ).overwrite_output().run()
         logger.info(f"Finales Video erstellt und gemischt: {final_video_path}")
     except ffmpeg.Error as e:
@@ -363,7 +387,7 @@ def main():
         return
 
     # 8) Text-to-Speech (TTS) mit Stimmenklonung
-    text_to_speech_with_voice_cloning(translated_segments, SAMPLE_PATH, TRANSLATED_AUDIO_WITH_PAUSES, speed=1.0)
+    text_to_speech_with_voice_cloning(translated_segments, SAMPLE_PATH, TRANSLATED_AUDIO_WITH_PAUSES)
 
     # 9) Audio resamplen auf 44.100 Hz, Stereo (für Mixdown), inkl. separatem Lautstärke- und Geschwindigkeitsfaktor
     resample_to_44100_stereo(TRANSLATED_AUDIO_WITH_PAUSES, RESAMPLED_AUDIO_FOR_MIXDOWN, SPEED_FACTOR_RESAMPLE_44100)
