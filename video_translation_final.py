@@ -7,7 +7,7 @@ import numpy as np
 import json
 import scipy.signal as signal
 import torch
-from transformers import AutoTokenizer, MarianMTModel, MarianTokenizer
+from transformers import AutoTokenizer, MarianMTModel
 from TTS.api import TTS
 import whisper
 from pydub import AudioSegment
@@ -24,8 +24,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Geschwindigkeitseinstellungen
-SPEED_FACTOR_RESAMPLE_22050 = 0.95   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
-SPEED_FACTOR_RESAMPLE_44100 = 1.3  # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
+SPEED_FACTOR_RESAMPLE_22050 = 0.9   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
+SPEED_FACTOR_RESAMPLE_44100 = 1.4   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
 SPEED_FACTOR_PLAYBACK = 0.7         # Geschwindigkeitsfaktor für die Wiedergabe des Videos
 
 # Lautstärkeanpassungen
@@ -33,7 +33,7 @@ VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
 VOLUME_ADJUSTMENT_VIDEO = 0.05   # Lautstärkefaktor für das Video
 
 # Dateipfade
-VIDEO_PATH = "Joe Rogan Experience @2254 - Mel Gibson_HD_1.mp4"
+VIDEO_PATH = "Joe Rogan Experience @2254 - Mel Gibson_HD_2.mp4"
 ORIGINAL_AUDIO_PATH = "original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 SAMPLE_PATH = "sample.wav"
@@ -43,7 +43,7 @@ TRANSLATION_FILE = "translation.json"
 TRANSLATED_AUDIO_WITH_PAUSES = "translated_audio_with_pauses.wav"
 RESAMPLED_AUDIO_FOR_MIXDOWN = "resampled_audio_44100.wav"
 ADJUSTED_VIDEO_PATH = "adjusted_video.mp4"
-FINAL_VIDEO_PATH = "Joe Rogan Experience @2254 - Mel Gibson_HD_1_deutsch.mp4"
+FINAL_VIDEO_PATH = "Joe Rogan Experience @2254 - Mel Gibson_HD_2_deutsch.mp4"
 
 # ============================== 
 # Hilfsfunktionen
@@ -73,6 +73,36 @@ def extract_audio_ffmpeg(video_path, audio_output):
         logger.info(f"Audio extrahiert: {audio_output}")
     except ffmpeg.Error as e:
         logger.error(f"Fehler bei der Audioextraktion: {e}")
+
+def resample_to_22050_mono(input_path, output_path, speed_factor):
+    """Resample the audio to 24.000 Hz (Mono)."""
+    if os.path.exists(output_path):
+        if not ask_overwrite(output_path):
+            logger.info(f"Verwende vorhandene Datei: {output_path}")
+            return
+
+    try:
+        # Load the audio file
+        audio, sr = librosa.load(input_path, sr=None)  # Load with original sampling rate
+        logger.info(f"Original sampling rate: {sr} Hz")
+
+        # Adjust playback speed if necessary
+        if speed_factor != 1.0:
+            audio = librosa.effects.time_stretch(audio, rate=speed_factor)
+
+        # Resample to 22.050 Hz if needed
+        target_sr = 22050
+        if sr != target_sr:
+            audio_resampled = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
+        else:
+            audio_resampled = audio
+
+        # Save the resampled audio
+        sf.write(output_path, audio_resampled, samplerate=target_sr)
+        logger.info(f"Audio successfully resampled to {target_sr} Hz (Mono): {output_path}")
+
+    except Exception as e:
+        logger.error(f"Error during resampling to 22.050 Hz: {e}")
 
 def process_audio(input_file, output_file):
     if os.path.exists(output_file):
@@ -226,36 +256,6 @@ def create_voice_sample(audio_path, sample_path):
         except ffmpeg.Error as e:
             logger.error(f"Fehler beim Erstellen des Voice Samples: {e}")
 
-def resample_to_24000_mono(input_path, output_path, speed_factor):
-    """Resample the audio to 24.000 Hz (Mono)."""
-    if os.path.exists(output_path):
-        if not ask_overwrite(output_path):
-            logger.info(f"Verwende vorhandene Datei: {output_path}")
-            return
-
-    try:
-        # Load the audio file
-        audio, sr = librosa.load(input_path, sr=None)  # Load with original sampling rate
-        logger.info(f"Original sampling rate: {sr} Hz")
-
-        # Adjust playback speed if necessary
-        if speed_factor != 1.0:
-            audio = librosa.effects.time_stretch(audio, rate=speed_factor)
-
-        # Resample to 24.000 Hz if needed
-        target_sr = 24000
-        if sr != target_sr:
-            audio_resampled = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
-        else:
-            audio_resampled = audio
-
-        # Save the resampled audio
-        sf.write(output_path, audio_resampled, samplerate=target_sr)
-        logger.info(f"Audio successfully resampled to {target_sr} Hz (Mono): {output_path}")
-
-    except Exception as e:
-        logger.error(f"Error during resampling to 24.000 Hz: {e}")
-
 def transcribe_audio_with_timestamps(audio_file, transcription_file):
     """Führt eine Spracherkennung mit Whisper durch und speichert die Transkription (inkl. Zeitstempel) in einer JSON-Datei."""
     if os.path.exists(transcription_file):
@@ -264,15 +264,19 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
             with open(transcription_file, "r", encoding="utf-8") as file:
                 return json.load(file)
     try:
-        logger.info("Lade Whisper-Modell (large-v2)...")
-        model = whisper.load_model("large-v2")
+        logger.info("Lade Whisper-Modell (large-v3)...")
+        model = whisper.load_model("large-v3")
         logger.info("Starte Transkription...")
         result = model.transcribe(audio_file, verbose=True, language="en")
-        segments = result.get("segments", [])
+        #segments = result.get("segments", [])
+        # Anpassung der Timestamps (z.B. Verkürzung um 2 Sekunden)
+        for segment in result["segments"]:
+            segment["start"] = max(segment["start"] - 0, 0)  # Startzeit anpassen
+            segment["end"] = max(segment["end"] - 2, 0)      # Endzeit anpassen
         with open(transcription_file, "w", encoding="utf-8") as file:
-            json.dump(segments, file, ensure_ascii=False, indent=4)
+            json.dump(result["segments"], file, ensure_ascii=False, indent=4)
         logger.info("Transkription abgeschlossen!")
-        return segments
+        return result["segments"]
     except Exception as e:
         logger.error(f"Fehler bei der Transkription: {e}")
         return []
@@ -325,12 +329,13 @@ def text_to_speech_with_voice_cloning(segments, sample_path, output_path):
             audio_clip = tts.tts(
                 text=translated_text,
                 speaker_wav=sample_path,
-                language="de",
-                split_sentences=True
+                language="de"
                 )
             
+            text_length_factor = len(translated_text) * 0.02  # Kürzere Texte = kürzere Pausen
             clip_length = len(audio_clip) / sampling_rate
-            pause_duration = max(0, duration - clip_length)
+            pause_duration = max(0, duration - clip_length - text_length_factor)
+            #pause_duration = max(0, duration - clip_length -0.2)
             silence = np.zeros(int(pause_duration * sampling_rate))
             final_audio_segments.append(audio_clip)
             final_audio_segments.append(silence)
@@ -473,14 +478,14 @@ def main():
     # 2) Audiospur aus dem Video extrahieren (Mono, 44.1 kHz)
     extract_audio_ffmpeg(VIDEO_PATH, ORIGINAL_AUDIO_PATH)
 
-    # 3) Audioverarbeitung (Rauschunterdrückung und Lautheitsnormalisierung)
-    process_audio(ORIGINAL_AUDIO_PATH, PROCESSED_AUDIO_PATH)
+    # 3) Audio resamplen auf 22.050 Hz, Mono (für TTS)
+    resample_to_22050_mono(ORIGINAL_AUDIO_PATH, DOWNSAMPLED_AUDIO_PATH, SPEED_FACTOR_RESAMPLE_22050)
+ 
+    # 4) Audioverarbeitung (Rauschunterdrückung und Lautheitsnormalisierung)
+    process_audio(DOWNSAMPLED_AUDIO_PATH, PROCESSED_AUDIO_PATH)
 
-    # 4) Optional: Erstellung eines Voice-Samples für die Stimmenklonung
-    create_voice_sample(PROCESSED_AUDIO_PATH, SAMPLE_PATH)
-
-    # 5) Audio resamplen auf 22.050 Hz, Mono (für TTS)
-    resample_to_24000_mono(PROCESSED_AUDIO_PATH, DOWNSAMPLED_AUDIO_PATH, SPEED_FACTOR_RESAMPLE_22050)
+    # 5) Optional: Erstellung eines Voice-Samples für die Stimmenklonung
+    create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH)
 
     # 6) Spracherkennung (Transkription) mit Whisper
     segments = transcribe_audio_with_timestamps(DOWNSAMPLED_AUDIO_PATH, TRANSCRIPTION_FILE)
