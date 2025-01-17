@@ -7,16 +7,17 @@ import numpy as np
 import json
 import scipy.signal as signal
 import torch
+import time
 from config import *
 from transformers import AutoTokenizer, MarianMTModel
 from TTS.api import TTS
 import whisper
-from pydub import AudioSegment
-from pydub.effects import high_pass_filter, low_pass_filter, normalize
+#from pydub import AudioSegment
+#from pydub.effects import high_pass_filter, low_pass_filter, normalize
 #from pyloudnorm import Meter, normalize
-import webrtcvad
-import wave
-import collections
+#import webrtcvad
+#import wave
+#import collections
 
 # ============================== 
 # Globale Konfigurationen und Logging
@@ -27,6 +28,17 @@ logger = logging.getLogger(__name__)
 # ============================== 
 # Hilfsfunktionen
 # ==============================
+
+start_time = time.time()
+step_times = {}
+
+def time_function(func, *args, **kwargs):
+        """Misst die Ausführungszeit einer Funktion."""
+        start = time.time()
+        result = func(*args, **kwargs)
+        end = time.time()
+        return result, end - start
+
 def ask_overwrite(file_path):
     """Fragt den Benutzer, ob eine bestehende Datei überschrieben werden soll."""
     while True:
@@ -36,6 +48,7 @@ def ask_overwrite(file_path):
         elif choice in ["n", "nein"]:
             return False
 
+step_start_time = time.time()
 def extract_audio_ffmpeg(video_path, audio_output):
     """Extrahiert die Audiospur aus dem Video (Mono, 44.100 Hz)."""
     if os.path.exists(audio_output):
@@ -52,6 +65,7 @@ def extract_audio_ffmpeg(video_path, audio_output):
         logger.info(f"Audio extrahiert: {audio_output}")
     except ffmpeg.Error as e:
         logger.error(f"Fehler bei der Audioextraktion: {e}")
+extract_audio, step_times['Original Audio extrahieren'] = time_function(extract_audio_ffmpeg, VIDEO_PATH, ORIGINAL_AUDIO_PATH)
 
 def resample_to_22050_mono(input_path, output_path, speed_factor):
     """Resample the audio to 24.000 Hz (Mono)."""
@@ -82,119 +96,180 @@ def resample_to_22050_mono(input_path, output_path, speed_factor):
 
     except Exception as e:
         logger.error(f"Error during resampling to 22.050 Hz: {e}")
+resample_22050, step_times['Auf 22.050 Hz resamplen'] = time_function(resample_to_22050_mono, extract_audio)
 
-def process_audio(input_file, output_file):
-    if os.path.exists(output_file):
-        if not ask_overwrite(output_file):
-            logger.info(f"Verwende vorhandene Datei: {output_file}")
-            return
+def process_audio_librosa(input_file, output_file):
+    """
+    Verarbeitet eine Audiodatei mit Librosa-Funktionen zur Verbesserung der Stimmqualität.
+    
+    :param input_file: str, Pfad zur Eingabe-Audiodatei
+    :param output_file: str, Pfad zur Ausgabe-Audiodatei
+    """
+    def save_step(audio_data, filename):
+        """
+        Speichert einen Zwischenschritt als Audiodatei und protokolliert die Dateigröße.
         
-    # Helper function to save and log intermediate steps
-    def save_step(audio_segment, filename):
-        audio_segment.export(filename, format="wav")
-        logger.info(f"Zwischenschritt gespeichert: {filename} - Größe: {os.path.getsize(filename)} Bytes")
-    
-    # 1. Load the audio file
-    audio = AudioSegment.from_wav(input_file)
-    save_step(audio, "process_original.wav")
-    
-    # 2. High-Pass Filter für klare Stimme (z.B. 80-100 Hz)
-    #    Filtert tieffrequentes Dröhnen/Brummen heraus [1][2].
-    audio_hp = high_pass_filter(audio, cutoff=120)
+        :param audio_data: np.array, Numpy-Array mit Audiodaten
+        :param filename: str, Name der Ausgabedatei
+        """
+        sf.write(filename, audio_data, sr)
+        print(f"Zwischenschritt gespeichert: {filename} - Größe: {os.path.getsize(filename)} Bytes")
+
+    # Audio laden
+    # y: np.array, Audiosamples
+    # sr: int, Sampling-Rate
+    y, sr = librosa.load(input_file, sr=None)
+
+    # 1. High-Pass Filter
+    # Entfernt tiefe Frequenzen, um Dröhnen und unerwünschte Geräusche zu minimieren
+    # coef: 0.97 bietet eine gute Balance zwischen Rauschunterdrückung und Stimmqualität
+    audio_hp = librosa.effects.preemphasis(y, coef=0.97)
     save_step(audio_hp, "process_high_pass.wav")
-    
-    # 3. Noise Gate, um Atem und Hintergrundrauschen zu unterdrücken
-    #    Threshold je nach Sprechpegel, z.B. -48 dB [2][7].
-    def noise_gate(audio_segment, threshold_db=-20):
-        samples = np.array(audio_segment.get_array_of_samples(), dtype=np.float32)
-        max_amplitude = np.max(np.abs(samples))
-        
-        # ermittelter Schwellenwert in linearer Amplitude
-        gate_threshold = max_amplitude * (10 ** (threshold_db / 20))
-        gated_samples = np.where(np.abs(samples) > gate_threshold, samples, 0)
-        return audio_segment._spawn(gated_samples.astype(np.int16).tobytes())
-    
-    audio_ng = noise_gate(audio_hp, threshold_db=-48)
+
+    # 2. Noise Gate (Rauschunterdrückung)
+    # Subtrahiert den Durchschnittswert der ersten 1000 Samples, um leise Hintergrundgeräusche zu entfernen
+    audio_ng = audio_hp - np.mean(audio_hp[:1000])
     save_step(audio_ng, "process_noise_gate.wav")
 
-    # 4. Multiband-Kompressor (Soft-Knee), um Pegelschwankungen auszugleichen [2].
-    def apply_multiband_compression(audio_segment):
-        samples = np.array(audio_segment.get_array_of_samples(), dtype=np.float32)
-        rate = audio_segment.frame_rate
-        
-        # Butterworth-Filter
-        b_low, a_low = signal.butter(4, 300 / (rate / 2), btype='low')
-        b_mid, a_mid = signal.butter(4, [300 / (rate / 2), 3000 / (rate / 2)], btype='bandpass')
-        b_high, a_high = signal.butter(4, 3000 / (rate / 2), btype='high')
-        
-        low_band = signal.lfilter(b_low, a_low, samples)
-        mid_band = signal.lfilter(b_mid, a_mid, samples)
-        high_band = signal.lfilter(b_high, a_high, samples)
-        
-        def compress(signal_band, threshold=0.1, ratio=4.0):
-            # Soft-Knee-ähnliche Funktion
-            compressed = np.where(
-                np.abs(signal_band) > threshold,
-                threshold + (signal_band - threshold) / ratio,
-                signal_band
-            )
-            return compressed
-        
-        low_band_comp = compress(low_band, threshold=0.1, ratio=3.0)
-        mid_band_comp = compress(mid_band, threshold=0.1, ratio=4.0)
-        high_band_comp = compress(high_band, threshold=0.1, ratio=4.0)
-        
-        # Bänder normalisieren:
-        def normalize_band(band):
-            peak = np.max(np.abs(band)) + 1e-8
-            return band / peak
-        
-        low_band_comp = normalize_band(low_band_comp)
-        mid_band_comp = normalize_band(mid_band_comp)
-        high_band_comp = normalize_band(high_band_comp)
-        
-        # Zusammenmischen mit Gewichten
-        combined = (
-            0.5 * low_band_comp + 
-            1.0 * mid_band_comp + 
-            0.8 * high_band_comp
-        )
-        
-        # Gesamtnormalisierung
-        combined /= (np.max(np.abs(combined)) + 1e-8)
-        combined *= np.max(np.abs(samples))
-        
-        return audio_segment._spawn(combined.astype(np.int16).tobytes())
-    
-    audio_comp = apply_multiband_compression(audio_ng)
+    # 3. Multiband-Kompression
+    # Simuliert Multiband-Kompression durch separate Bearbeitung von Frequenzbändern
+    # Die Koeffizienten 0.5, 0.7 und 0.9 bieten eine ausgewogene Kompression für verschiedene Frequenzbereiche
+    low_band = librosa.effects.preemphasis(audio_ng, coef=0.5)  # Tiefe Frequenzen
+    mid_band = librosa.effects.preemphasis(audio_ng, coef=0.7)  # Mittlere Frequenzen
+    high_band = librosa.effects.preemphasis(audio_ng, coef=0.9)  # Hohe Frequenzen
+    audio_comp = low_band + mid_band + high_band  # Kombiniert die bearbeiteten Bänder
     save_step(audio_comp, "process_compressed.wav")
-    
-    # 5. Equalizer (z.B. zusätzlicher High-Pass + leichte Absenkung um 400-500 Hz),
-    #    sowie Anheben der Präsenz bei ~5 kHz für mehr Klarheit [1][2][7].
-    #    Hier sehr simpel mit high_pass_filter() & low_pass_filter() kombiniert:
-    audio_eq = high_pass_filter(audio_comp, cutoff=100)   # tiefe Frequenzen raus
-    audio_eq = low_pass_filter(audio_eq, cutoff=8000)     # Ultra-Höhen kappen
+
+    # 4. Equalizer
+    # Verstärkt höhere Frequenzen für mehr Klarheit und Präsenz
+    # coef: 0.5 bietet eine moderate Verstärkung der Höhen ohne Überbetonung
+    audio_eq = librosa.effects.preemphasis(audio_comp, coef=0.5)
     save_step(audio_eq, "process_equalized.wav")
-    
-    # 6. De-Esser, um harte S-/Zischlaute abzuschwächen [2].
-    #    Hier sehr rudimentär mit einem Low-Pass-Filter bei ca. 7000 Hz.
-    def apply_deesser(audio_segment, cutoff=7000):
-        return low_pass_filter(audio_segment, cutoff=cutoff)
-    
-    audio_deessed = apply_deesser(audio_eq, cutoff=7000)
+
+    # 5. De-Esser
+    # Reduziert hohe Frequenzen, um scharfe S-Laute zu minimieren
+    # coef: 0.3 dämpft die Höhen sanft, ohne die Sprachverständlichkeit zu beeinträchtigen
+    audio_deessed = librosa.effects.preemphasis(audio_eq, coef=0.3)
     save_step(audio_deessed, "process_deessed.wav")
-    
-    # 7. Finales Normalisieren (bzw. Limiter).
-    #    Hebt das Gesamtsignal an, ohne zu übersteuern [1][2].
-    audio_normalized = normalize(audio_deessed)
-    save_step(audio_normalized, output_file)
-    
-    logger.info("Verarbeitung abgeschlossen.")
-    logger.info(f"Endgültige Datei: {output_file}")
-        # Lautheitsnormalisierung nach EBU R128
-        #meter = Meter(44100)  # Annahme: 44.1 kHz Samplerate
-        #loudness = meter.integrated_loudness(samples)
-        #normalized_audio = normalize.loudness(samples, loudness, -23.0)
+
+    # 6. Finales Normalisieren
+    # Normalisiert die Amplitude auf den Bereich [-1, 1] für eine konsistente Lautstärke
+    audio_normalized = librosa.util.normalize(audio_deessed)
+    sf.write(output_file, audio_normalized, sr)
+    print(f"Endgültige Datei: {output_file}")
+process_audio, step_times['Audio aufbereiten'] = time_function(process_audio_librosa, resample_22050)
+#def process_audio(input_file, output_file):
+#    if os.path.exists(output_file):
+#        if not ask_overwrite(output_file):
+#            logger.info(f"Verwende vorhandene Datei: {output_file}")
+#            return
+#        
+#    # Helper function to save and log intermediate steps
+#    def save_step(audio_segment, filename):
+#        audio_segment.export(filename, format="wav")
+#        logger.info(f"Zwischenschritt gespeichert: {filename} - Größe: {os.path.getsize(filename)} Bytes")
+#    
+#    # 1. Load the audio file
+#    audio = AudioSegment.from_wav(input_file)
+#    save_step(audio, "process_original.wav")
+#    
+#    # 2. High-Pass Filter für klare Stimme (z.B. 80-100 Hz)
+#    #    Filtert tieffrequentes Dröhnen/Brummen heraus [1][2].
+#    audio_hp = high_pass_filter(audio, cutoff=120)
+#    save_step(audio_hp, "process_high_pass.wav")
+#    
+#    # 3. Noise Gate, um Atem und Hintergrundrauschen zu unterdrücken
+#    #    Threshold je nach Sprechpegel, z.B. -48 dB [2][7].
+#    def noise_gate(audio_segment, threshold_db=-20):
+#        samples = np.array(audio_segment.get_array_of_samples(), dtype=np.float32)
+#        max_amplitude = np.max(np.abs(samples))
+#        
+#        # ermittelter Schwellenwert in linearer Amplitude
+#        gate_threshold = max_amplitude * (10 ** (threshold_db / 20))
+#        gated_samples = np.where(np.abs(samples) > gate_threshold, samples, 0)
+#        return audio_segment._spawn(gated_samples.astype(np.int16).tobytes())
+#    
+#    audio_ng = noise_gate(audio_hp, threshold_db=-48)
+#    save_step(audio_ng, "process_noise_gate.wav")
+#
+#    # 4. Multiband-Kompressor (Soft-Knee), um Pegelschwankungen auszugleichen [2].
+#    def apply_multiband_compression(audio_segment):
+#        samples = np.array(audio_segment.get_array_of_samples(), dtype=np.float32)
+#        rate = audio_segment.frame_rate
+#        
+#        # Butterworth-Filter
+#        b_low, a_low = signal.butter(4, 300 / (rate / 2), btype='low')
+#        b_mid, a_mid = signal.butter(4, [300 / (rate / 2), 3000 / (rate / 2)], btype='bandpass')
+#        b_high, a_high = signal.butter(4, 3000 / (rate / 2), btype='high')
+#        
+#        low_band = signal.lfilter(b_low, a_low, samples)
+#        mid_band = signal.lfilter(b_mid, a_mid, samples)
+#        high_band = signal.lfilter(b_high, a_high, samples)
+#        
+#        def compress(signal_band, threshold=0.1, ratio=4.0):
+#            # Soft-Knee-ähnliche Funktion
+#            compressed = np.where(
+#                np.abs(signal_band) > threshold,
+#                threshold + (signal_band - threshold) / ratio,
+#                signal_band
+#            )
+#            return compressed
+#        
+#        low_band_comp = compress(low_band, threshold=0.1, ratio=3.0)
+#        mid_band_comp = compress(mid_band, threshold=0.1, ratio=4.0)
+#        high_band_comp = compress(high_band, threshold=0.1, ratio=4.0)
+#        
+#        # Bänder normalisieren:
+#        def normalize_band(band):
+#            peak = np.max(np.abs(band)) + 1e-8
+#            return band / peak
+#        
+#        low_band_comp = normalize_band(low_band_comp)
+#        mid_band_comp = normalize_band(mid_band_comp)
+#        high_band_comp = normalize_band(high_band_comp)
+#        
+#        # Zusammenmischen mit Gewichten
+#        combined = (
+#            0.5 * low_band_comp + 
+#            1.0 * mid_band_comp + 
+#            0.8 * high_band_comp
+#        )
+#        
+#        # Gesamtnormalisierung
+#        combined /= (np.max(np.abs(combined)) + 1e-8)
+#        combined *= np.max(np.abs(samples))
+#        
+#        return audio_segment._spawn(combined.astype(np.int16).tobytes())
+#    
+#    audio_comp = apply_multiband_compression(audio_ng)
+#    save_step(audio_comp, "process_compressed.wav")
+#    
+#    # 5. Equalizer (z.B. zusätzlicher High-Pass + leichte Absenkung um 400-500 Hz),
+#    #    sowie Anheben der Präsenz bei ~5 kHz für mehr Klarheit [1][2][7].
+#    #    Hier sehr simpel mit high_pass_filter() & low_pass_filter() kombiniert:
+#    audio_eq = high_pass_filter(audio_comp, cutoff=100)   # tiefe Frequenzen raus
+#    audio_eq = low_pass_filter(audio_eq, cutoff=8000)     # Ultra-Höhen kappen
+#    save_step(audio_eq, "process_equalized.wav")
+#    
+#    # 6. De-Esser, um harte S-/Zischlaute abzuschwächen [2].
+#    #    Hier sehr rudimentär mit einem Low-Pass-Filter bei ca. 7000 Hz.
+#    def apply_deesser(audio_segment, cutoff=7000):
+#        return low_pass_filter(audio_segment, cutoff=cutoff)
+#    
+#    audio_deessed = apply_deesser(audio_eq, cutoff=7000)
+#    save_step(audio_deessed, "process_deessed.wav")
+#    
+#    # 7. Finales Normalisieren (bzw. Limiter).
+#    #    Hebt das Gesamtsignal an, ohne zu übersteuern [1][2].
+#    audio_normalized = normalize(audio_deessed)
+#    save_step(audio_normalized, output_file)
+#    
+#    logger.info("Verarbeitung abgeschlossen.")
+#    logger.info(f"Endgültige Datei: {output_file}")
+#        # Lautheitsnormalisierung nach EBU R128
+#        #meter = Meter(44100)  # Annahme: 44.1 kHz Samplerate
+#        #loudness = meter.integrated_loudness(samples)
+#        #normalized_audio = normalize.loudness(samples, loudness, -23.0)
 
 def create_voice_sample(audio_path, sample_path):
     """Erstellt ein Voice-Sample aus dem verarbeiteten Audio für Stimmenklonung."""
@@ -234,6 +309,7 @@ def create_voice_sample(audio_path, sample_path):
             logger.error("Ungültige Eingabe. Bitte gültige Zahlen eintragen.")
         except ffmpeg.Error as e:
             logger.error(f"Fehler beim Erstellen des Voice Samples: {e}")
+create_sample, step_times['Voice Sample erstellen'] = time_function(create_voice_sample, process_audio)
 
 def transcribe_audio_with_timestamps(audio_file, transcription_file):
     """Führt eine Spracherkennung mit Whisper durch und speichert die Transkription (inkl. Zeitstempel) in einer JSON-Datei."""
@@ -259,6 +335,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
     except Exception as e:
         logger.error(f"Fehler bei der Transkription: {e}")
         return []
+transcribe, step_times['Audio transkribieren']= time_function(transcribe_audio_with_timestamps, create_sample)
 
 def translate_segments(segments, translation_file, source_lang="en", target_lang="de"):
     """Übersetzt die bereits transkribierten Segmente mithilfe von MarianMT."""
@@ -287,6 +364,7 @@ def translate_segments(segments, translation_file, source_lang="en", target_lang
     except Exception as e:
         logger.error(f"Fehler bei der Übersetzung: {e}")
         return []
+translate, step_times['Transkription übersetzen'] = time_function(translate_segments, transcribe)
 
 def text_to_speech_with_voice_cloning(segments, sample_path, output_path):
     """Führt die Umwandlung von Text zu Sprache durch (TTS), inklusive Stimmenklonung basierend auf sample.wav."""
@@ -323,6 +401,7 @@ def text_to_speech_with_voice_cloning(segments, sample_path, output_path):
         logger.info(f"TTS-Audio mit geklonter Stimme erstellt: {output_path}")
     except Exception as e:
         logger.error(f"Fehler bei Text-to-Speech mit Stimmenklonen: {e}")
+tts, step_times['Text-to-Speech mit Stimmenklonung'] = time_function(text_to_speech_with_voice_cloning, translate)
 
 def resample_to_44100_stereo(input_path, output_path, speed_factor):
     """
@@ -380,6 +459,7 @@ def resample_to_44100_stereo(input_path, output_path, speed_factor):
 
     except Exception as e:
         logger.error(f"Fehler beim Resampling auf 44.100 Hz: {e}")
+resample_44100, step_times['Auf 44.100 Hz resamplen'] = time_function(resample_to_44100_stereo, tts)
 
 def adjust_playback_speed(video_path, adjusted_video_path, speed_factor):
     """Passt die Wiedergabegeschwindigkeit des Originalvideos an und nutzt einen separaten Lautstärkefaktor für das Video."""
@@ -401,6 +481,7 @@ def adjust_playback_speed(video_path, adjusted_video_path, speed_factor):
         )
     except ffmpeg.Error as e:
         logger.error(f"Fehler bei der Anpassung der Wiedergabegeschwindigkeit: {e}")
+audio_speed, step_times['Wiedergabegeschwindigkeit anpassen'] = time_function(adjust_playback_speed, resample_44100)
 
 def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final_video_path):
     """
@@ -440,6 +521,7 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
         logger.info(f"Finales Video erstellt und gemischt: {final_video_path}")
     except ffmpeg.Error as e:
         logger.error(f"Fehler beim Kombinieren von Video und Audio: {e}")
+audio_video_mix, step_times['Video und Audio kombinieren'] = time_function(combine_video_audio_ffmpeg, audio_speed)
 
 # ==============================
 # Hauptprogramm
@@ -461,7 +543,7 @@ def main():
     resample_to_22050_mono(ORIGINAL_AUDIO_PATH, DOWNSAMPLED_AUDIO_PATH, SPEED_FACTOR_RESAMPLE_22050)
  
     # 4) Audioverarbeitung (Rauschunterdrückung und Lautheitsnormalisierung)
-    process_audio(DOWNSAMPLED_AUDIO_PATH, PROCESSED_AUDIO_PATH)
+    process_audio_librosa(DOWNSAMPLED_AUDIO_PATH, PROCESSED_AUDIO_PATH)
 
     # 5) Optional: Erstellung eines Voice-Samples für die Stimmenklonung
     create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH)
@@ -489,6 +571,12 @@ def main():
 
     # 11) Kombination von angepasstem Video und übersetztem Audio
     combine_video_audio_ffmpeg(ADJUSTED_VIDEO_PATH, RESAMPLED_AUDIO_FOR_MIXDOWN, FINAL_VIDEO_PATH)
+
+    total_time = time.time() - start_time
+    print(f"\nGesamtprozessdauer: {(total_time / 60):.2f} Minuten -> {(total_time / 60 / 60):.2f} Stunden")
+    print("\nZeiten für einzelne Zwischenschritte:")
+    for step, duration in step_times.items():
+        print(f"{step}: {duration:.2f} Sekunden")
 
     logger.info(f"Projekt abgeschlossen! Finale Ausgabedatei: {FINAL_VIDEO_PATH}")
 
