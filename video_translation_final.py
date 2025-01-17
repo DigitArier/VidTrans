@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Geschwindigkeitseinstellungen
 SPEED_FACTOR_RESAMPLE_22050 = 0.9   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
-SPEED_FACTOR_RESAMPLE_44100 = 1.4   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
+SPEED_FACTOR_RESAMPLE_44100 = 1.35   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
 SPEED_FACTOR_PLAYBACK = 0.7         # Geschwindigkeitsfaktor für die Wiedergabe des Videos
 
 # Lautstärkeanpassungen
@@ -33,7 +33,7 @@ VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
 VOLUME_ADJUSTMENT_VIDEO = 0.05   # Lautstärkefaktor für das Video
 
 # Dateipfade
-VIDEO_PATH = "Joe Rogan Experience @2254 - Mel Gibson_HD_2.mp4"
+VIDEO_PATH = "Joe Rogan Experience @2254 - Mel Gibson_HD_3.mp4"
 ORIGINAL_AUDIO_PATH = "original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 SAMPLE_PATH = "sample.wav"
@@ -43,7 +43,7 @@ TRANSLATION_FILE = "translation.json"
 TRANSLATED_AUDIO_WITH_PAUSES = "translated_audio_with_pauses.wav"
 RESAMPLED_AUDIO_FOR_MIXDOWN = "resampled_audio_44100.wav"
 ADJUSTED_VIDEO_PATH = "adjusted_video.mp4"
-FINAL_VIDEO_PATH = "Joe Rogan Experience @2254 - Mel Gibson_HD_2_deutsch.mp4"
+FINAL_VIDEO_PATH = "Joe Rogan Experience @2254 - Mel Gibson_HD_3_deutsch.mp4"
 
 # ============================== 
 # Hilfsfunktionen
