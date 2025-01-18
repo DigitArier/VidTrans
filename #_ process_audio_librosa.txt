@@ -1,0 +1,59 @@
+#def process_audio_librosa(input_file, output_file):
+#    """
+#    Verarbeitet eine Audiodatei mit Librosa-Funktionen zur Verbesserung der Stimmqualität.
+#    
+#    :param input_file: str, Pfad zur Eingabe-Audiodatei
+#    :param output_file: str, Pfad zur Ausgabe-Audiodatei
+#    """
+#    def save_step(audio_data, filename):
+#        """
+#        Speichert einen Zwischenschritt als Audiodatei und protokolliert die Dateigröße.
+#        
+#        :param audio_data: np.array, Numpy-Array mit Audiodaten
+#        :param filename: str, Name der Ausgabedatei
+#        """
+#        sf.write(filename, audio_data, sr)
+#        print(f"Zwischenschritt gespeichert: {filename} - Größe: {os.path.getsize(filename)} Bytes")
+#
+#    # Audio laden
+#    # y: np.array, Audiosamples
+#    # sr: int, Sampling-Rate
+#    y, sr = librosa.load(input_file, sr=None)
+#
+#    # 1. High-Pass Filter
+#    # Entfernt tiefe Frequenzen, um Dröhnen und unerwünschte Geräusche zu minimieren
+#    # coef: 0.97 bietet eine gute Balance zwischen Rauschunterdrückung und Stimmqualität
+#    audio_hp = librosa.effects.preemphasis(y, coef=0.97)
+#    save_step(audio_hp, "process_high_pass.wav")
+#
+#    # 2. Noise Gate (Rauschunterdrückung)
+#    # Subtrahiert den Durchschnittswert der ersten 1000 Samples, um leise Hintergrundgeräusche zu entfernen
+#    audio_ng = audio_hp - np.mean(audio_hp[:1000])
+#    save_step(audio_ng, "process_noise_gate.wav")
+#
+#    # 3. Multiband-Kompression
+#    # Simuliert Multiband-Kompression durch separate Bearbeitung von Frequenzbändern
+#    # Die Koeffizienten 0.5, 0.7 und 0.9 bieten eine ausgewogene Kompression für verschiedene Frequenzbereiche
+#    low_band = librosa.effects.preemphasis(audio_ng, coef=0.5)  # Tiefe Frequenzen
+#    mid_band = librosa.effects.preemphasis(audio_ng, coef=0.7)  # Mittlere Frequenzen
+#    high_band = librosa.effects.preemphasis(audio_ng, coef=0.9)  # Hohe Frequenzen
+#    audio_comp = low_band + mid_band + high_band  # Kombiniert die bearbeiteten Bänder
+#    save_step(audio_comp, "process_compressed.wav")
+#
+#    # 4. Equalizer
+#    # Verstärkt höhere Frequenzen für mehr Klarheit und Präsenz
+#    # coef: 0.5 bietet eine moderate Verstärkung der Höhen ohne Überbetonung
+#    audio_eq = librosa.effects.preemphasis(audio_comp, coef=0.5)
+#    save_step(audio_eq, "process_equalized.wav")
+#
+#    # 5. De-Esser
+#    # Reduziert hohe Frequenzen, um scharfe S-Laute zu minimieren
+#    # coef: 0.3 dämpft die Höhen sanft, ohne die Sprachverständlichkeit zu beeinträchtigen
+#    audio_deessed = librosa.effects.preemphasis(audio_eq, coef=0.3)
+#    save_step(audio_deessed, "process_deessed.wav")
+#
+#    # 6. Finales Normalisieren
+#    # Normalisiert die Amplitude auf den Bereich [-1, 1] für eine konsistente Lautstärke
+#    audio_normalized = librosa.util.normalize(audio_deessed)
+#    sf.write(output_file, audio_normalized, sr)
+#    print(f"Endgültige Datei: {output_file}")
