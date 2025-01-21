@@ -7,16 +7,20 @@ import numpy as np
 import json
 import scipy.signal as signal
 import torch
-torch.set_num_threads(1)
 import torchaudio
 import time
+#import whisperx
 from config import *
-from silero_vad import (load_silero_vad, get_speech_timestamps, collect_chunks)
+#from speechbrain.inference import interfaces
 from transformers import AutoTokenizer, MarianMTModel
 from TTS.api import TTS
 import whisper
 from pydub import AudioSegment
 from pydub.effects import high_pass_filter, low_pass_filter, normalize
+#from pyloudnorm import Meter, normalize
+#import webrtcvad
+#import wave
+#import collections
 
 # Geschwindigkeitseinstellungen
 SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
@@ -83,7 +87,7 @@ def resample_to_16000_mono(input_path, output_path, speed_factor):
 
     try:
         # Load the audio file
-        audio, sr = librosa.load(input_path, sr=None)  # Load with original sampling rate
+        audio, sr = librosa.load(input_path, sr=None, mono=True)  # Load with original sampling rate
         logger.info(f"Original sampling rate: {sr} Hz")
 
         # Adjust playback speed if necessary
@@ -218,7 +222,16 @@ def process_audio(input_file, output_file):
         #loudness = meter.integrated_loudness(samples)
         #normalized_audio = normalize.loudness(samples, loudness, -23.0)
 
+# Silero VAD für Sprachaktivitätserkennung
+def detect_speech(audio_path, sample_rate=16000):
+    model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad')
+    (get_speech_timestamps, _, read_audio, _, _) = utils
+    wav = read_audio(audio_path, sampling_rate=sample_rate)
+    speech_timestamps = get_speech_timestamps(wav, model, sampling_rate=sample_rate)
+    return speech_timestamps
+
 def create_voice_sample(audio_path, sample_path):
+
     """Erstellt ein Voice-Sample aus dem verarbeiteten Audio für Stimmenklonung."""
     if os.path.exists(sample_path):
         choice = input("Eine sample.wav existiert bereits. Möchten Sie eine neue erstellen? (j/n, ENTER zum Überspringen): ").strip().lower()
@@ -257,80 +270,43 @@ def create_voice_sample(audio_path, sample_path):
         except ffmpeg.Error as e:
             logger.error(f"Fehler beim Erstellen des Voice Samples: {e}")
 
-def transcribe_audio_with_timestamps(audio_file, transcription_file):
+def transcribe_audio_with_timestamps(audio_file, speech_timestamps):
     """Führt eine Spracherkennung mit Whisper durch und speichert die Transkription (inkl. Zeitstempel) in einer JSON-Datei."""
-    if os.path.exists(transcription_file):
-        if not ask_overwrite(transcription_file):
-            logger.info(f"Verwende vorhandene Transkription: {transcription_file}")
-            with open(transcription_file, "r", encoding="utf-8") as file:
+    if os.path.exists(speech_timestamps):
+        if not ask_overwrite(speech_timestamps):
+            logger.info(f"Verwende vorhandene Transkription: {speech_timestamps}")
+            with open(speech_timestamps, "r", encoding="utf-8") as file:
                 return json.load(file)
     try:
-        # Neue Funktion zum Laden der Audiodaten
-        def load_audio(audio_file):
-            waveform, sample_rate = sf.read(audio_file)
-            waveform = np.atleast_2d(waveform).T  # Stellt sicher, dass es 2D ist
-            return torch.from_numpy(waveform).float(), sample_rate
-        
-        # Laden der Audiodaten
-        wav, sample_rate = load_audio(audio_file)
-        logger.info(f"Geladene Audiodaten: Shape {wav.shape}, Sample Rate {sample_rate}")
-
-        model = load_silero_vad(onnx=USE_ONNX)
-
-        # Anpassen der Sampling-Rate, falls nötig
-        if sample_rate != SAMPLING_RATE:
-            wav = torchaudio.functional.resample(wav, sample_rate, SAMPLING_RATE)
-        speech_timestamps = get_speech_timestamps(wav, model, sampling_rate=SAMPLING_RATE)
-        speech_chunks = collect_chunks(speech_timestamps, wav)
-
-        logger.info("Lade Whisper-Modell (large-v3-turbo)...")
+        logger.info("Lade Whisper-Modell (large-v3)...")
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        whisper_model = whisper.load_model("large-v3-turbo").to(device)
+        model = whisper.load_model("large-v3-turbo").to(device)
         logger.info("Starte Transkription...")
-
-        # Transkription für jedes Sprachsegment durchführen
-        transcriptions = []
-        for i, chunk in enumerate(speech_chunks):
-
-        # Temporäre Audiodatei speichern
-            temp_file = f"temp_chunk_{i}.wav"
-            torchaudio.save(temp_file, chunk.unsqueeze(0), SAMPLING_RATE)
-
-        # Whisper-Transkription durchführen
-            result = whisper_model.transcribe(temp_file, verbose=True, language="en")
-
-        # Zeitstempel und Transkription speichern
-            start_time = speech_timestamps[i]['start'] / SAMPLING_RATE  # Umrechnung in Sekunden
-            end_time = speech_timestamps[i]['end'] / SAMPLING_RATE
-            transcriptions.append({
-                'start': start_time,
-                'end': end_time,
-                'text': result['text']
-            })
-            os.remove(temp_file)  # Temporäre Datei löschen
-
-        # Ergebnisse ausgeben
-        for t in transcriptions:
-            logger.info(f"Von {t['start']:.2f}s bis {t['end']:.2f}s: {t['text']}")
-            print(f"Von {t['start']:.2f}s bis {t['end']:.2f}s: {t['text']}")
-        with open(transcription_file, "w", encoding="utf-8") as file:
-            json.dump(transcriptions, file, ensure_ascii=False, indent=4)
+        result = model.transcribe(audio_file)
+        segments = result["segments"]
+        for i, segment in enumerate(speech_timestamps):
+            start = segment['start'] / 16000  # Umrechnung in Sekunden
+            end = segment['end'] / 16000
+            text = result['text'][i] if i < len(result['text']) else ""
+            segments.append({"start": start, "end": end, "text": text})
+        with open(speech_timestamps, "w", encoding="utf-8") as file:
+            json.dump(result["segments"], file, ensure_ascii=False, indent=4)
         logger.info("Transkription abgeschlossen!")
-        return transcriptions
+        return result["segments"]
     except Exception as e:
-        logger.error(f"Fehler bei der Transkription: {e}")
+        logger.error(f"Fehler bei der Transkription: {e}", exc_info=True)
         return []
 
-def translate_segments(transcriptions, translation_file, source_lang="en", target_lang="de"):
+# MarianMT für Übersetzung
+def translate_segments(segments, translation_file, source_lang="en", target_lang="de"):
     """Übersetzt die bereits transkribierten Segmente mithilfe von MarianMT."""
-    translated_segments = translate_segments
     if os.path.exists(translation_file):
         if not ask_overwrite(translation_file):
             logger.info(f"Verwende vorhandene Übersetzungen: {translation_file}")
             with open(translation_file, "r", encoding="utf-8") as file:
                 return json.load(file)
     try:
-        if not transcriptions:
+        if not segments:
             logger.error("Keine Segmente für die Übersetzung gefunden.")
             return []
         model_name = f"Helsinki-NLP/opus-mt-{source_lang}-{target_lang}"
@@ -338,24 +314,23 @@ def translate_segments(transcriptions, translation_file, source_lang="en", targe
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = MarianMTModel.from_pretrained(model_name).to(device)
-        for segment in transcriptions:
-            text = segment["text"]
-            inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True).to(device)
-            outputs = model.generate(**inputs, max_length=512, num_beams=8, early_stopping=True)
+
+        for segment in segments:
+            input_ids = tokenizer(segment["text"], return_tensors="pt").input_ids
+            outputs = model.generate(**input_ids, max_length=512, num_beams=8, early_stopping=True)
             segment["translated_text"] = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-            # Behalten Sie die ursprünglichen Timestamps bei
-            segment["start"] = segment["start"]
-            segment["end"] = segment["end"]
         with open(translation_file, "w", encoding="utf-8") as file:
-            json.dump(translated_segments, file, ensure_ascii=False, indent=4)
+            json.dump(segments, file, ensure_ascii=False, indent=4)
         logger.info("Übersetzung abgeschlossen!")
-        return translated_segments
+
+        return segments
+
     except Exception as e:
         logger.error(f"Fehler bei der Übersetzung: {e}")
         return []
 
-def text_to_speech_with_voice_cloning(translated_segments, sample_path, output_path):
+def text_to_speech_with_voice_cloning(segments, sample_path, output_path):
     """Führt die Umwandlung von Text zu Sprache durch (TTS), inklusive Stimmenklonung basierend auf sample.wav."""
     if os.path.exists(output_path):
         if not ask_overwrite(output_path):
@@ -366,27 +341,22 @@ def text_to_speech_with_voice_cloning(translated_segments, sample_path, output_p
         device = "cuda" if torch.cuda.is_available() else "cpu"
         tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=True).to(device)
         sampling_rate = tts.synthesizer.output_sample_rate
-        final_audio_segments = []
-        for segment in translated_segments:
+
+        full_audio = np.array([])
+        for segment in segments:
             translated_text = segment.get("translated_text", "")
             start_time = segment["start"]
             end_time = segment["end"]
             duration = end_time - start_time
             logger.info(f"Erzeuge Audio für Segment ({start_time:.2f}-{end_time:.2f}s): {translated_text}")
-            audio_clip = tts.tts(
-                text=translated_text,
+            audio = tts.tts(
+                text=segment["translated_text"],
                 speaker_wav=sample_path,
                 language="de"
-                )         
-            text_length_factor = len(translated_text) * 0.02  # Kürzere Texte = kürzere Pausen
-            clip_length = len(audio_clip) / sampling_rate
-            pause_duration = max(0, duration - clip_length - text_length_factor)
-            #pause_duration = max(0, duration - clip_length -0.2)
-            #silence = np.zeros(int(pause_duration * sampling_rate))
-            final_audio_segments.append(audio_clip)
-            #final_audio_segments.append(silence)
-        final_audio = np.concatenate(final_audio_segments)
-        sf.write(output_path, final_audio, samplerate=sampling_rate)
+                )
+            full_audio = np.concatenate((full_audio, audio))
+        torchaudio.save(output_path, torch.tensor(full_audio).unsqueeze(0), 24000)
+        sf.write(output_path, full_audio, samplerate=sampling_rate)
         logger.info(f"TTS-Audio mit geklonter Stimme erstellt: {output_path}")
     except Exception as e:
         logger.error(f"Fehler bei Text-to-Speech mit Stimmenklonen: {e}")
@@ -530,14 +500,19 @@ def main():
     # 4) Audioverarbeitung (Rauschunterdrückung und Lautheitsnormalisierung)
     process_audio(DOWNSAMPLED_AUDIO_PATH, PROCESSED_AUDIO_PATH)
 
+    # 4.1) Spracherkennung (VAD) mit Silero VAD
+    speech_timestamps = detect_speech(PROCESSED_AUDIO_PATH)
+    
     # 5) Optional: Erstellung eines Voice-Samples für die Stimmenklonung
     create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH)
 
     # 6) Spracherkennung (Transkription) mit Whisper
-    segments = transcribe_audio_with_timestamps(DOWNSAMPLED_AUDIO_PATH, TRANSCRIPTION_FILE)
+    segments = transcribe_audio_with_timestamps(speech_timestamps, TRANSCRIPTION_FILE)
     if not segments:
         logger.error("Transkription fehlgeschlagen oder keine Segmente gefunden.")
         return
+    with open(TRANSCRIPTION_FILE, "w", encoding="utf-8") as f:
+        json.dump(segments, f, ensure_ascii=False, indent=4)
 
     # 7) Übersetzung der Segmente mithilfe von MarianMT
     translated_segments = translate_segments(segments, TRANSLATION_FILE)
