@@ -1,4 +1,5 @@
 import os
+import subprocess
 import ffmpeg
 import logging
 import librosa
@@ -7,25 +8,31 @@ import numpy as np
 import json
 import scipy.signal as signal
 import torch
+torch.set_num_threads(1)
 import torchaudio
 import time
 #import whisperx
 from config import *
+from pprint import pprint
 #from speechbrain.inference import interfaces
 from transformers import AutoTokenizer, MarianMTModel
 from TTS.api import TTS
 import whisper
 from pydub import AudioSegment
+from pydub.silence import split_on_silence
 from pydub.effects import high_pass_filter, low_pass_filter, normalize
+from silero_vad import load_silero_vad, read_audio, get_speech_timestamps, save_audio, collect_chunks
+from IPython.display import Audio
+from scipy.signal import butter, lfilter
 #from pyloudnorm import Meter, normalize
 #import webrtcvad
 #import wave
 #import collections
 
 # Geschwindigkeitseinstellungen
-SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
-SPEED_FACTOR_RESAMPLE_44100 = 1.0   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
-SPEED_FACTOR_PLAYBACK = 1.0        # Geschwindigkeitsfaktor für die Wiedergabe des Videos
+SPEED_FACTOR_RESAMPLE_16000 = 1.1   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
+SPEED_FACTOR_RESAMPLE_44100 = 1.3   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
+SPEED_FACTOR_PLAYBACK = 0.85        # Geschwindigkeitsfaktor für die Wiedergabe des Videos
 
 # Lautstärkeanpassungen
 VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
@@ -34,7 +41,7 @@ VOLUME_ADJUSTMENT_VIDEO = 0.05   # Lautstärkefaktor für das Video
 # ============================== 
 # Globale Konfigurationen und Logging
 # ==============================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(filename='video_translation_final.log', format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============================== 
@@ -43,6 +50,10 @@ logger = logging.getLogger(__name__)
 
 start_time = time.time()
 step_times = {}
+
+def run_command(command):
+    print(f"Ausführung des Befehls: {command}")
+    subprocess.run(command, shell=True, check=True)
 
 def time_function(func, *args, **kwargs):
         """Misst die Ausführungszeit einer Funktion."""
@@ -72,61 +83,31 @@ def extract_audio_ffmpeg(video_path, audio_output):
             audio_output,
             acodec="pcm_s16le",
             ac=1,  # Mono-Audio
-            ar="44100"  # 44.100 Hz
-        ).run()
+            ar="16000"  # 44.100 Hz
+            ).run()
         logger.info(f"Audio extrahiert: {audio_output}")
     except ffmpeg.Error as e:
         logger.error(f"Fehler bei der Audioextraktion: {e}")
-
-def resample_to_16000_mono(input_path, output_path, speed_factor):
-    """Resample the audio to 24.000 Hz (Mono)."""
-    if os.path.exists(output_path):
-        if not ask_overwrite(output_path):
-            logger.info(f"Verwende vorhandene Datei: {output_path}")
-            return
-
-    try:
-        # Load the audio file
-        audio, sr = librosa.load(input_path, sr=None, mono=True)  # Load with original sampling rate
-        logger.info(f"Original sampling rate: {sr} Hz")
-
-        # Adjust playback speed if necessary
-        if speed_factor != 1.0:
-            audio = librosa.effects.time_stretch(audio, rate=speed_factor)
-
-        # Resample to 16.000 Hz if needed
-        target_sr = 16000
-        if sr != target_sr:
-            audio_resampled = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
-        else:
-            audio_resampled = audio
-
-        # Save the resampled audio
-        sf.write(output_path, audio_resampled, samplerate=target_sr)
-        logger.info(f"Audio successfully resampled to {target_sr} Hz (Mono): {output_path}")
-
-    except Exception as e:
-        logger.error(f"Error during resampling to 22.050 Hz: {e}")
 
 def process_audio(input_file, output_file):
 
     if os.path.exists(output_file):
         if not ask_overwrite(output_file):
-            logger.info(f"Verwende vorhandene Datei: {output_file}")
+            logger.info(f"Verwende vorhandene Datei: {output_file}", exc_info=True)
             return
         
     # Helper function to save and log intermediate steps
     def save_step(audio_segment, filename):
         audio_segment.export(filename, format="wav")
-        logger.info(f"Zwischenschritt gespeichert: {filename} - Größe: {os.path.getsize(filename)} Bytes")
+        logger.info(f"Zwischenschritt gespeichert: {filename} - Größe: {os.path.getsize(filename)} Bytes", exc_info=True)
     
     # 1. Load the audio file
     audio = AudioSegment.from_wav(input_file)
-    save_step(audio, "process_original.wav")
+    #save_step(audio, "process_original.wav")
     
     # 2. High-Pass Filter für klare Stimme (z.B. 80-100 Hz)
     #    Filtert tieffrequentes Dröhnen/Brummen heraus [1][2].
-    audio_hp = high_pass_filter(audio, cutoff=120)
+    audio_hp = high_pass_filter(audio, cutoff=100)
     save_step(audio_hp, "process_high_pass.wav")
     
     # 3. Noise Gate, um Atem und Hintergrundrauschen zu unterdrücken
@@ -215,20 +196,107 @@ def process_audio(input_file, output_file):
     audio_normalized = normalize(audio_deessed)
     save_step(audio_normalized, output_file)
     
-    logger.info("Verarbeitung abgeschlossen.")
-    logger.info(f"Endgültige Datei: {output_file}")
+    logger.info("Verarbeitung abgeschlossen.", exc_info=True)
+    logger.info(f"Endgültige Datei: {output_file}", exc_info=True)
         # Lautheitsnormalisierung nach EBU R128
         #meter = Meter(44100)  # Annahme: 44.1 kHz Samplerate
         #loudness = meter.integrated_loudness(samples)
         #normalized_audio = normalize.loudness(samples, loudness, -23.0)
 
-# Silero VAD für Sprachaktivitätserkennung
-def detect_speech(audio_path, sample_rate=16000):
-    model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad')
-    (get_speech_timestamps, _, read_audio, _, _) = utils
-    wav = read_audio(audio_path, sampling_rate=sample_rate)
-    speech_timestamps = get_speech_timestamps(wav, model, sampling_rate=sample_rate)
-    return speech_timestamps
+def resample_to_16000_mono(input_path, output_path, speed_factor):
+    """Resample the audio to 24.000 Hz (Mono)."""
+    if os.path.exists(output_path):
+        if not ask_overwrite(output_path):
+            logger.info(f"Verwende vorhandene Datei: {output_path}", exc_info=True)
+            return
+
+    try:
+        # Load the audio file
+        audio, sr = librosa.load(input_path, sr=None, mono=True)  # Load with original sampling rate
+        logger.info(f"Original sampling rate: {sr} Hz", exc_info=True)
+
+        # Adjust playback speed if necessary
+        if speed_factor != 1.0:
+            audio = librosa.effects.time_stretch(audio, rate=speed_factor)
+
+        # Resample to 16.000 Hz if needed
+        target_sr = 16000
+        if sr != target_sr:
+            audio_resampled = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
+        else:
+            audio_resampled = audio
+
+        # Save the resampled audio
+        sf.write(output_path, audio_resampled, samplerate=target_sr)
+        logger.info(f"Audio successfully resampled to {target_sr} Hz (Mono): {output_path}", exc_info=True)
+
+    except Exception as e:
+        logger.error(f"Error during resampling to 22.050 Hz: {e}")
+
+def detect_speech(audio_path, output_json_path):
+    """Führt eine Sprachaktivitätserkennung (VAD) mit Silero VAD durch."""
+    try:
+        logger.info("Lade Silero VAD-Modell...")
+        vad_model = load_silero_vad(onnx=USE_ONNX)
+        logger.info("Starte Sprachaktivitätserkennung...")
+        wav = read_audio(audio_path, SAMPLING_RATE)
+        speech_timestamps = get_speech_timestamps(
+            wav,
+            vad_model,
+            sampling_rate=SAMPLING_RATE,
+            return_seconds=True,
+            visualize_probs=True
+        )
+        with open("timestamps_raw.json", "w", encoding="utf-8") as file:
+            json.dump(speech_timestamps, file, ensure_ascii=False, indent=4)
+
+        # Nahe beieinander liegende Segmente zusammenführen
+        merged_segments = []
+        prev_end = 0
+        max_silence_gap = 500
+        if not speech_timestamps:
+            return []
+    
+        merged_segments = [speech_timestamps[0].copy()]  # Erstes Segment kopieren
+        prev_end = merged_segments[0]['end']
+    
+        for segment in speech_timestamps[1:]:
+            current_start = segment['start']
+            if current_start - prev_end <= max_silence_gap:
+                # Segmente zusammenführen
+                merged_segments[-1]['end'] = segment['end']
+            else:
+                # Neues Segment hinzufügen
+                merged_segments.append(segment.copy())
+            prev_end = segment['end']
+        with open("merged_segments.json", "w", encoding="utf-8") as file:
+            json.dump(merged_segments, file, ensure_ascii=False, indent=4)
+        
+
+        # Konvertiere Zeitstempel in Samples
+        speech_timestamps_samples = [
+            {"start": int(ts["start"] * SAMPLING_RATE), "end": int(ts["end"] * SAMPLING_RATE)}
+            for ts in speech_timestamps
+        ]
+
+        # Speichere nur die Sprachsegmente als separate WAV-Datei
+        save_audio('only_speech.wav', collect_chunks(speech_timestamps_samples, wav), sampling_rate=SAMPLING_RATE)
+        Audio('only_speech.wav')
+        
+        # Konvertiere die Zeitstempel in ein serialisierbares Format
+        serializable_timestamps = [
+            {"start": float(ts["start"]), "end": float(ts["end"])}
+            for ts in speech_timestamps
+        ]
+        # Schreibe die Ergebnisse in eine JSON-Datei
+        with open(output_json_path, "w", encoding="utf-8") as file:
+            json.dump(serializable_timestamps, file, ensure_ascii=False, indent=4)
+
+            logger.info("Sprachaktivitätserkennung abgeschlossen!")
+            return serializable_timestamps
+    except Exception as e:
+        logger.error(f"Fehler bei der Sprachaktivitätserkennung: {e}", exc_info=True)
+        return []
 
 def create_voice_sample(audio_path, sample_path):
 
@@ -236,7 +304,7 @@ def create_voice_sample(audio_path, sample_path):
     if os.path.exists(sample_path):
         choice = input("Eine sample.wav existiert bereits. Möchten Sie eine neue erstellen? (j/n, ENTER zum Überspringen): ").strip().lower()
         if choice == "" or choice in ["n", "nein"]:
-            logger.info("Verwende vorhandene sample.wav.")
+            logger.info("Verwende vorhandene sample.wav.", exc_info=True)
             return
 
     while True:
@@ -244,7 +312,7 @@ def create_voice_sample(audio_path, sample_path):
         end_time = input("Endzeit für das Sample (in Sekunden): ")
         
         if start_time == "" or end_time == "":
-            logger.info("Erstellung der sample.wav übersprungen.")
+            logger.info("Erstellung der sample.wav übersprungen.", exc_info=True)
             return
         
         try:
@@ -260,70 +328,69 @@ def create_voice_sample(audio_path, sample_path):
                 sample_path,
                 acodec='pcm_s16le',
                 ac=1,
-                ar=24000
+                ar=22050
             ).overwrite_output().run(capture_stdout=True, capture_stderr=True)
             
-            logger.info(f"Voice sample erstellt: {sample_path}")
+            logger.info(f"Voice sample erstellt: {sample_path}", exc_info=True)
             break
         except ValueError:
             logger.error("Ungültige Eingabe. Bitte gültige Zahlen eintragen.")
         except ffmpeg.Error as e:
             logger.error(f"Fehler beim Erstellen des Voice Samples: {e}")
 
-def transcribe_audio_with_timestamps(audio_file, speech_timestamps):
+def transcribe_audio_with_timestamps(audio_file, transcription_file):
     """Führt eine Spracherkennung mit Whisper durch und speichert die Transkription (inkl. Zeitstempel) in einer JSON-Datei."""
-    if os.path.exists(speech_timestamps):
-        if not ask_overwrite(speech_timestamps):
-            logger.info(f"Verwende vorhandene Transkription: {speech_timestamps}")
-            with open(speech_timestamps, "r", encoding="utf-8") as file:
+    if os.path.exists(transcription_file):
+        if not ask_overwrite(transcription_file):
+            logger.info(f"Verwende vorhandene Transkription: {transcription_file}", exc_info=True)
+            with open(transcription_file, "r", encoding="utf-8") as file:
                 return json.load(file)
     try:
-        logger.info("Lade Whisper-Modell (large-v3)...")
+        logger.info("Lade Whisper-Modell (large-v3-turbo)...", exc_info=True)
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = whisper.load_model("large-v3-turbo").to(device)
-        logger.info("Starte Transkription...")
-        result = model.transcribe(audio_file)
-        segments = result["segments"]
-        for i, segment in enumerate(speech_timestamps):
-            start = segment['start'] / 16000  # Umrechnung in Sekunden
-            end = segment['end'] / 16000
-            text = result['text'][i] if i < len(result['text']) else ""
-            segments.append({"start": start, "end": end, "text": text})
-        with open(speech_timestamps, "w", encoding="utf-8") as file:
+        logger.info("Starte Transkription...", exc_info=True)
+        result = model.transcribe(audio_file, verbose=True, language="en")
+        #segments = result["segments"]
+        for segment in result["segments"]:
+            segment["start"] = max(segment["start"] - 0, 0)  # Startzeit anpassen
+            segment["end"] = max(segment["end"] - 2, 0)      # Endzeit anpassen
+        with open(transcription_file, "w", encoding="utf-8") as file:
             json.dump(result["segments"], file, ensure_ascii=False, indent=4)
-        logger.info("Transkription abgeschlossen!")
+        logger.info("Transkription abgeschlossen!", exc_info=True)
         return result["segments"]
     except Exception as e:
         logger.error(f"Fehler bei der Transkription: {e}", exc_info=True)
         return []
 
-# MarianMT für Übersetzung
 def translate_segments(segments, translation_file, source_lang="en", target_lang="de"):
     """Übersetzt die bereits transkribierten Segmente mithilfe von MarianMT."""
     if os.path.exists(translation_file):
         if not ask_overwrite(translation_file):
-            logger.info(f"Verwende vorhandene Übersetzungen: {translation_file}")
+            logger.info(f"Verwende vorhandene Übersetzungen: {translation_file}", exc_info=True)
             with open(translation_file, "r", encoding="utf-8") as file:
                 return json.load(file)
+            
     try:
         if not segments:
             logger.error("Keine Segmente für die Übersetzung gefunden.")
             return []
-        model_name = f"Helsinki-NLP/opus-mt-{source_lang}-{target_lang}"
-        logger.info(f"Lade Übersetzungsmodell: {model_name}")
+        
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model_name = (f"Helsinki-NLP/opus-mt-{source_lang}-{target_lang}")
+        logger.info(f"Lade Übersetzungsmodell: {model_name}", exc_info=True)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = MarianMTModel.from_pretrained(model_name).to(device)
 
         for segment in segments:
-            input_ids = tokenizer(segment["text"], return_tensors="pt").input_ids
-            outputs = model.generate(**input_ids, max_length=512, num_beams=8, early_stopping=True)
+            inputs = tokenizer(segment["text"], return_tensors="pt")
+            inputs = {k: v.to(device) for k, v in inputs.items()}  # Verschiebe alle Eingaben auf das Gerät
+            outputs = model.generate(**inputs, max_length=512, num_beams=8, early_stopping=True)
             segment["translated_text"] = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
         with open(translation_file, "w", encoding="utf-8") as file:
             json.dump(segments, file, ensure_ascii=False, indent=4)
-        logger.info("Übersetzung abgeschlossen!")
-
+            logger.info("Übersetzung abgeschlossen!")
         return segments
 
     except Exception as e:
@@ -334,30 +401,45 @@ def text_to_speech_with_voice_cloning(segments, sample_path, output_path):
     """Führt die Umwandlung von Text zu Sprache durch (TTS), inklusive Stimmenklonung basierend auf sample.wav."""
     if os.path.exists(output_path):
         if not ask_overwrite(output_path):
-            logger.info(f"TTS-Audio bereits vorhanden: {output_path}")
+            logger.info(f"TTS-Audio bereits vorhanden: {output_path}", exc_info=True)
             return
     try:
-        logger.info("Lade TTS-Modell (multilingual/multi-dataset/xtts_v2)...")
+        logger.info("Lade TTS-Modell (multilingual/multi-dataset/xtts_v2)...", exc_info=True)
         device = "cuda" if torch.cuda.is_available() else "cpu"
         tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=True).to(device)
         sampling_rate = tts.synthesizer.output_sample_rate
-
-        full_audio = np.array([])
+        final_audio_segments = [np.array([])]
         for segment in segments:
             translated_text = segment.get("translated_text", "")
             start_time = segment["start"]
             end_time = segment["end"]
             duration = end_time - start_time
-            logger.info(f"Erzeuge Audio für Segment ({start_time:.2f}-{end_time:.2f}s): {translated_text}")
-            audio = tts.tts(
+            logger.info(f"Erzeuge Audio für Segment ({start_time:.2f}-{end_time:.2f}s): {translated_text}", exc_info=True)
+            
+            # Adaptive Geschwindigkeit
+            base_speed = 1.2
+            if len(translated_text) > 50:
+                speed = min(base_speed * 1.5, 2.0)
+            else:
+                speed = base_speed
+            # TTS mit dynamischer Geschwindigkeit
+            audio_clip = tts.tts(
                 text=segment["translated_text"],
                 speaker_wav=sample_path,
-                language="de"
+                language="de",
+                speed=speed
                 )
-            full_audio = np.concatenate((full_audio, audio))
-        torchaudio.save(output_path, torch.tensor(full_audio).unsqueeze(0), 24000)
-        sf.write(output_path, full_audio, samplerate=sampling_rate)
-        logger.info(f"TTS-Audio mit geklonter Stimme erstellt: {output_path}")
+            text_length_factor = len(translated_text) * 0.1  # Kürzere Texte = kürzere Pausen
+            clip_length = len(audio_clip) / sampling_rate
+            pause_duration = max(0, duration - clip_length - text_length_factor)
+            #pause_duration = max(0, duration - clip_length -0.2)
+            silence = np.zeros(int(pause_duration * sampling_rate))
+            final_audio_segments.append(audio_clip)
+            final_audio_segments.append(silence)
+        final_audio = np.concatenate(final_audio_segments)
+        torchaudio.save(output_path, torch.tensor(final_audio).unsqueeze(0), 24000)
+        sf.write(output_path, final_audio, samplerate=sampling_rate)
+        logger.info(f"TTS-Audio mit geklonter Stimme erstellt: {output_path}", exc_info=True)
     except Exception as e:
         logger.error(f"Fehler bei Text-to-Speech mit Stimmenklonen: {e}")
 
@@ -367,14 +449,14 @@ def resample_to_44100_stereo(input_path, output_path, speed_factor):
     """
     if os.path.exists(output_path):
         if not ask_overwrite(output_path):
-            logger.info(f"Verwende vorhandene Datei: {output_path}")
+            logger.info(f"Verwende vorhandene Datei: {output_path}", exc_info=True)
             return
 
     try:
         # Lade Audio in mono (falls im Original), dann dupliziere ggf. auf 2 Kanäle
         audio, sr = librosa.load(input_path, sr=None, mono=True)
         audio = np.vstack([audio, audio])  # Duplicate mono channel to create stereo
-        logger.info(f"Original-Samplingrate: {sr} Hz")
+        logger.info(f"Original-Samplingrate: {sr} Hz", exc_info=True)
 
         target_sr = 44100
 
@@ -413,7 +495,7 @@ def resample_to_44100_stereo(input_path, output_path, speed_factor):
             f"- Geschwindigkeitsfaktor: {speed_factor}",
             f"- Lautstärkeanpassung: {VOLUME_ADJUSTMENT_44100}",
             f"- Datei: {output_path}"
-        ]))
+            ]), exc_info=True)
 
     except Exception as e:
         logger.error(f"Fehler beim Resampling auf 44.100 Hz: {e}")
@@ -422,7 +504,7 @@ def adjust_playback_speed(video_path, adjusted_video_path, speed_factor):
     """Passt die Wiedergabegeschwindigkeit des Originalvideos an und nutzt einen separaten Lautstärkefaktor für das Video."""
     if os.path.exists(adjusted_video_path):
         if not ask_overwrite(adjusted_video_path):
-            logger.info(f"Verwende vorhandene Datei: {adjusted_video_path}")
+            logger.info(f"Verwende vorhandene Datei: {adjusted_video_path}", exc_info=True)
             return
     try:
         video_speed = 1 / speed_factor
@@ -433,7 +515,8 @@ def adjust_playback_speed(video_path, adjusted_video_path, speed_factor):
                         af=f"atempo={audio_speed}"
         ).run(overwrite_output=True)
         logger.info(
-            f"Videogeschwindigkeit angepasst (Faktor={speed_factor}): {adjusted_video_path} "
+            f"Videogeschwindigkeit angepasst (Faktor={speed_factor}): {adjusted_video_path} ",
+            exc_info=True
             #f"und Lautstärke={VOLUME_ADJUSTMENT_VIDEO}"
         )
     except ffmpeg.Error as e:
@@ -452,7 +535,7 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
         return
     if os.path.exists(final_video_path):
         if not ask_overwrite(final_video_path):
-            logger.info(f"Verwende vorhandene Datei: {final_video_path}")
+            logger.info(f"Verwende vorhandene Datei: {final_video_path}", exc_info=True)
             return
     try:
         filter_complex = (
@@ -474,7 +557,7 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
             map="0:v",
             map_metadata="-1"
         ).overwrite_output().run()
-        logger.info(f"Finales Video erstellt und gemischt: {final_video_path}")
+        logger.info(f"Finales Video erstellt und gemischt: {final_video_path}", exc_info=True)
     except ffmpeg.Error as e:
         logger.error(f"Fehler beim Kombinieren von Video und Audio: {e}")
 
@@ -495,19 +578,20 @@ def main():
     extract_audio_ffmpeg(VIDEO_PATH, ORIGINAL_AUDIO_PATH)
 
     # 3) Audio resamplen auf 22.050 Hz, Mono (für TTS)
-    resample_to_16000_mono(ORIGINAL_AUDIO_PATH, DOWNSAMPLED_AUDIO_PATH, SPEED_FACTOR_RESAMPLE_16000)
- 
+    process_audio(ORIGINAL_AUDIO_PATH, PROCESSED_AUDIO_PATH)
+    resample_to_16000_mono(PROCESSED_AUDIO_PATH, PROCESSED_AUDIO_PATH_SPEED, SPEED_FACTOR_RESAMPLE_16000)
+
     # 4) Audioverarbeitung (Rauschunterdrückung und Lautheitsnormalisierung)
-    process_audio(DOWNSAMPLED_AUDIO_PATH, PROCESSED_AUDIO_PATH)
+    
 
     # 4.1) Spracherkennung (VAD) mit Silero VAD
-    speech_timestamps = detect_speech(PROCESSED_AUDIO_PATH)
+    detect_speech(PROCESSED_AUDIO_PATH_SPEED, SPEECH_TIMESTAMPS)
     
     # 5) Optional: Erstellung eines Voice-Samples für die Stimmenklonung
     create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH)
 
     # 6) Spracherkennung (Transkription) mit Whisper
-    segments = transcribe_audio_with_timestamps(speech_timestamps, TRANSCRIPTION_FILE)
+    segments = transcribe_audio_with_timestamps(SPEECH_TIMESTAMPS_WAV, TRANSCRIPTION_FILE)
     if not segments:
         logger.error("Transkription fehlgeschlagen oder keine Segmente gefunden.")
         return
@@ -519,6 +603,8 @@ def main():
     if not translated_segments:
         logger.error("Übersetzung fehlgeschlagen oder keine Segmente vorhanden.")
         return
+    with open(TRANSLATION_FILE, "w", encoding="utf-8") as f:
+        json.dump(translated_segments, f, ensure_ascii=False, indent=4)
 
     # 8) Text-to-Speech (TTS) mit Stimmenklonung
     text_to_speech_with_voice_cloning(translated_segments, SAMPLE_PATH, TRANSLATED_AUDIO_WITH_PAUSES)
@@ -536,7 +622,7 @@ def main():
     print(f"\nGesamtprozessdauer: {(total_time / 60):.2f} Minuten -> {(total_time / 60 / 60):.2f} Stunden")
     print("\nZeiten für einzelne Zwischenschritte:")
 
-    logger.info(f"Projekt abgeschlossen! Finale Ausgabedatei: {FINAL_VIDEO_PATH}")
+    logger.info(f"Projekt abgeschlossen! Finale Ausgabedatei: {FINAL_VIDEO_PATH}", exc_info=True)
 
 if __name__ == "__main__":
     main()
