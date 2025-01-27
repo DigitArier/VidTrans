@@ -30,9 +30,9 @@ from scipy.signal import butter, lfilter
 #import collections
 
 # Geschwindigkeitseinstellungen
-SPEED_FACTOR_RESAMPLE_16000 = 1.1   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
-SPEED_FACTOR_RESAMPLE_44100 = 1.3   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
-SPEED_FACTOR_PLAYBACK = 0.85        # Geschwindigkeitsfaktor für die Wiedergabe des Videos
+SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
+SPEED_FACTOR_RESAMPLE_44100 = 1.0   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
+SPEED_FACTOR_PLAYBACK = 1.0        # Geschwindigkeitsfaktor für die Wiedergabe des Videos
 
 # Lautstärkeanpassungen
 VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
@@ -233,67 +233,91 @@ def resample_to_16000_mono(input_path, output_path, speed_factor):
     except Exception as e:
         logger.error(f"Error during resampling to 22.050 Hz: {e}")
 
-def detect_speech(audio_path, output_json_path):
+def detect_speech(audio_path, only_speech_path):
     """Führt eine Sprachaktivitätserkennung (VAD) mit Silero VAD durch."""
+    if os.path.exists(only_speech_path):
+        if not ask_overwrite(only_speech_path):
+            logger.info(f"Verwende vorhandene Datei: {only_speech_path}", exc_info=True)
+            return
     try:
+        sampling_rate=SAMPLING_RATE
         logger.info("Lade Silero VAD-Modell...")
         vad_model = load_silero_vad(onnx=USE_ONNX)
         logger.info("Starte Sprachaktivitätserkennung...")
-        wav = read_audio(audio_path, SAMPLING_RATE)
-        speech_timestamps = get_speech_timestamps(
-            wav,
-            vad_model,
-            sampling_rate=SAMPLING_RATE,
-            return_seconds=True,
-            visualize_probs=True
-        )
-        with open("timestamps_raw.json", "w", encoding="utf-8") as file:
-            json.dump(speech_timestamps, file, ensure_ascii=False, indent=4)
-
-        # Nahe beieinander liegende Segmente zusammenführen
-        merged_segments = []
-        prev_end = 0
-        max_silence_gap = 500
-        if not speech_timestamps:
-            return []
-    
-        merged_segments = [speech_timestamps[0].copy()]  # Erstes Segment kopieren
-        prev_end = merged_segments[0]['end']
-    
-        for segment in speech_timestamps[1:]:
-            current_start = segment['start']
-            if current_start - prev_end <= max_silence_gap:
-                # Segmente zusammenführen
-                merged_segments[-1]['end'] = segment['end']
-            else:
-                # Neues Segment hinzufügen
-                merged_segments.append(segment.copy())
-            prev_end = segment['end']
-        with open("merged_segments.json", "w", encoding="utf-8") as file:
-            json.dump(merged_segments, file, ensure_ascii=False, indent=4)
+        wav = read_audio(audio_path, sampling_rate)
         
+        # Initialize output_audio as a 2D tensor [1, samples]
+        output_audio = torch.zeros((1, len(wav)), dtype=wav.dtype, device=wav.device)
+        
+        speech_timestamps = get_speech_timestamps(
+            wav,                                # Audio-Daten
+            vad_model,                          # Silero VAD-Modell
+            sampling_rate=SAMPLING_RATE,        # 16.000 Hz
+            return_seconds=True,                # Rückgabe in Sekunden
+            threshold=0.4,                      # Weniger empfindlich
+        )
+        # Überprüfe, ob Sprachaktivität gefunden wurde
+        if not speech_timestamps:
+            logger.warning("Keine Sprachaktivität gefunden. Das Audio enthält möglicherweise nur Stille oder Rauschen.")
+            return []
+        
+        # Setze die sprachaktiven Abschnitte in das leere Audio-Array
+        prev_end = 0                                    # Startzeit des vorherigen Segments
+        max_silence_samples = int(1.0 * sampling_rate)  # Maximal 2 Sekunden Stille
 
+        for segment in speech_timestamps:
+            start = int(segment['start'] * sampling_rate)   # Sekunden in Samples umrechnen
+            end = int(segment['end'] * sampling_rate)       # Sekunden in Samples umrechnen
+    
+            # Kürze die Stille zwischen den Segmenten
+            silence_duration = start - prev_end             # Dauer der Stille
+            if silence_duration > max_silence_samples:      # Wenn die Stille zu lang ist
+                start = prev_end + max_silence_samples      # Startzeit anpassen
+    
+            output_audio[:, start:end] = wav[start:end]     # Kopiere den Abschnitt in das Ausgabe-Audio
+            prev_end = end                                  # Speichere das Ende des aktuellen Segments
+            
+        # Speichere das modifizierte Audio
+        torchaudio.save(only_speech_path, output_audio, sampling_rate)
+        # Schreibe die Ergebnisse in eine JSON-Datei
+        with open(SPEECH_TIMESTAMPS, "w", encoding="utf-8") as file:
+            json.dump(speech_timestamps, file, ensure_ascii=False, indent=4)
+        
+        # Nahe beieinander liegende Segmente zusammenführen
+        #merged_segments = []
+        #prev_end = 0
+        #max_silence_gap = 500
+        #if not speech_timestamps:
+        #    return []
+        #merged_segments = [speech_timestamps[0].copy()]  # Erstes Segment kopieren
+        #prev_end = merged_segments[0]['end']
+    
+        #for segment in speech_timestamps[1:]:
+        #    current_start = segment['start']
+        #    if current_start - prev_end <= max_silence_gap:
+        #        # Segmente zusammenführen
+        #        merged_segments[-1]['end'] = segment['end']
+        #    else:
+        #        # Neues Segment hinzufügen
+        #        merged_segments.append(segment.copy())
+        #    prev_end = segment['end']
+        #with open("merged_segments.json", "w", encoding="utf-8") as file:
+        #    json.dump(merged_segments, file, ensure_ascii=False, indent=4)
+        
         # Konvertiere Zeitstempel in Samples
         speech_timestamps_samples = [
             {"start": int(ts["start"] * SAMPLING_RATE), "end": int(ts["end"] * SAMPLING_RATE)}
             for ts in speech_timestamps
         ]
-
         # Speichere nur die Sprachsegmente als separate WAV-Datei
-        save_audio('only_speech.wav', collect_chunks(speech_timestamps_samples, wav), sampling_rate=SAMPLING_RATE)
-        Audio('only_speech.wav')
-        
-        # Konvertiere die Zeitstempel in ein serialisierbares Format
-        serializable_timestamps = [
-            {"start": float(ts["start"]), "end": float(ts["end"])}
-            for ts in speech_timestamps
-        ]
-        # Schreibe die Ergebnisse in eine JSON-Datei
-        with open(output_json_path, "w", encoding="utf-8") as file:
-            json.dump(serializable_timestamps, file, ensure_ascii=False, indent=4)
+        save_audio(
+            'only_speech_silero.wav',
+            collect_chunks(speech_timestamps_samples, wav),
+                    sampling_rate=SAMPLING_RATE
+                    )
 
-            logger.info("Sprachaktivitätserkennung abgeschlossen!")
-            return serializable_timestamps
+        logger.info("Sprachaktivitätserkennung abgeschlossen!")
+        return speech_timestamps
     except Exception as e:
         logger.error(f"Fehler bei der Sprachaktivitätserkennung: {e}", exc_info=True)
         return []
@@ -350,7 +374,16 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = whisper.load_model("large-v3-turbo").to(device)
         logger.info("Starte Transkription...", exc_info=True)
-        result = model.transcribe(audio_file, verbose=True, language="en")
+        result = model.transcribe(
+            audio_file,                 # Audio-Datei
+            verbose=True,               # Ausführliche Ausgabe
+            language="en",              # Englische Sprache
+            #best_of=5,                  # Anzahl der besten Ergebnisse
+            #beam_size=10,               # Anzahl der Hypothesen
+            #word_timestamps=True,       # Zeitstempel für jedes Wort
+            #temperature=0.1,            # Temperatur für Sampling
+            #no_speech_threshold=1.0     # Schwellenwert für Stille
+            )
         #segments = result["segments"]
         for segment in result["segments"]:
             segment["start"] = max(segment["start"] - 0, 0)  # Startzeit anpassen
@@ -397,6 +430,15 @@ def translate_segments(segments, translation_file, source_lang="en", target_lang
         logger.error(f"Fehler bei der Übersetzung: {e}")
         return []
 
+def apply_denoising(audio, sr):
+    """Rauschfilter für Audio-Postprocessing"""
+    audio_tensor = torch.FloatTensor(audio).unsqueeze(0)
+    return torchaudio.functional.lowpass_biquad(
+        audio_tensor, 
+        sample_rate=sr, 
+        cutoff_freq=8000
+    ).squeeze().numpy()
+
 def text_to_speech_with_voice_cloning(segments, sample_path, output_path):
     """Führt die Umwandlung von Text zu Sprache durch (TTS), inklusive Stimmenklonung basierend auf sample.wav."""
     if os.path.exists(output_path):
@@ -406,39 +448,49 @@ def text_to_speech_with_voice_cloning(segments, sample_path, output_path):
     try:
         logger.info("Lade TTS-Modell (multilingual/multi-dataset/xtts_v2)...", exc_info=True)
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        #tts = TTS(model_name="tts_models/de/thorsten/tacotron2-DDC", progress_bar=True).to(device)
+        #tts = TTS(model_name="tts_models/de/thorsten/vits", progress_bar=True).to(device)
         tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=True).to(device)
-        sampling_rate = tts.synthesizer.output_sample_rate
-        final_audio_segments = [np.array([])]
-        for segment in segments:
-            translated_text = segment.get("translated_text", "")
-            start_time = segment["start"]
-            end_time = segment["end"]
-            duration = end_time - start_time
+        sampling_rate = tts.synthesizer.output_sample_rate          # 24.000 Hz
+        final_audio_segments = [np.array([])]                       # Array für die kombinierten Audio-Segmente
+        for segment in segments:                                    # Jedes Segment einzeln verarbeiten
+            translated_text = segment.get("translated_text", "")    # Übersetzter Text
+            start_time = segment["start"]                           # Startzeit des Segments
+            end_time = segment["end"]                               # Endzeit des Segments
+            duration = end_time - start_time                        # Dauer des Segments
             logger.info(f"Erzeuge Audio für Segment ({start_time:.2f}-{end_time:.2f}s): {translated_text}", exc_info=True)
-            
             # Adaptive Geschwindigkeit
-            base_speed = 1.2
+            base_speed = 1.5
             if len(translated_text) > 50:
-                speed = min(base_speed * 1.5, 2.0)
+                speed = min(base_speed * 1.7, 2.0)
             else:
                 speed = base_speed
             # TTS mit dynamischer Geschwindigkeit
             audio_clip = tts.tts(
-                text=segment["translated_text"],
-                speaker_wav=sample_path,
-                language="de",
-                speed=speed
+                text=segment["translated_text"],    # Übersetzter Text
+                speaker_wav=sample_path,            # Stimmenklon-Sample
+                emotion="neutral",                  # Emotion
+                language="de",                      # Zielsprache
+                temperature=0.5,                    # Temperatur für Sampling
+                length_penalty=0.6,                 # Längenpenalität
+                repetition_penalty=7.5,             # Wiederholungspenalität
+                speed=speed,                        # Sprechgeschwindigkeit
+                decoder_iterations=200,             # Anzahl der Dekodierungsiterationen
+                denoiser_strength=0.02,             # Stärke des Rauschfilters
+                sound_norm_refs=True                # Normalisierung
                 )
-            text_length_factor = len(translated_text) * 0.1  # Kürzere Texte = kürzere Pausen
-            clip_length = len(audio_clip) / sampling_rate
-            pause_duration = max(0, duration - clip_length - text_length_factor)
+            # Pausenlänge basierend auf Textlänge und Clip-Länge
+            text_length_factor = len(translated_text) * 0.1                         # Kürzere Texte = kürzere Pausen
+            clip_length = len(audio_clip) / sampling_rate                           # Länge des Audio-Clips in Sekunden
+            pause_duration = max(0, duration - clip_length - text_length_factor)    # Pausenlänge berechnen
             #pause_duration = max(0, duration - clip_length -0.2)
-            silence = np.zeros(int(pause_duration * sampling_rate))
-            final_audio_segments.append(audio_clip)
-            final_audio_segments.append(silence)
-        final_audio = np.concatenate(final_audio_segments)
-        torchaudio.save(output_path, torch.tensor(final_audio).unsqueeze(0), 24000)
-        sf.write(output_path, final_audio, samplerate=sampling_rate)
+            silence = np.zeros(int(pause_duration * sampling_rate))                 # Stille erzeugen
+            final_audio_segments.append(audio_clip)                                 # Audio-Clip hinzufügen
+            final_audio_segments.append(silence)                                    # Stille hinzufügen
+        final_audio = np.concatenate(final_audio_segments)                          # Alle Segmente zusammenfügen
+        final_audio = apply_denoising(final_audio, sampling_rate)                   # Rauschfilter anwenden
+        torchaudio.save(output_path, torch.tensor(final_audio).unsqueeze(0), 24000) # Audio speichern
+        sf.write(output_path, final_audio, samplerate=sampling_rate, subtype='PCM_24')
         logger.info(f"TTS-Audio mit geklonter Stimme erstellt: {output_path}", exc_info=True)
     except Exception as e:
         logger.error(f"Fehler bei Text-to-Speech mit Stimmenklonen: {e}")
@@ -577,21 +629,20 @@ def main():
     # 2) Audiospur aus dem Video extrahieren (Mono, 44.1 kHz)
     extract_audio_ffmpeg(VIDEO_PATH, ORIGINAL_AUDIO_PATH)
 
-    # 3) Audio resamplen auf 22.050 Hz, Mono (für TTS)
+    # 3) Audioverarbeitung (Rauschunterdrückung und Lautheitsnormalisierung)
     process_audio(ORIGINAL_AUDIO_PATH, PROCESSED_AUDIO_PATH)
+
+    # 4) Audio resamplen auf 22.050 Hz, Mono (für TTS)
     resample_to_16000_mono(PROCESSED_AUDIO_PATH, PROCESSED_AUDIO_PATH_SPEED, SPEED_FACTOR_RESAMPLE_16000)
 
-    # 4) Audioverarbeitung (Rauschunterdrückung und Lautheitsnormalisierung)
-    
-
     # 4.1) Spracherkennung (VAD) mit Silero VAD
-    detect_speech(PROCESSED_AUDIO_PATH_SPEED, SPEECH_TIMESTAMPS)
+    detect_speech(PROCESSED_AUDIO_PATH_SPEED, ONLY_SPEECH)
     
     # 5) Optional: Erstellung eines Voice-Samples für die Stimmenklonung
     create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH)
 
     # 6) Spracherkennung (Transkription) mit Whisper
-    segments = transcribe_audio_with_timestamps(SPEECH_TIMESTAMPS_WAV, TRANSCRIPTION_FILE)
+    segments = transcribe_audio_with_timestamps(ONLY_SPEECH, TRANSCRIPTION_FILE)
     if not segments:
         logger.error("Transkription fehlgeschlagen oder keine Segmente gefunden.")
         return
