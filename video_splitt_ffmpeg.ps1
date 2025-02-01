@@ -2,7 +2,7 @@
 $duration = ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "its Worse than You think full documentary.mp4"
 
 # Anzahl der Segmente festlegen
-$segments = 7
+$segments = 6
 
 # Segmentdauer berechnen
 $segment_time = [math]::Round($duration / $segments, 2)
