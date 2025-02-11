@@ -1,10 +1,12 @@
 import os
 import io
+import re
 from pathlib import Path
 import subprocess
 import ffmpeg
 import logging
 import librosa
+import matplotlib.pyplot as plt
 import soundfile as sf
 import numpy as np
 import json
@@ -23,11 +25,14 @@ from config import *
 from tqdm import tqdm
 from contextlib import contextmanager
 from transformers import (
+    AutoModelForSeq2SeqLM,
     AutoTokenizer,
     MarianMTModel,
+    MarianTokenizer,
     PreTrainedModel,
     AutoModelForCausalLM,
     GenerationMixin,
+    T5Config,
     T5Tokenizer,
     T5ForConditionalGeneration,
     WhisperFeatureExtractor,
@@ -59,8 +64,8 @@ from silero_vad import(
 
 # Geschwindigkeitseinstellungen
 SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
-SPEED_FACTOR_RESAMPLE_44100 = 1.1   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
-SPEED_FACTOR_PLAYBACK = 1.0         # Geschwindigkeitsfaktor für die Wiedergabe des Videos
+SPEED_FACTOR_RESAMPLE_44100 = 1.0   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
+SPEED_FACTOR_PLAYBACK = 1.0        # Geschwindigkeitsfaktor für die Wiedergabe des Videos
 
 # Lautstärkeanpassungen
 VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
@@ -71,8 +76,6 @@ VOLUME_ADJUSTMENT_VIDEO = 0.05   # Lautstärkefaktor für das Video
 # ==============================
 logging.basicConfig(filename='video_translation_final.log', format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
-WHISPER_PROCESSOR = WhisperProcessor.from_pretrained("openai/whisper-large-v3-turbo")
-feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v3-turbo")
 _WHISPER_MODEL = None
 _TRANSLATE_MODEL = None
 _TTS_MODEL = None
@@ -87,7 +90,7 @@ _TTS_MODEL = None
 start_time = time.time()
 step_times = {}
 device = "cuda" if torch.cuda.is_available() else "cpu"
-source_lang="en"
+source_lang="pl"
 target_lang="de"
 # Konfigurationen für die Verwendung von CUDA
 cuda_options = {
@@ -118,8 +121,8 @@ step_start_time = time.time()
 def get_whisper_model():
     global _WHISPER_MODEL
     if not _WHISPER_MODEL:
-        _WHISPER_MODEL = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3-turbo").to(device)
-#        _WHISPER_MODEL = whisper.load_model("large-v3-turbo", device=device, in_memory=True)
+#        _WHISPER_MODEL = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3").to(device)
+        _WHISPER_MODEL = whisper.load_model("large-v3", device=device, in_memory=True)
         _WHISPER_MODEL.to(torch.device("cuda"))
         torch.cuda.empty_cache()
     return _WHISPER_MODEL
@@ -145,12 +148,15 @@ def get_tts_model():
     global _TTS_MODEL
     if not _TTS_MODEL:
         _TTS_MODEL = TTS(
-            model_name="tts_models/multilingual/multi-dataset/xtts_v2",
+            model_name="tts_models/de/thorsten/tacotron2-DDC",
             progress_bar=True,
-            vocoder_path=vocoder_pth,
-            vocoder_config_path=vocoder_cfg,
-            vocoder_name="wavegrad",
+#            vocoder_path=vocoder_pth,
+#            vocoder_config_path=vocoder_cfg,
+#            vocoder_name="wavegrad",
             )
+# tts_models/de/thorsten/vits
+# tts_models/de/thorsten/tacotron2-DDC
+# tts_models/de/thorsten/tacotron2-DDC
         _TTS_MODEL.to(torch.device("cuda"))
         #torch.load(_TTS_MODEL, weights_only=True)
         torch.cuda.empty_cache()
@@ -185,11 +191,14 @@ def extract_audio_ffmpeg(video_path, audio_output):
         logger.error(f"Fehler bei der Audioextraktion: {e}")
 
 def process_audio(input_file, output_file):
-
     if os.path.exists(output_file):
         if not ask_overwrite(output_file):
             logger.info(f"Verwende vorhandene Datei: {output_file}", exc_info=True)
             return
+        
+    print("--------------------------------")
+    print("<< Starte Audio-Verarbeitung >>|")
+    print("--------------------------------")
         
     # Helper function to save and log intermediate steps
     def save_step(audio_segment, filename):
@@ -202,12 +211,12 @@ def process_audio(input_file, output_file):
     
     # 2. High-Pass Filter für klare Stimme (z.B. 80-100 Hz)
     #    Filtert tieffrequentes Dröhnen/Brummen heraus [1][2].
-    audio_hp = high_pass_filter(audio, cutoff=100)
+    audio_hp = high_pass_filter(audio, cutoff=150)
     save_step(audio_hp, "process_high_pass.wav")
     
     # 3. Noise Gate, um Atem und Hintergrundrauschen zu unterdrücken
     #    Threshold je nach Sprechpegel, z.B. -48 dB [2][7].
-    def noise_gate(audio_segment, threshold_db=-20):
+    def noise_gate(audio_segment, threshold_db=-40):
         samples = np.array(audio_segment.get_array_of_samples(), dtype=np.float32)
         max_amplitude = np.max(np.abs(samples))
         
@@ -233,7 +242,7 @@ def process_audio(input_file, output_file):
         mid_band = signal.lfilter(b_mid, a_mid, samples)
         high_band = signal.lfilter(b_high, a_high, samples)
         
-        def compress(signal_band, threshold=0.1, ratio=4.0):
+        def compress(signal_band, threshold=0.1, ratio=5.0):
             # Soft-Knee-ähnliche Funktion
             compressed = np.where(
                 np.abs(signal_band) > threshold,
@@ -242,9 +251,9 @@ def process_audio(input_file, output_file):
             )
             return compressed
         
-        low_band_comp = compress(low_band, threshold=0.1, ratio=3.0)
-        mid_band_comp = compress(mid_band, threshold=0.1, ratio=4.0)
-        high_band_comp = compress(high_band, threshold=0.1, ratio=4.0)
+        low_band_comp = compress(low_band, threshold=0.1, ratio=3.5)
+        mid_band_comp = compress(mid_band, threshold=0.1, ratio=4.5)
+        high_band_comp = compress(high_band, threshold=0.1, ratio=4.5)
         
         # Bänder normalisieren:
         def normalize_band(band):
@@ -274,7 +283,7 @@ def process_audio(input_file, output_file):
     # 5. Equalizer (z.B. zusätzlicher High-Pass + leichte Absenkung um 400-500 Hz),
     #    sowie Anheben der Präsenz bei ~5 kHz für mehr Klarheit [1][2][7].
     #    Hier sehr simpel mit high_pass_filter() & low_pass_filter() kombiniert:
-    audio_eq = high_pass_filter(audio_comp, cutoff=100)   # tiefe Frequenzen raus
+    audio_eq = high_pass_filter(audio_comp, cutoff=150)   # tiefe Frequenzen raus
     audio_eq = low_pass_filter(audio_eq, cutoff=8000)     # Ultra-Höhen kappen
     save_step(audio_eq, "process_equalized.wav")
     
@@ -290,6 +299,10 @@ def process_audio(input_file, output_file):
     #    Hebt das Gesamtsignal an, ohne zu übersteuern [1][2].
     audio_normalized = normalize(audio_deessed)
     save_step(audio_normalized, output_file)
+    
+    print("----------------------------------------")
+    print("|<< Audio-Verbesserung abgeschlossen >>|")
+    print("----------------------------------------")
     
     logger.info("Verarbeitung abgeschlossen.", exc_info=True)
     logger.info(f"Endgültige Datei: {output_file}", exc_info=True)
@@ -335,6 +348,9 @@ def detect_speech(audio_path, only_speech_path):
             logger.info(f"Verwende vorhandene Datei: {only_speech_path}", exc_info=True)
             return
     try:
+        print("------------------")
+        print("|<< Starte VAD >>|")
+        print("------------------")
         sampling_rate=SAMPLING_RATE
         logger.info("Lade Silero VAD-Modell...")
         vad_model = load_silero_vad(onnx=USE_ONNX)
@@ -380,32 +396,11 @@ def detect_speech(audio_path, only_speech_path):
             
         # Speichere das modifizierte Audio
         torchaudio.save(only_speech_path, output_audio, sampling_rate)
+        
         # Schreibe die Ergebnisse in eine JSON-Datei
         with open(SPEECH_TIMESTAMPS, "w", encoding="utf-8") as file:
             json.dump(speech_timestamps, file, ensure_ascii=False, indent=4)
-        
-        # Nahe beieinander liegende Segmente zusammenführen
-        #merged_segments = []
-        #prev_end = 0
-        #max_silence_gap = 500
-        #if not speech_timestamps:
-        #    return []
-        #merged_segments = [speech_timestamps[0].copy()]  # Erstes Segment kopieren
-        #prev_end = merged_segments[0]['end']
-    
-        #for segment in speech_timestamps[1:]:
-        #    current_start = segment['start']
-        #    if current_start - prev_end <= max_silence_gap:
-        #        # Segmente zusammenführen
-        #        merged_segments[-1]['end'] = segment['end']
-        #    else:
-        #        # Neues Segment hinzufügen
-        #        merged_segments.append(segment.copy())
-        #    prev_end = segment['end']
-        #with open("merged_segments.json", "w", encoding="utf-8") as file:
-        #    json.dump(merged_segments, file, ensure_ascii=False, indent=4)
-        
-        # Konvertiere Zeitstempel in Samples
+
         speech_timestamps_samples = [
             {"start": int(ts["start"] * SAMPLING_RATE), "end": int(ts["end"] * SAMPLING_RATE)}
             for ts in speech_timestamps
@@ -418,6 +413,11 @@ def detect_speech(audio_path, only_speech_path):
                     )
 
         logger.info("Sprachaktivitätserkennung abgeschlossen!")
+        
+        print("--------------------------")
+        print("<< VAD abgeschlossen!! >>|")
+        print("--------------------------")
+        
         return speech_timestamps
     except Exception as e:
         logger.error(f"Fehler bei der Sprachaktivitätserkennung: {e}", exc_info=True)
@@ -531,51 +531,6 @@ def create_voice_sample(audio_path, sample_path_1, sample_path_2, sample_path_3)
                 except ffmpeg.Error as e:
                     logger.error(f"Fehler beim Erstellen des Voice Samples: {e}")
 
-def extract_mel_spectrogram(audio_path: str):
-    """
-    Erstellt ein Log-Mel-Spektrogramm aus einer Audiodatei.
-    Das Spektrogramm kann für Whisper oder andere TTS-Modelle verwendet werden.
-    
-    :param audio_path: Pfad zur Audio-Datei (16 kHz empfohlen)
-    :return: Log-Mel-Spektrogramm als Tensor
-    """
-    # 🎙 Lade die Audio-Datei mit 16kHz
-    waveform, sr = librosa.load(audio_path, sr=16000)
-
-    # 💡 Erzeuge das Mel-Spektrogramm
-    mel_spectrogram = feature_extractor(
-        waveform, sampling_rate=16000, return_tensors="pt"
-    ).input_features  # Shape: [1, 80, T]
-
-    return mel_spectrogram
-
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
-
-# 📌 Initialisiere den Prozessor & das Modell
-processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
-model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3").to("cuda")
-
-def transcribe_audio(audio_path: str):
-    """
-    Führt eine Speech-to-Text-Transkription mit Whisper durch.
-    
-    :param audio_path: Pfad zur Audio-Datei
-    :return: Transkribierter Text
-    """
-    # 🏗 Lade das Mel-Spektrogramm
-    mel_spectrogram = extract_mel_spectrogram(audio_path)
-
-    # 🔄 Transkription generieren
-    predicted_ids = model.generate(mel_spectrogram.to("cuda"))
-    transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-
-    return transcription
-
-# 🛠 Beispiel-Nutzung
-text = transcribe_audio("processed_audio.wav")
-print("Transkribierter Text:", text)
-
-
 def transcribe_audio_with_timestamps(audio_file, transcription_file):
     """Führt eine Spracherkennung mit Whisper durch und speichert die Transkription (inkl. Zeitstempel) in einer JSON-Datei."""
     if os.path.exists(transcription_file):
@@ -585,26 +540,27 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
     try:
         logger.info("Lade Whisper-Modell (large-v3-turbo)...", exc_info=True)
         logger.info("Starte Transkription...", exc_info=True)
-        print("Starte Transkription...")
+        print("----------------------------")
+        print("|<< Starte Transkription >>|")
+        print("----------------------------")
         model = get_whisper_model()                                                 # Laden des vortrainierten Whisper-Modells
-        model=whisper.load_model("large-v3", device=device, in_memory=True)
         result = model.transcribe(
             audio_file,                         # Audio-Datei
-            compression_ratio_threshold=1.8,    # Schwellenwert für Kompressionsrate
-            logprob_threshold=-0.7,             # Schwellenwert für Log-Probabilität
+            compression_ratio_threshold=2.5,    # Schwellenwert für Kompressionsrate
+            logprob_threshold=-1.1,             # Schwellenwert für Log-Probabilität
             no_speech_threshold=0.5,            # Schwellenwert für Stille
-            temperature=(0.2, 0.25, 0.3),       # Temperatur für Sampling
+            temperature=(0.2, 0.5),      # Temperatur für Sampling
             word_timestamps=True,               # Zeitstempel für Wörter
-            hallucination_silence_threshold=0.5,  # Schwellenwert für Halluzinationen
+            hallucination_silence_threshold=0.7,  # Schwellenwert für Halluzinationen
             condition_on_previous_text=True,    # Bedingung an vorherigen Text
             verbose=True,                       # Ausführliche Ausgabe
             language="pl",                       # Englische Sprache
-            task="translate",                    # Übersetzung aktivieren
+#            task="translate",                    # Übersetzung aktivieren
             )
         #segments = result["segments"]
         for segment in result["segments"]:
             segment["start"] = max(segment["start"] - 0, 0)  # Startzeit anpassen
-            segment["end"] = max(segment["end"] + 2, 0)      # Endzeit anpassen
+            segment["end"] = max(segment["end"] + 0, 0)      # Endzeit anpassen
             
 #        # JSON-Datei speichern
 #        with open(transcription_file, "w", encoding="utf-8") as file:
@@ -621,7 +577,9 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
                 ende = str(timedelta(seconds=segment["end"])).split('.')[0]
                 text = segment["text"]
                 csv_writer.writerow([start, ende, text])
-        print("Transkription abgeschlossen!")
+        print("------------------------------------")
+        print("|<< Transkription abgeschlossen! >>|")
+        print("------------------------------------")
         logger.info("Transkription abgeschlossen!", exc_info=True)
         return result["segments"]
     except Exception as e:
@@ -645,7 +603,7 @@ def read_transcripted_csv(file_path):
                 })
     return segments
 
-def translate_segments(transcription_file, translation_file, source_lang="en", target_lang="de"):
+def translate_segments(transcription_file, translation_file, source_lang="pl", target_lang="de"):
     """Übersetzt die bereits transkribierten Segmente mithilfe von MarianMT."""
     if os.path.exists(translation_file):
         if not ask_overwrite(translation_file):
@@ -654,6 +612,9 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
 #                return json.load(file)
             
     try:
+        print(f"--------------------------")
+        print(f"|<< Starte Übersetzung >>|")
+        print(f"--------------------------")
         # 1) Lese die CSV-Transkription ein
         segments = []
         with open(transcription_file, mode='r', encoding='utf-8') as csvfile:
@@ -668,18 +629,15 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
                         "end": end,
                         "text": row[2]
                     })
-
         if not segments:
             logger.error("Keine Segmente gefunden!")
             return []
-        
         model_name = (f"Helsinki-NLP/opus-mt-{source_lang}-{target_lang}")
 #        model_name = "t5-large"
         logger.info(f"Lade Übersetzungsmodell: {model_name}", exc_info=True)
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer = MarianTokenizer.from_pretrained(model_name)
 #        tokenizer = T5Tokenizer.from_pretrained(model_name, legacy=False)
         model = get_translate_model()
-        print("Starte Übersetzung...")
         translated_segments = []
 #        translation_prefix = "translate English to German: "
         if tokenizer.pad_token is None:
@@ -687,58 +645,46 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
         for segment in segments:
 #            input_text = translation_prefix + segment["text"]
             input_text = segment["text"]
-            inputs = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True).to(device)
+            inputs = tokenizer(input_text, return_tensors="pt", padding=True, max_length=512, truncation=True).to(device)
             #   inputs = {k: v.to(device) for k, v in inputs.items()}  # Verschiebe alle Eingaben auf das Gerät
             outputs = model.generate(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 pad_token_id=tokenizer.eos_token_id,
-                num_beams=5,
+                num_beams=6,
+                repetition_penalty=1.0,
+                early_stopping=True,
                 do_sample=True,
-                temperature=0.2,
-                #no_repeat_ngram_size=2,
-                #return_dict_in_generate=True,
-                #output_scores=True,
-                min_length=15,
-                max_length=90,
+#                return_dict=True, 
+                temperature=0.6,
+                no_repeat_ngram_size=2,
+#                return_dict_in_generate=True,
+#                output_scores=True,
+                min_length=5,
+                max_length=50
             )
             translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
-
             translated_segments.append({
                 "start": segment["start"],
                 "end": segment["end"],
                 "text": translated_text 
-            })
-            
+            })           
             with open(translation_file, mode='w', encoding='utf-8', newline='') as csvfile:
                 csv_writer = csv.writer(csvfile, delimiter='|')
                 csv_writer.writerow(['Startpunkt Zeitstempel', 'Endpunkt Zeitstempel', 'Text'])  # Header
-            
                 for seg in translated_segments:
                     start = str(timedelta(seconds=seg["start"])).split('.')[0]
                     ende = str(timedelta(seconds=seg["end"])).split('.')[0]
                     csv_writer.writerow([start, ende, seg["text"]])
-            translated_segments.append({
-                "start": segment["start"],
-                "end": segment["end"],
-                "text": translated_text 
-            })
-            
-            with open(translation_file, mode='w', encoding='utf-8', newline='') as csvfile:
-                csv_writer = csv.writer(csvfile, delimiter='|')
-                csv_writer.writerow(['Startpunkt Zeitstempel', 'Endpunkt Zeitstempel', 'Text'])  # Header
-            
-                for seg in translated_segments:
-                    start = str(timedelta(seconds=seg["start"])).split('.')[0]
-                    ende = str(timedelta(seconds=seg["end"])).split('.')[0]
-                    csv_writer.writerow([start, ende, seg["text"]])
-            logger.info("Übersetzung abgeschlossen!")
+            logger.info("Übersetzung abgeschlossen!")            
+        print(f"-----------------------------------")
+        print(f"|<< Übersetzung abgeschlossen!! >>|")
+        print(f"-----------------------------------")
         return translated_segments
-
     except Exception as e:
         logger.error(f"Fehler bei der Übersetzung: {e}")
     return []
-print("Übersetzung abgeschlossen!")
+
 def read_translated_csv(file_path):
     """Liest die übersetzte CSV-Datei."""
     segments = []
@@ -760,11 +706,10 @@ def apply_denoising(audio, sr):
     """Rauschfilter für Audio-Postprocessing"""
     audio_tensor = torch.FloatTensor(audio).unsqueeze(0)
     return torchaudio.functional.lowpass_biquad(
-        audio_tensor,
-        audio_tensor,
-        sample_rate=sr, 
-        cutoff_freq=7000
-    ).squeeze().numpy()
+            audio_tensor,
+            sr,
+            cutoff_freq=7000
+            ).squeeze().numpy()
 
 def convert_time_to_seconds(time_str):
     """Konvertiert Zeitstempel im Format HH:MM:SS in Sekunden."""
@@ -776,6 +721,37 @@ def convert_time_to_seconds(time_str):
     else:  # Nur Sekunden
         return parts[0]
 
+def check_and_replace_last_char(file_path):
+    # CSV-Datei lesen
+    with open(file_path, 'r', encoding='utf-8') as file:
+        lines = file.readlines()
+    print("------------------------------------------------")
+    print("|<< Letzte Charakter pro Zeile ist ein Punkt >>|")
+    print("------------------------------------------------")
+    # Zeilen modifizieren, wenn nötig
+    modified_lines = []
+    for line in lines:
+        line = line.strip()  # Zeilenendenzeichen entfernen
+        # Behalte die ersten 15 Zeichen (Zeitangaben) unverändert
+        prefix = line[:16]
+        rest_of_line = line[16:]
+        # Sicherstellen, dass ab dem 16. Zeichen ein Buchstabe am Anfang steht
+        while rest_of_line and not rest_of_line[0].isalnum():
+            rest_of_line = rest_of_line[1:]  # Erstes Zeichen entfernen, wenn es kein Buchstabe ist
+        if rest_of_line:  # Stelle sicher, dass der Rest der Zeile nicht leer ist
+            last_char = rest_of_line[-1]  # Letzten Charakter der Zeile holen
+            if last_char.isalnum():  # Wenn der letzte Charakter ein Buchstabe ist
+                rest_of_line += '.'  # Einen Punkt ans Ende hängen
+            elif last_char in [',', ';', ':', '-']:  # Wenn es ein Komma oder ähnliches Satzzeichen ist
+                rest_of_line = rest_of_line[:-1] + '.'  # Letzten Charakter durch einen Punkt ersetzen
+            elif last_char not in ['.', '?', '!']:  # Wenn es ein anderes Satzzeichen ist, aber nicht ?, ! oder .
+                rest_of_line = rest_of_line[:-1] + '.'  # Letzten Charakter durch einen Punkt ersetzen
+        # Füge die Zeitangaben und den modifizierten Text wieder zusammen
+        modified_lines.append(prefix + rest_of_line + '\n')
+    # Modifizierte Zeilen zurück in die Datei schreiben
+    with open(file_path, 'w', encoding='utf-8') as file:
+        file.writelines(modified_lines)
+
 def text_to_speech_with_voice_cloning(translation_file, sample_path_1, output_path):
     """Führt die Umwandlung von Text zu Sprache durch (TTS), inklusive Stimmenklonung basierend auf sample.wav."""
     if os.path.exists(output_path):
@@ -783,7 +759,10 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, output_pa
             logger.info(f"TTS-Audio bereits vorhanden: {output_path}", exc_info=True)
             return
     try:
-        logger.info("Lade TTS-Modell (multilingual/multi-dataset/xtts_v2)...", exc_info=True)
+        print(f"------------------")
+        print(f"|<< Starte TTS >>|")
+        print(f"------------------")
+        logger.info("Lade TTS-Modell {model_name}...", exc_info=True)
         #tts = TTS(model_name="tts_models/de/thorsten/tacotron2-DDC", progress_bar=True).to(device)
         #tts = TTS(model_name="tts_models/de/thorsten/vits", progress_bar=True).to(device)
         tts = get_tts_model()
@@ -793,36 +772,31 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, output_pa
         with open(translation_file, mode="r", encoding="utf-8") as f:
             reader = csv.reader(f, delimiter="|")
             next(reader)  # Header überspringen
-            
             for row in reader:
                 if len(row) < 3:
                     continue
-                
                 # Extrahiere Startzeit, Endzeit und Text
                 start = convert_time_to_seconds(row[0])
                 end = convert_time_to_seconds(row[1])
                 text = row[2].strip()
-
+#                text = text.strip()
                 try:
                     audio_clip = tts.tts(
                         text=text,                          # Übersetzter Text
                         speaker_wav=sample_path_1,          # Stimmenklon-Sample #1
-                        language="de",                      # Zielsprache
-                        speed=1.1,                          # Sprechgeschwindigkeit
-                        temperature=0.2, 
-                        length_penalty=1.0,
+                        num_beams=5,
+#                        language="de",                      # Zielsprache
+                        speed=1.5,                          # Sprechgeschwindigkeit
+                        temperature=0.5, 
+                        length_penalty=3.0,
                         repetition_penalty=2.5,
                         split_sentences=True
-                        )
-                    
-
+                    )
                     audio_clip = np.squeeze(audio_clip)                                         # In float32 konvertieren
                     if audio_clip.size == 0:
                         raise ValueError("Leeres Audio-Segment nach Squeeze")
                     if isinstance(audio_clip, torch.Tensor):
                         audio_clip = audio_clip.detach().cpu().numpy()
-
-                    peak_val = np.max(np.abs(audio_clip))
                     peak_val = np.max(np.abs(audio_clip))
                     if peak_val < 1e-6:
                         raise ValueError("Stummes Audio-Segment erkannt")
@@ -833,21 +807,24 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, output_pa
                     silence_samples = int(silence_duration * sampling_rate)                    # Stille in Samples
                     silence_segment = np.zeros(silence_samples, dtype=np.float32)
                     final_audio = np.concatenate([final_audio, silence_segment, audio_clip])                # Alle Segmente zusammenfügen
-            
                 except Exception as segment_error:
                     logger.error(f"Fehler in Segment {start}-{end}s: {segment_error}", exc_info=True)
                     continue
-                                            # Speichere das finale Audio            
-                final_audio = apply_denoising(final_audio, sampling_rate)                       # Rauschfilter anwenden
-                final_audio = final_audio.astype(np.float32)                                    # In float32 konvertieren
-                final_audio = final_audio.reshape(1, -1)  # [1, samples] statt [samples]
-                torchaudio.save(output_path, torch.from_numpy(final_audio), sampling_rate)
-                logger.info(f"TTS-Audio mit geklonter Stimme erstellt: {output_path}", exc_info=True)
-
+                                    # Speichere das finale Audio            
+#        final_audio = apply_denoising(final_audio, sampling_rate)                       # Rauschfilter anwenden
+        final_audio = final_audio.astype(np.float32)                                    # In float32 konvertieren
+        final_audio = final_audio.reshape(1, -1)  # [1, samples] statt [samples]
+        torchaudio.save(output_path, torch.from_numpy(final_audio), sampling_rate)
+        
+        print(f"---------------------------")
+        print(f"|<< TTS abgeschlossen!! >>|")
+        print(f"---------------------------")
+        
+        logger.info(f"TTS-Audio mit geklonter Stimme erstellt: {output_path}", exc_info=True)
     except Exception as e:
         logger.error(f"Fehler: {str(e)}", exc_info=True)
         raise
-        
+
 def resample_to_44100_stereo(input_path, output_path, speed_factor):
     """
     Resample das Audio auf 44.100 Hz (Stereo), passe die Wiedergabegeschwindigkeit sowie die Lautstärke an.
@@ -858,6 +835,9 @@ def resample_to_44100_stereo(input_path, output_path, speed_factor):
             return
 
     try:
+        print("-------------------------")
+        print("|<< Starte ReSampling >>|")
+        print("-------------------------")
         # Lade Audio in mono (falls im Original), dann dupliziere ggf. auf 2 Kanäle
         audio, sr = librosa.load(input_path, sr=None, mono=True)
         audio = np.vstack([audio, audio])             # Duplicate mono channel to create stereo
@@ -902,7 +882,9 @@ def resample_to_44100_stereo(input_path, output_path, speed_factor):
             f"- Lautstärkeanpassung: {VOLUME_ADJUSTMENT_44100}",
             f"- Datei: {output_path}"
             ]), exc_info=True)
-
+        print("--------------------------")
+        print("|<< ReSampling beendet >>|")
+        print("--------------------------")
     except Exception as e:
         logger.error(f"Fehler beim Resampling auf 44.100 Hz: {e}")
 
@@ -986,8 +968,6 @@ def main():
 
     # 2) Audiospur aus dem Video extrahieren (Mono, 44.1 kHz)
     extract_audio_ffmpeg(VIDEO_PATH, ORIGINAL_AUDIO_PATH)
-    
-#    create_mel_spectrogram(ORIGINAL_AUDIO_PATH, MelSpectrogram_PATH)
 
     # 3) Audioverarbeitung (Rauschunterdrückung und Lautheitsnormalisierung)
     process_audio(ORIGINAL_AUDIO_PATH, PROCESSED_AUDIO_PATH)
@@ -997,9 +977,6 @@ def main():
 
     # 4.1) Spracherkennung (VAD) mit Silero VAD
     detect_speech(PROCESSED_AUDIO_PATH_SPEED, ONLY_SPEECH)
-    
-    # 5) Erstellung eines Mel-Spektrogramms für die Stimmenklonung
-#    get_mel_spectrogram(ORIGINAL_AUDIO_PATH, _WHISPER_MODEL)
     
     # 5) Optional: Erstellung eines Voice-Samples für die Stimmenklonung
     create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3)
@@ -1023,7 +1000,8 @@ def main():
     #    json.dump(translated, f, ensure_ascii=False, indent=4)
     #with open(TRANSLATION_FILE, "w", encoding="utf-8") as f:
     #    json.dump(translated, f, ensure_ascii=False, indent=4)
-
+    
+#    check_and_replace_last_char(TRANSLATION_FILE)
     # 8) Text-to-Speech (TTS) mit Stimmenklonung
     text_to_speech_with_voice_cloning(TRANSLATION_FILE, SAMPLE_PATH_1, TRANSLATED_AUDIO_WITH_PAUSES)
 
@@ -1043,4 +1021,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

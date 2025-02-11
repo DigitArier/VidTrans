@@ -1,5 +1,5 @@
 # Dateipfade
-VIDEO_PATH = "Kardiolog ze wzruszeniem powiedział, że to niewytłumaczalny przypadek _ Świa_HD.mp4"
+VIDEO_PATH = "Z pewnością za większość zaburzeń u dzieci odpowiada to, co zrobiliśmy ze św_HD.mp4"
 ORIGINAL_AUDIO_PATH = "original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
@@ -14,7 +14,7 @@ TRANSLATION_FILE = "translation.csv"
 TRANSLATED_AUDIO_WITH_PAUSES = "translated_audio_with_pauses.wav"
 RESAMPLED_AUDIO_FOR_MIXDOWN = "resampled_audio_44100.wav"
 ADJUSTED_VIDEO_PATH = "adjusted_video.mp4"
-FINAL_VIDEO_PATH = "Kardiolog ze wzruszeniem powiedział, że to niewytłumaczalny przypadek _ Świa_HD_deutsch.mp4"
+FINAL_VIDEO_PATH = "Z pewnością za większość zaburzeń u dzieci odpowiada to, co zrobiliśmy ze św_HD_deutsch.mp4"
 SAMPLING_RATE = 16000
 #TORTOISE_MODEL_DIR = r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\tortoise-tts-v2\models"
 # Stimmenparameter
@@ -23,6 +23,9 @@ SAMPLING_RATE = 16000
 #PRESET_MODE = "fast"         # "ultra_fast", "fast", "standard", "high_quality"
 USE_PIP = True
 USE_ONNX = True
+BOS_TOKEN_ID = 0
+EOS_TOKEN_ID = 1
+PAD_TOKEN_ID = 2
 vocoder_pth = r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\vocoder_models--universal--libri-tts--wavegrad\model_file.pth"   #WaveGrad
 vocoder_cfg = r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\vocoder_models--universal--libri-tts--wavegrad\config.json"      #WaveGrad
 #r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\TTS\TTS\vocoder\models\wavernn.py"
