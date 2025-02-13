@@ -34,19 +34,12 @@ from transformers import (
     GenerationMixin,
     T5Config,
     T5Tokenizer,
-    T5ForConditionalGeneration,
-    WhisperFeatureExtractor,
-    WhisperForConditionalGeneration,
-    WhisperProcessor
+    T5ForConditionalGeneration
     )
 from TTS.api import TTS
-#import sys
-#repo_path = r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\tortoise-tts-v2"
-#sys.path.insert(0, repo_path)
-from tortoise.api import TextToSpeech
-from tortoise import utils
+from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.tts.models.xtts import Xtts
 import whisper
-from faster_whisper import WhisperModel
 from pydub import AudioSegment
 from pydub.effects import(
     high_pass_filter,
@@ -64,7 +57,7 @@ from silero_vad import(
 
 # Geschwindigkeitseinstellungen
 SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
-SPEED_FACTOR_RESAMPLE_44100 = 1.0   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
+SPEED_FACTOR_RESAMPLE_44100 = 1.25   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
 SPEED_FACTOR_PLAYBACK = 1.0        # Geschwindigkeitsfaktor für die Wiedergabe des Videos
 
 # Lautstärkeanpassungen
@@ -90,7 +83,7 @@ _TTS_MODEL = None
 start_time = time.time()
 step_times = {}
 device = "cuda" if torch.cuda.is_available() else "cpu"
-source_lang="pl"
+source_lang="en"
 target_lang="de"
 # Konfigurationen für die Verwendung von CUDA
 cuda_options = {
@@ -106,7 +99,9 @@ def time_function(func, *args, **kwargs):
         start = time.time()
         result = func(*args, **kwargs)
         end = time.time()
-        return result, end - start
+        execution_time = end - start
+        logger.info(f"Execution time for {func.__name__}: {execution_time:.4f} seconds")
+        return result, execution_time
 
 def ask_overwrite(file_path):
     """Fragt den Benutzer, ob eine bestehende Datei überschrieben werden soll."""
@@ -122,7 +117,7 @@ def get_whisper_model():
     global _WHISPER_MODEL
     if not _WHISPER_MODEL:
 #        _WHISPER_MODEL = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3").to(device)
-        _WHISPER_MODEL = whisper.load_model("large-v3", device=device, in_memory=True)
+        _WHISPER_MODEL = whisper.load_model("large-v3-turbo", device=device, in_memory=True)
         _WHISPER_MODEL.to(torch.device("cuda"))
         torch.cuda.empty_cache()
     return _WHISPER_MODEL
@@ -137,26 +132,17 @@ def get_translate_model():
     return _TRANSLATE_MODEL
 
 def get_tts_model():
-#    model_path = r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\tortoise-tts-v2\.models"
-#    if not isinstance(model_path, str):  # Ensure model_path is a string (file path)
-#            raise ValueError("Model path must be a valid string, but got:", type(model_path))
-
-    #with open(model_path, "rb") as f:
-    #    model_data = io.BytesIO(f.read())  # Ensure it's seekable
-
-    #    return torch.load(model_data, map_location=torch.device("cpu"))
     global _TTS_MODEL
     if not _TTS_MODEL:
-        _TTS_MODEL = TTS(
-            model_name="tts_models/de/thorsten/tacotron2-DDC",
-            progress_bar=True,
-#            vocoder_path=vocoder_pth,
-#            vocoder_config_path=vocoder_cfg,
-#            vocoder_name="wavegrad",
-            )
-# tts_models/de/thorsten/vits
+        config = XttsConfig(
+            model="xtts_v2.0.2"
+        )
+        config.load_json(r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\XTTS\config.json")
+        _TTS_MODEL = Xtts.init_from_config(config)
+        _TTS_MODEL.load_checkpoint(config, checkpoint_dir=r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\XTTS\2.0.2")
+# tts_models/de/thorsten/vits"
 # tts_models/de/thorsten/tacotron2-DDC
-# tts_models/de/thorsten/tacotron2-DDC
+# tts_models/multilingual/multi-dataset/xtts_v2
         _TTS_MODEL.to(torch.device("cuda"))
         #torch.load(_TTS_MODEL, weights_only=True)
         torch.cuda.empty_cache()
@@ -365,11 +351,11 @@ def detect_speech(audio_path, only_speech_path):
             wav,                                # Audio-Daten
             vad_model,                          # Silero VAD-Modell
             sampling_rate=SAMPLING_RATE,        # 16.000 Hz
-            min_speech_duration_ms=200,         # Minimale Sprachdauer
-            min_silence_duration_ms=150,         # Minimale Stille-Dauer
+            min_speech_duration_ms=250,         # Minimale Sprachdauer
+            min_silence_duration_ms=100,         # Minimale Stille-Dauer
             speech_pad_ms=50,                   # Padding für Sprachsegmente
             return_seconds=True,                # Rückgabe in Sekunden
-            threshold=0.4                       # Schwellenwert für Sprachaktivität
+            threshold=0.5                       # Schwellenwert für Sprachaktivität
         )
         # Überprüfe, ob Sprachaktivität gefunden wurde
         if not speech_timestamps:
@@ -546,15 +532,15 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
         model = get_whisper_model()                                                 # Laden des vortrainierten Whisper-Modells
         result = model.transcribe(
             audio_file,                         # Audio-Datei
-            compression_ratio_threshold=2.5,    # Schwellenwert für Kompressionsrate
-            logprob_threshold=-1.1,             # Schwellenwert für Log-Probabilität
-            no_speech_threshold=0.5,            # Schwellenwert für Stille
-            temperature=(0.2, 0.5),      # Temperatur für Sampling
+            compression_ratio_threshold=1.8,    # Schwellenwert für Kompressionsrate
+            logprob_threshold=-0.9,             # Schwellenwert für Log-Probabilität
+            no_speech_threshold=0.6,            # Schwellenwert für Stille
+            temperature=(0.2, 0.35, 0.5, 0.65, 0.8),      # Temperatur für Sampling
             word_timestamps=True,               # Zeitstempel für Wörter
-            hallucination_silence_threshold=0.7,  # Schwellenwert für Halluzinationen
+            hallucination_silence_threshold=0.2,  # Schwellenwert für Halluzinationen
             condition_on_previous_text=True,    # Bedingung an vorherigen Text
             verbose=True,                       # Ausführliche Ausgabe
-            language="pl",                       # Englische Sprache
+            language="en",                       # Englische Sprache
 #            task="translate",                    # Übersetzung aktivieren
             )
         #segments = result["segments"]
@@ -603,7 +589,7 @@ def read_transcripted_csv(file_path):
                 })
     return segments
 
-def translate_segments(transcription_file, translation_file, source_lang="pl", target_lang="de"):
+def translate_segments(transcription_file, translation_file, source_lang="en", target_lang="de"):
     """Übersetzt die bereits transkribierten Segmente mithilfe von MarianMT."""
     if os.path.exists(translation_file):
         if not ask_overwrite(translation_file):
@@ -742,9 +728,9 @@ def check_and_replace_last_char(file_path):
             last_char = rest_of_line[-1]  # Letzten Charakter der Zeile holen
             if last_char.isalnum():  # Wenn der letzte Charakter ein Buchstabe ist
                 rest_of_line += '.'  # Einen Punkt ans Ende hängen
-            elif last_char in [',', ';', ':', '-']:  # Wenn es ein Komma oder ähnliches Satzzeichen ist
+            elif last_char in [';', ':', '-']:  # Wenn es ein Komma oder ähnliches Satzzeichen ist
                 rest_of_line = rest_of_line[:-1] + '.'  # Letzten Charakter durch einen Punkt ersetzen
-            elif last_char not in ['.', '?', '!']:  # Wenn es ein anderes Satzzeichen ist, aber nicht ?, ! oder .
+            elif last_char not in [',', '.', '?', '!']:  # Wenn es ein anderes Satzzeichen ist, aber nicht ?, ! oder .
                 rest_of_line = rest_of_line[:-1] + '.'  # Letzten Charakter durch einen Punkt ersetzen
         # Füge die Zeitangaben und den modifizierten Text wieder zusammen
         modified_lines.append(prefix + rest_of_line + '\n')
@@ -762,12 +748,23 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, output_pa
         print(f"------------------")
         print(f"|<< Starte TTS >>|")
         print(f"------------------")
-        logger.info("Lade TTS-Modell {model_name}...", exc_info=True)
+        logger.info(f"Lade TTS-Modell {Xtts}...", exc_info=True)
         #tts = TTS(model_name="tts_models/de/thorsten/tacotron2-DDC", progress_bar=True).to(device)
         #tts = TTS(model_name="tts_models/de/thorsten/vits", progress_bar=True).to(device)
-        tts = get_tts_model()
-        sampling_rate = tts.synthesizer.output_sample_rate          # 24.000 Hz
         final_audio = np.array([], dtype=np.float32)                # Array für die kombinierten Audio-Segmente
+        sampling_rate = 24000
+        
+        config = XttsConfig(model="xtts_v2.0.2")
+        config.load_json(r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\XTTS\config.json")
+        model = Xtts.init_from_config(
+            config,
+            vocoder_path=vocoder_pth,
+            vocoder_config=vocoder_cfg
+            )
+        model.load_checkpoint(config, checkpoint_dir=r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\XTTS\2.0.2")
+        model.to(torch.device("cuda"))
+        
+        gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(sound_norm_refs=True, audio_path=[sample_path_1])
         # Lese die CSV-Datei mit den Zeitstempeln und Texten
         with open(translation_file, mode="r", encoding="utf-8") as f:
             reader = csv.reader(f, delimiter="|")
@@ -780,28 +777,42 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, output_pa
                 end = convert_time_to_seconds(row[1])
                 text = row[2].strip()
 #                text = text.strip()
+
+                print(f"🔍 Bearbeite Segment: {start}-{end}s mit Text: {text[:128]}")
+
                 try:
-                    audio_clip = tts.tts(
+#                    audio_clip = audio_clip[wav]
+                    result = model.inference(
+                        gpt_cond_latent=gpt_cond_latent,
+                        speaker_embedding=speaker_embedding,
                         text=text,                          # Übersetzter Text
-                        speaker_wav=sample_path_1,          # Stimmenklon-Sample #1
-                        num_beams=5,
-#                        language="de",                      # Zielsprache
-                        speed=1.5,                          # Sprechgeschwindigkeit
-                        temperature=0.5, 
-                        length_penalty=3.0,
-                        repetition_penalty=2.5,
-                        split_sentences=True
+                        language="de",
+#                        speaker_wav = sample_path_1,          # Stimmenklon-Sample #1
+#                        num_beams = 3,
+                        speed = 1.0,                          # Sprechgeschwindigkeit
+                        temperature = 0.6, 
+                        length_penalty = 1.0,
+                        repetition_penalty = 2.0,
+                        enable_text_splitting=True,
                     )
-                    audio_clip = np.squeeze(audio_clip)                                         # In float32 konvertieren
+                    # Extrahiere das Audio aus dem Dictionary
+                    if isinstance(result, dict):
+                        audio_clip = result.get("wav", None)
+                        if not isinstance(audio_clip, (np.ndarray, torch.Tensor)):
+                            print(f"⚠️ Warnung: `inference()` hat kein Audio für Text: {text} generiert.")
+                            audio_clip = np.zeros(1000, dtype=np.float32)  # Ersetze mit Stille
+                    audio_clip = np.array(audio_clip, dtype=np.float32)
+                    audio_clip = np.squeeze(audio_clip) if audio_clip.ndim > 1 else audio_clip      # In float32 konvertieren
+                    
                     if audio_clip.size == 0:
-                        raise ValueError("Leeres Audio-Segment nach Squeeze")
-                    if isinstance(audio_clip, torch.Tensor):
-                        audio_clip = audio_clip.detach().cpu().numpy()
-                    peak_val = np.max(np.abs(audio_clip))
-                    if peak_val < 1e-6:
-                        raise ValueError("Stummes Audio-Segment erkannt")
-                    audio_clip = audio_clip.astype(np.float32)
-                    audio_clip /= peak_val  # Abschließende Normalisierung
+                        print(f"⚠️ Warnung: `audio_clip` ist leer. Ersetze mit Stille.")
+                        audio_clip = np.zeros(1000, dtype=np.float32)
+                    
+                    peak_val = np.max(np.abs(audio_clip)) if np.any(audio_clip) else 1.0
+                    audio_clip /= peak_val
+                    
+#                    audio_clip = audio_clip.astype(np.float32)
+#                    audio_clip /= peak_val  # Abschließende Normalisierung
                     current_length = len(final_audio) / sampling_rate                           # Aktuelle Länge des Audios
                     silence_duration = max(0.0, start - current_length)                         # Stille vor dem Segment   
                     silence_samples = int(silence_duration * sampling_rate)                    # Stille in Samples
@@ -810,10 +821,18 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, output_pa
                 except Exception as segment_error:
                     logger.error(f"Fehler in Segment {start}-{end}s: {segment_error}", exc_info=True)
                     continue
-                                    # Speichere das finale Audio            
+                                    # Speichere das finale Audio  
+
+        if len(final_audio) == 0:
+            print("Kein Audio - Datei leer!")
+            final_audio = np.zeros((1, 1000), dtype=np.float32)
+
 #        final_audio = apply_denoising(final_audio, sampling_rate)                       # Rauschfilter anwenden
         final_audio = final_audio.astype(np.float32)                                    # In float32 konvertieren
-        final_audio = final_audio.reshape(1, -1)  # [1, samples] statt [samples]
+        
+        if final_audio.ndim == 1:
+            final_audio = final_audio.reshape(1, -1)  # [1, samples] statt [samples]
+        
         torchaudio.save(output_path, torch.from_numpy(final_audio), sampling_rate)
         
         print(f"---------------------------")
