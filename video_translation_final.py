@@ -9,6 +9,7 @@ import librosa
 import matplotlib.pyplot as plt
 import soundfile as sf
 import numpy as np
+import pandas as pd
 import json
 import scipy.signal as signal
 import torch
@@ -24,9 +25,12 @@ import csv
 from config import *
 from tqdm import tqdm
 from contextlib import contextmanager
+from scipy.interpolate import interp1d
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
+    MarianConfig,
+    MarianPreTrainedModel,
     MarianMTModel,
     MarianTokenizer,
     PreTrainedModel,
@@ -35,10 +39,15 @@ from transformers import (
     T5Config,
     T5Tokenizer,
     T5ForConditionalGeneration,
+    UnivNetFeatureExtractor,
+    UnivNetModel
     )
 from TTS.api import TTS
 from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.vocoder.configs.univnet_config import UnivnetConfig
+from TTS.vocoder.models.univnet_generator import UnivnetGenerator
 from TTS.tts.models.xtts import Xtts
+from bigvgan.inference import inference
 import whisper
 from faster_whisper import vad, WhisperModel
 from pydub import AudioSegment
@@ -59,7 +68,7 @@ from silero_vad import(
 # Geschwindigkeitseinstellungen
 SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
 SPEED_FACTOR_RESAMPLE_44100 = 1.0   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
-SPEED_FACTOR_PLAYBACK = 1.0        # Geschwindigkeitsfaktor für die Wiedergabe des Videos
+SPEED_FACTOR_PLAYBACK = 1.0      # Geschwindigkeitsfaktor für die Wiedergabe des Videos
 
 # Lautstärkeanpassungen
 VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
@@ -70,9 +79,6 @@ VOLUME_ADJUSTMENT_VIDEO = 0.05   # Lautstärkefaktor für das Video
 # ==============================
 logging.basicConfig(filename='video_translation_final.log', format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
-_WHISPER_MODEL = None
-_TRANSLATE_MODEL = None
-_TTS_MODEL = None
 _WHISPER_MODEL = None
 _TRANSLATE_MODEL = None
 _TTS_MODEL = None
@@ -132,22 +138,24 @@ def get_translate_model():
         torch.cuda.empty_cache()
     return _TRANSLATE_MODEL
 
-def get_tts_model():
-    global _TTS_MODEL
-    if not _TTS_MODEL:
-        config = XttsConfig(
-            model="xtts_v2.0.2"
-        )
-        config.load_json(r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\XTTS\config.json")
-        _TTS_MODEL = Xtts.init_from_config(config)
-        _TTS_MODEL.load_checkpoint(config, checkpoint_dir=r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\XTTS\2.0.2")
+
+#def get_tts_model():
+#    global _TTS_MODEL
+#    if not _TTS_MODEL:
+#        config = XttsConfig(
+#            model="xtts_v2.0.2"
+#        )
+#        config.load_json(r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\XTTS\config.json")
+#        _TTS_MODEL = Xtts.init_from_config(config)
+#        _TTS_MODEL.load_checkpoint(config, checkpoint_dir=r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\XTTS\2.0.2")
 # tts_models/de/thorsten/vits"
 # tts_models/de/thorsten/tacotron2-DDC
 # tts_models/multilingual/multi-dataset/xtts_v2
-        _TTS_MODEL.to(torch.device("cuda"))
-        #torch.load(_TTS_MODEL, weights_only=True)
-        torch.cuda.empty_cache()
-    return _TTS_MODEL
+#        _TTS_MODEL.to(torch.device("cuda"))
+#        #torch.load(_TTS_MODEL, weights_only=True)
+#        torch.cuda.empty_cache()
+#    return _TTS_MODEL
+
 
 # Context Manager für GPU-Operationen
 @contextmanager
@@ -533,17 +541,19 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
         model = get_whisper_model()                                                 # Laden des vortrainierten Whisper-Modells
         segments, info = model.transcribe(
             audio_file,                         # Audio-Datei
-            beam_size=5,
-            patience=1.0,
-            vad_filter=False,
-            chunk_length=60,
-            compression_ratio_threshold=4.0,    # Schwellenwert für Kompressionsrate
-#            logprob_threshold=-0.9,             # Schwellenwert für Log-Probabilität
-            no_speech_threshold=0.2,            # Schwellenwert für Stille
-            temperature=(0.0, 0.1, 0.2),      # Temperatur für Sampling
+            beam_size=10,
+            patience=2.0,
+            vad_filter=True,
+#            chunk_length=60,
+            compression_ratio_threshold=1.8,    # Schwellenwert für Kompressionsrate
+#            log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
+#            no_speech_threshold=2.0,            # Schwellenwert für Stille
+            temperature=(0.05, 0.1, 0.2),      # Temperatur für Sampling
             word_timestamps=True,               # Zeitstempel für Wörter
-            hallucination_silence_threshold=0.25,  # Schwellenwert für Halluzinationen
-            condition_on_previous_text=False,    # Bedingung an vorherigen Text
+#            hallucination_silence_threshold=0.35,  # Schwellenwert für Halluzinationen
+            condition_on_previous_text=True,    # Bedingung an vorherigen Text
+            no_repeat_ngram_size=3,
+#            repetition_penalty=1.5,
 #            verbose=True,                       # Ausführliche Ausgabe
             language="en",                       # Englische Sprache
 #            task="translate",                    # Übersetzung aktivieren
@@ -591,6 +601,142 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
     except Exception as e:
         logger.error(f"Fehler bei der Transkription: {e}", exc_info=True)
         return []
+
+def parse_time(time_str):
+    """
+    Konvertiert h:mm:ss-Strings in Sekunden
+    """
+    try:
+        time_obj = datetime.strptime(time_str, "%H:%M:%S")
+        return time_obj.hour * 3600 + time_obj.minute * 60 + time_obj.second
+    except ValueError:
+        raise ValueError(f"Ungültiges Zeitformat: {time_str}")
+
+def format_time(seconds):
+    """
+    Konvertiert Sekunden zurück in h:mm:ss-Format
+    """
+    return str(timedelta(seconds=int(seconds)))
+
+def merge_transcript_chunks(input_file, output_file, min_dur=1, max_dur=15, max_gap=5):
+    """
+    Führt Transkript-Segmente unter Berücksichtigung der spezifizierten Regeln zusammen
+    
+    Args:
+        input_file (str): Eingabedatei mit | als Trennzeichen
+        output_file (str): Zieldatei für Ergebnisse
+        min_dur (int): Minimale Segmentdauer in Sekunden
+        max_dur (int): Maximale Segmentdauer in Sekunden
+        max_gap (int): Maximaler akzeptierter Zeitabstand zwischen Segmenten
+    """
+    if os.path.exists(output_file):
+        if not ask_overwrite(output_file):
+            logger.info(f"Verwende vorhandene Übersetzungen: {output_file}", exc_info=True)
+            return read_translated_csv(output_file)
+        
+    try:
+        # CSV mit | als Trennzeichen einlesen
+        df = pd.read_csv(
+            input_file,
+            sep='|',
+            dtype=str
+        )
+
+        # Debugging: Zeige erkannte Spalten
+        print("Original Spalten:", df.columns.tolist())
+
+        # Spaltennamen normalisieren
+        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '')
+        print("Normalisierte Spalten:", df.columns.tolist())
+
+        # Erforderliche Spalten validieren
+        required_columns = {'startzeit', 'endzeit', 'text'}
+        if not required_columns.issubset(df.columns):
+            missing = required_columns - set(df.columns)
+            raise ValueError(f"Fehlende Spalten: {', '.join(missing)}")
+
+        print(f"Verarbeite {len(df)} Segmente aus {input_file}...")
+
+        # Zeitkonvertierung mit Fehlerprotokollierung
+        def safe_parse(time_str):
+            try:
+                return parse_time(time_str)
+            except ValueError:
+                print(f"Ungültige Zeitangabe: {time_str}")
+                return None
+
+        # Zeitkonvertierung
+        df['start_sec'] = df['startzeit'].apply(safe_parse)
+        df['end_sec'] = df['endzeit'].apply(safe_parse)
+        df['duration'] = df['end_sec'] - df['start_sec']
+
+        # Ungültige Zeilen filtern
+        original_count = len(df)
+        df = df.dropna(subset=['start_sec', 'end_sec'])
+        if len(df) < original_count:
+            print(f"{original_count - len(df)} ungültige Zeilen entfernt")
+            
+        # Sortierung nach Startzeit
+        df = df.sort_values('start_sec').reset_index(drop=True)
+
+        merged_data = []
+        current_chunk = None
+
+        for _, row in df.iterrows():
+            if not current_chunk:
+                # Neues Segment starten
+                current_chunk = {
+                    'start': row['start_sec'],
+                    'end': row['end_sec'],
+                    'text': [row['text']]
+                }
+            else:
+                gap = row['start_sec'] - current_chunk['end']
+                
+                # Entscheidungslogik
+                if (gap <= max_gap) and ((row['end_sec'] - current_chunk['start']) <= max_dur):
+                    # Segment erweitern
+                    current_chunk['end'] = row['end_sec']
+                    current_chunk['text'].append(row['text'])
+                else:
+                    # Aktuelles Segment speichern
+                    merged_data.append({
+                        'startzeit': format_time(current_chunk['start']),
+                        'endzeit': format_time(current_chunk['end']),
+                        'text': ' '.join(current_chunk['text'])
+                    })
+                    # Neues Segment beginnen
+                    current_chunk = {
+                        'start': row['start_sec'],
+                        'end': row['end_sec'],
+                        'text': [row['text']]
+                    }
+
+        # Letztes Segment hinzufügen
+        if current_chunk:
+            merged_data.append({
+                'startzeit': format_time(current_chunk['start']),
+                'endzeit': format_time(current_chunk['end']),
+                'text': ' '.join(current_chunk['text'])
+            })
+
+        # Nachbearbeitung: Segmente unter Mindestdauer
+        final_data = []
+        for item in merged_data:
+            duration = parse_time(item['endzeit']) - parse_time(item['startzeit'])
+            if duration >= min_dur:
+                final_data.append(item)
+            else:
+                print(f"Segment {item['startzeit']}-{item['endzeit']} ({duration}s) unter Mindestdauer")
+
+        # Ergebnis speichern
+        result_df = pd.DataFrame(final_data)
+        result_df.to_csv(output_file, sep='|', index=False)
+        print(f"Ergebnis mit {len(result_df)} Segmenten in {output_file} gespeichert")
+        
+    except Exception as e:
+        print(f"Kritischer Fehler: {str(e)}")
+        raise
 
 def read_transcripted_csv(file_path):
     """Liest die übersetzte CSV-Datei."""
@@ -669,17 +815,18 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 pad_token_id=tokenizer.eos_token_id,
-                num_beams=4,
-                repetition_penalty=1.0,
-#                early_stopping=True,
+                num_beams=7,
+                repetition_penalty=1.3,
+                length_penalty=1.0,
+                early_stopping=True,
                 do_sample=True,
 #                return_dict=True, 
-                temperature=0.8,
-                no_repeat_ngram_size=4,
+                temperature=0.2,
+                no_repeat_ngram_size=3,
 #                return_dict_in_generate=True,
 #                output_scores=True,
-                min_length=10,
-                max_length=40,
+                min_length=5,
+                max_length=60
             )
             translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
             translated_text = clean_translation(translated_text)  # Bereinigung anwenden!
@@ -781,11 +928,11 @@ def check_and_replace_last_char(file_path):
                 rest_of_line += '.'  # Einen Punkt ans Ende hängen
             elif last_char in [';', ':', '-']:  # Wenn es ein Komma oder ähnliches Satzzeichen ist
                 rest_of_line = rest_of_line[:-1] + '.'  # Letzten Charakter durch einen Punkt ersetzen
-            elif last_char not in [',', '.', '?', '!']:  # Wenn es ein anderes Satzzeichen ist, aber nicht ?, ! oder .
+            elif last_char not in [' ', ',', '.', '?', '!']:  # Wenn es ein anderes Satzzeichen ist, aber nicht ?, ! oder .
                 rest_of_line = rest_of_line[:-1] + '.'  # Letzten Charakter durch einen Punkt ersetzen
             
             # Vermeide Leerzeichen vor Punkten
-            rest_of_line = rest_of_line.replace(' .', '.').replace('?', '?').replace('!', '!').replace(',', ',')
+            rest_of_line = rest_of_line.replace(' .', '.').replace(' ?', '?').replace(' !', '!').replace(',', ',')
         
         # Füge die Zeitangaben und den modifizierten Text wieder zusammen
         modified_lines.append(prefix + rest_of_line + '\n')
@@ -804,23 +951,17 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
         print(f"------------------")
         print(f"|<< Starte TTS >>|")
         print(f"------------------")
-        logger.info(f"Lade TTS-Modell {Xtts}...", exc_info=True)
+        logger.info(f"Lade TTS-Modell ...", exc_info=True)
         #tts = TTS(model_name="tts_models/de/thorsten/tacotron2-DDC", progress_bar=True).to(device)
         #tts = TTS(model_name="tts_models/de/thorsten/vits", progress_bar=True).to(device)
         final_audio = np.array([], dtype=np.float32)                # Array für die kombinierten Audio-Segmente
         sampling_rate = 24000
         
-        config = XttsConfig(
-            model="xtts_v2.0.3",
-            model_dir=r"C:\Users\regme\Desktop\Translate\AllTalk\alltalk_tts\models\xtts\v203_5_4_2\model.pth"
-            )
-        config.load_json(r"C:\Users\regme\Desktop\Translate\AllTalk\alltalk_tts\models\xtts\v203_5_4_2\config.json")
-        model = Xtts.init_from_config(
-            config,
-#            vocoder_path=vocoder_pth,
-#            vocoder_config=vocoder_cfg
-            )
-        model.load_checkpoint(config, checkpoint_dir=r"C:\Users\regme\Desktop\Translate\AllTalk\alltalk_tts\models\xtts\v203_5_4_2")
+        config = XttsConfig(model_param_stats=True)
+        config.load_json(r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_4_63\config.json")
+                
+        model = Xtts.init_from_config(config)
+        model.load_checkpoint(config, checkpoint_dir=r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_4_63", checkpoint_path=r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_4_63\model.pth", use_deepspeed=False)
         model.to(torch.device("cuda"))
         
         gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(sound_norm_refs=True, audio_path=[sample_path_1, sample_path_2, sample_path_3])
@@ -838,7 +979,7 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
                 text = row[2].strip()
 #                text = text.strip()
 
-                print(f"🔍 Bearbeite Segment: {start}-{end}s mit Text: {text[:128]}")
+                print(f"🔍 Bearbeite Segment mit: {start}-{end}s mit Text:\n{text}\n")
 
                 try:
 #                    audio_clip = audio_clip[wav]
@@ -849,12 +990,16 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
                         language="de",
 #                        speaker_wav = sample_path_1,          # Stimmenklon-Sample #1
                         num_beams = 2,
-                        speed = 1.05,                          # Sprechgeschwindigkeit
-                        temperature = 0.65,
-                        length_penalty = 1.2,
-                        repetition_penalty = 2.2,
+                        speed = 0.9,                          # Sprechgeschwindigkeit
+                        temperature = 0.7,
+                        length_penalty = 1.1,
+                        repetition_penalty = 10.0,
+#                        do_sample=True,
                         enable_text_splitting=True,
+                        top_k=55,
+                        top_p=0.90,
                     )
+
                     # Extrahiere das Audio aus dem Dictionary
                     if isinstance(result, dict):
                         audio_clip = result.get("wav", None)
@@ -868,7 +1013,8 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
                         print(f"⚠️ Warnung: `audio_clip` ist leer. Ersetze mit Stille.")
                         audio_clip = np.zeros(1000, dtype=np.float32)
                     
-                    peak_val = np.max(np.abs(audio_clip)) if np.any(audio_clip) else 1.0
+#                    peak_val = np.max(np.abs(audio_clip)) if np.any(audio_clip) else 1.0
+                    peak_val = np.max(np.abs(audio_clip)) + 1e-8
                     audio_clip /= peak_val
                     
 #                    audio_clip = audio_clip.astype(np.float32)
@@ -1065,22 +1211,23 @@ def main():
     if not segments:
         logger.error("Transkription fehlgeschlagen oder keine Segmente gefunden.")
         return
-    #with open(TRANSCRIPTION_FILE, "w", encoding="utf-8") as f:
-    #    json.dump(segments, f, ensure_ascii=False, indent=4)
-    #with open(TRANSCRIPTION_FILE, "w", encoding="utf-8") as f:
-    #    json.dump(segments, f, ensure_ascii=False, indent=4)
+
+    # 6.1) Zusammenführen von Transkript-Segmenten
+    merge_transcript_chunks(
+        input_file=TRANSCRIPTION_FILE,
+        output_file=MERGED_TRANSCRIPTION_FILE,
+        min_dur=1,
+        max_dur=15,
+        max_gap=5
+    )
 
     # 7) Übersetzung der Segmente mithilfe von MarianMT
-    translated = translate_segments(TRANSCRIPTION_FILE, TRANSLATION_FILE)
+    translated = translate_segments(MERGED_TRANSCRIPTION_FILE, TRANSLATION_FILE)
     if not translated:
         logger.error("Übersetzung fehlgeschlagen oder keine Segmente vorhanden.")
         return
-    #with open(TRANSLATION_FILE, "w", encoding="utf-8") as f:
-    #    json.dump(translated, f, ensure_ascii=False, indent=4)
-    #with open(TRANSLATION_FILE, "w", encoding="utf-8") as f:
-    #    json.dump(translated, f, ensure_ascii=False, indent=4)
-    
-#    check_and_replace_last_char(TRANSLATION_FILE)
+
+    check_and_replace_last_char(TRANSLATION_FILE)
     # 8) Text-to-Speech (TTS) mit Stimmenklonung
     text_to_speech_with_voice_cloning(TRANSLATION_FILE, SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3, TRANSLATED_AUDIO_WITH_PAUSES)
 
