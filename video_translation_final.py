@@ -34,12 +34,13 @@ from transformers import (
     GenerationMixin,
     T5Config,
     T5Tokenizer,
-    T5ForConditionalGeneration
+    T5ForConditionalGeneration,
     )
 from TTS.api import TTS
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
 import whisper
+from faster_whisper import vad, WhisperModel
 from pydub import AudioSegment
 from pydub.effects import(
     high_pass_filter,
@@ -57,7 +58,7 @@ from silero_vad import(
 
 # Geschwindigkeitseinstellungen
 SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
-SPEED_FACTOR_RESAMPLE_44100 = 1.25   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
+SPEED_FACTOR_RESAMPLE_44100 = 1.0   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
 SPEED_FACTOR_PLAYBACK = 1.0        # Geschwindigkeitsfaktor für die Wiedergabe des Videos
 
 # Lautstärkeanpassungen
@@ -109,7 +110,7 @@ def ask_overwrite(file_path):
         choice = input(f"Die Datei '{file_path}' existiert bereits. Überschreiben? (j/n): ").strip().lower()
         if choice in ["j", "ja"]:
             return True
-        elif choice in ["n", "nein"]:
+        elif choice == "" or choice in ["n", "nein"]:
             return False
 
 step_start_time = time.time()
@@ -117,8 +118,8 @@ def get_whisper_model():
     global _WHISPER_MODEL
     if not _WHISPER_MODEL:
 #        _WHISPER_MODEL = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3").to(device)
-        _WHISPER_MODEL = whisper.load_model("large-v3-turbo", device=device, in_memory=True)
-        _WHISPER_MODEL.to(torch.device("cuda"))
+        _WHISPER_MODEL = WhisperModel("large-v3-turbo", device=device)
+#        _WHISPER_MODEL.to(torch.device("cuda"))
         torch.cuda.empty_cache()
     return _WHISPER_MODEL
 
@@ -351,11 +352,11 @@ def detect_speech(audio_path, only_speech_path):
             wav,                                # Audio-Daten
             vad_model,                          # Silero VAD-Modell
             sampling_rate=SAMPLING_RATE,        # 16.000 Hz
-            min_speech_duration_ms=250,         # Minimale Sprachdauer
-            min_silence_duration_ms=100,         # Minimale Stille-Dauer
+            min_speech_duration_ms=200,         # Minimale Sprachdauer
+            min_silence_duration_ms=60,         # Minimale Stille-Dauer
             speech_pad_ms=50,                   # Padding für Sprachsegmente
             return_seconds=True,                # Rückgabe in Sekunden
-            threshold=0.5                       # Schwellenwert für Sprachaktivität
+            threshold=0.30                       # Schwellenwert für Sprachaktivität
         )
         # Überprüfe, ob Sprachaktivität gefunden wurde
         if not speech_timestamps:
@@ -530,44 +531,63 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
         print("|<< Starte Transkription >>|")
         print("----------------------------")
         model = get_whisper_model()                                                 # Laden des vortrainierten Whisper-Modells
-        result = model.transcribe(
+        segments, info = model.transcribe(
             audio_file,                         # Audio-Datei
-            compression_ratio_threshold=1.8,    # Schwellenwert für Kompressionsrate
-            logprob_threshold=-0.9,             # Schwellenwert für Log-Probabilität
-            no_speech_threshold=0.6,            # Schwellenwert für Stille
-            temperature=(0.2, 0.35, 0.5, 0.65, 0.8),      # Temperatur für Sampling
+            beam_size=5,
+            patience=1.0,
+            vad_filter=False,
+            chunk_length=60,
+            compression_ratio_threshold=4.0,    # Schwellenwert für Kompressionsrate
+#            logprob_threshold=-0.9,             # Schwellenwert für Log-Probabilität
+            no_speech_threshold=0.2,            # Schwellenwert für Stille
+            temperature=(0.0, 0.1, 0.2),      # Temperatur für Sampling
             word_timestamps=True,               # Zeitstempel für Wörter
-            hallucination_silence_threshold=0.2,  # Schwellenwert für Halluzinationen
-            condition_on_previous_text=True,    # Bedingung an vorherigen Text
-            verbose=True,                       # Ausführliche Ausgabe
+            hallucination_silence_threshold=0.25,  # Schwellenwert für Halluzinationen
+            condition_on_previous_text=False,    # Bedingung an vorherigen Text
+#            verbose=True,                       # Ausführliche Ausgabe
             language="en",                       # Englische Sprache
 #            task="translate",                    # Übersetzung aktivieren
-            )
+        )
         #segments = result["segments"]
-        for segment in result["segments"]:
-            segment["start"] = max(segment["start"] - 0, 0)  # Startzeit anpassen
-            segment["end"] = max(segment["end"] + 0, 0)      # Endzeit anpassen
+        segments_list = []
+        
+        # Simuliere die verbose-Ausgabe
+        print("\n[ Transkriptionsdetails ]")
+        for segment in segments:
+            start = str(timedelta(seconds=segment.start)).split('.')[0]
+            end = str(timedelta(seconds=segment.end)).split('.')[0]
+            text = segment.text.strip()
             
-#        # JSON-Datei speichern
-#        with open(transcription_file, "w", encoding="utf-8") as file:
-#            json.dump(result["segments"], file, ensure_ascii=False, indent=4)
+            # Text bereinigen: Entferne "..." am Ende des Textes
+            text = segment.text.strip()
+            text = re.sub(r'\.\.\.$', '', text).strip()  # Entferne "..." nur am Ende
             
-        # CSV-Datei speichern  
+            # Ähnlich wie verbose=True bei OpenAI Whisper
+            print(f"[{start} --> {end}] {text}")
+            
+            adjusted_segment = {
+                "start": max(segment.start - 0, 0),
+                "end": max(segment.end + 0, 0),
+                "text": segment.text
+            }
+            segments_list.append(adjusted_segment)
+
+        # CSV-Export
         transcription_file = transcription_file.replace('.json', '.csv')
         with open(transcription_file, mode='w', encoding='utf-8', newline='') as csvfile:
             csv_writer = csv.writer(csvfile, delimiter='|')
-            csv_writer.writerow(['Startpunkt Zeitstempel', 'Endpunkt Zeitstempel', 'Text'])  # Header
+            csv_writer.writerow(['Startzeit', 'Endzeit', 'Text'])
             
-            for segment in result["segments"]:
+            for segment in segments_list:
                 start = str(timedelta(seconds=segment["start"])).split('.')[0]
-                ende = str(timedelta(seconds=segment["end"])).split('.')[0]
-                text = segment["text"]
-                csv_writer.writerow([start, ende, text])
+                end = str(timedelta(seconds=segment["end"])).split('.')[0]
+                csv_writer.writerow([start, end, segment["text"]])
         print("------------------------------------")
         print("|<< Transkription abgeschlossen! >>|")
         print("------------------------------------")
         logger.info("Transkription abgeschlossen!", exc_info=True)
-        return result["segments"]
+        return segments_list
+
     except Exception as e:
         logger.error(f"Fehler bei der Transkription: {e}", exc_info=True)
         return []
@@ -588,6 +608,17 @@ def read_transcripted_csv(file_path):
                     "text": row[2]
                 })
     return segments
+
+def clean_translation(text):
+    """Entfernt Bindestriche und Punkte überall im Text, nicht nur am Zeilenende."""
+    # Entferne "..." oder "....." überall im Text
+    text = re.sub(r'\.{2,}', '', text)  # Mehr als 3 Punkte
+    # Entferne "---", "--" und einzelne Bindestriche, außer bei Wortverbindungen
+    text = re.sub(r'\s*-\s*', ' ', text)  # Bindestriche mit Leerzeichen drumherum -> entfernen
+    text = re.sub(r'(?<!\w)-(?=\w)', '', text)  # Bindestriche zwischen Buchstaben entfernen
+    # Optional: Mehrfache Leerzeichen bereinigen
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 def translate_segments(transcription_file, translation_file, source_lang="en", target_lang="de"):
     """Übersetzt die bereits transkribierten Segmente mithilfe von MarianMT."""
@@ -624,10 +655,11 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
         tokenizer = MarianTokenizer.from_pretrained(model_name)
 #        tokenizer = T5Tokenizer.from_pretrained(model_name, legacy=False)
         model = get_translate_model()
-        translated_segments = []
 #        translation_prefix = "translate English to German: "
         if tokenizer.pad_token is None:
             tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+            
+        translated_segments = []
         for segment in segments:
 #            input_text = translation_prefix + segment["text"]
             input_text = segment["text"]
@@ -637,24 +669,26 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 pad_token_id=tokenizer.eos_token_id,
-                num_beams=6,
+                num_beams=4,
                 repetition_penalty=1.0,
-                early_stopping=True,
+#                early_stopping=True,
                 do_sample=True,
 #                return_dict=True, 
-                temperature=0.6,
-                no_repeat_ngram_size=2,
+                temperature=0.8,
+                no_repeat_ngram_size=4,
 #                return_dict_in_generate=True,
 #                output_scores=True,
-                min_length=5,
-                max_length=50
+                min_length=10,
+                max_length=40,
             )
             translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            translated_text = clean_translation(translated_text)  # Bereinigung anwenden!
+            
             translated_segments.append({
                 "start": segment["start"],
                 "end": segment["end"],
                 "text": translated_text 
-            })           
+            })
             with open(translation_file, mode='w', encoding='utf-8', newline='') as csvfile:
                 csv_writer = csv.writer(csvfile, delimiter='|')
                 csv_writer.writerow(['Startpunkt Zeitstempel', 'Endpunkt Zeitstempel', 'Text'])  # Header
@@ -711,34 +745,56 @@ def check_and_replace_last_char(file_path):
     # CSV-Datei lesen
     with open(file_path, 'r', encoding='utf-8') as file:
         lines = file.readlines()
-    print("------------------------------------------------")
-    print("|<< Letzte Charakter pro Zeile ist ein Punkt >>|")
-    print("------------------------------------------------")
+    print("------------------------")
+    print("|<< Zeilen aufräumen >>|")
+    print("------------------------")
     # Zeilen modifizieren, wenn nötig
     modified_lines = []
     for line in lines:
         line = line.strip()  # Zeilenendenzeichen entfernen
-        # Behalte die ersten 15 Zeichen (Zeitangaben) unverändert
+        
+        # Klammern und Anführungszeichen entfernen
+        line = line.replace("(", "").replace(")", "").replace('"', '').replace('"', '')
+        
+        # Bindestriche entfernen, wenn ein Leerzeichen vorhanden ist
+        line = line.replace(" - ", " ").replace("–", " ")
+        
+        # Alle "-" entfernen, die nicht von Leerzeichen umgeben sind
+        line = ''.join([c if c != '-' or (c == '-' and (i > 0 and line[i-1].isspace()) and (i < len(line) - 1 and line[i+1].isspace())) else ' ' for i, c in enumerate(line)])
+        
+        # Zeile in zwei Teile teilen: Zeitangaben und Rest
         prefix = line[:16]
         rest_of_line = line[16:]
+        
         # Sicherstellen, dass ab dem 16. Zeichen ein Buchstabe am Anfang steht
         while rest_of_line and not rest_of_line[0].isalnum():
             rest_of_line = rest_of_line[1:]  # Erstes Zeichen entfernen, wenn es kein Buchstabe ist
+        
         if rest_of_line:  # Stelle sicher, dass der Rest der Zeile nicht leer ist
             last_char = rest_of_line[-1]  # Letzten Charakter der Zeile holen
+            
+            # Vermeide mehrere Punkte hintereinander
+            if last_char == '.':
+                rest_of_line = rest_of_line[:-1]
+            
             if last_char.isalnum():  # Wenn der letzte Charakter ein Buchstabe ist
                 rest_of_line += '.'  # Einen Punkt ans Ende hängen
             elif last_char in [';', ':', '-']:  # Wenn es ein Komma oder ähnliches Satzzeichen ist
                 rest_of_line = rest_of_line[:-1] + '.'  # Letzten Charakter durch einen Punkt ersetzen
             elif last_char not in [',', '.', '?', '!']:  # Wenn es ein anderes Satzzeichen ist, aber nicht ?, ! oder .
                 rest_of_line = rest_of_line[:-1] + '.'  # Letzten Charakter durch einen Punkt ersetzen
+            
+            # Vermeide Leerzeichen vor Punkten
+            rest_of_line = rest_of_line.replace(' .', '.').replace('?', '?').replace('!', '!').replace(',', ',')
+        
         # Füge die Zeitangaben und den modifizierten Text wieder zusammen
         modified_lines.append(prefix + rest_of_line + '\n')
+    
     # Modifizierte Zeilen zurück in die Datei schreiben
     with open(file_path, 'w', encoding='utf-8') as file:
         file.writelines(modified_lines)
 
-def text_to_speech_with_voice_cloning(translation_file, sample_path_1, output_path):
+def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_path_2, sample_path_3, output_path):
     """Führt die Umwandlung von Text zu Sprache durch (TTS), inklusive Stimmenklonung basierend auf sample.wav."""
     if os.path.exists(output_path):
         if not ask_overwrite(output_path):
@@ -754,17 +810,20 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, output_pa
         final_audio = np.array([], dtype=np.float32)                # Array für die kombinierten Audio-Segmente
         sampling_rate = 24000
         
-        config = XttsConfig(model="xtts_v2.0.2")
-        config.load_json(r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\XTTS\config.json")
+        config = XttsConfig(
+            model="xtts_v2.0.3",
+            model_dir=r"C:\Users\regme\Desktop\Translate\AllTalk\alltalk_tts\models\xtts\v203_5_4_2\model.pth"
+            )
+        config.load_json(r"C:\Users\regme\Desktop\Translate\AllTalk\alltalk_tts\models\xtts\v203_5_4_2\config.json")
         model = Xtts.init_from_config(
             config,
-            vocoder_path=vocoder_pth,
-            vocoder_config=vocoder_cfg
+#            vocoder_path=vocoder_pth,
+#            vocoder_config=vocoder_cfg
             )
-        model.load_checkpoint(config, checkpoint_dir=r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\XTTS\2.0.2")
+        model.load_checkpoint(config, checkpoint_dir=r"C:\Users\regme\Desktop\Translate\AllTalk\alltalk_tts\models\xtts\v203_5_4_2")
         model.to(torch.device("cuda"))
         
-        gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(sound_norm_refs=True, audio_path=[sample_path_1])
+        gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(sound_norm_refs=True, audio_path=[sample_path_1, sample_path_2, sample_path_3])
         # Lese die CSV-Datei mit den Zeitstempeln und Texten
         with open(translation_file, mode="r", encoding="utf-8") as f:
             reader = csv.reader(f, delimiter="|")
@@ -775,6 +834,7 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, output_pa
                 # Extrahiere Startzeit, Endzeit und Text
                 start = convert_time_to_seconds(row[0])
                 end = convert_time_to_seconds(row[1])
+                text = row[2].strip("-:")
                 text = row[2].strip()
 #                text = text.strip()
 
@@ -788,11 +848,11 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, output_pa
                         text=text,                          # Übersetzter Text
                         language="de",
 #                        speaker_wav = sample_path_1,          # Stimmenklon-Sample #1
-#                        num_beams = 3,
-                        speed = 1.0,                          # Sprechgeschwindigkeit
-                        temperature = 0.6, 
-                        length_penalty = 1.0,
-                        repetition_penalty = 2.0,
+                        num_beams = 2,
+                        speed = 1.05,                          # Sprechgeschwindigkeit
+                        temperature = 0.65,
+                        length_penalty = 1.2,
+                        repetition_penalty = 2.2,
                         enable_text_splitting=True,
                     )
                     # Extrahiere das Audio aus dem Dictionary
@@ -995,13 +1055,13 @@ def main():
     resample_to_16000_mono(PROCESSED_AUDIO_PATH, PROCESSED_AUDIO_PATH_SPEED, SPEED_FACTOR_RESAMPLE_16000)
 
     # 4.1) Spracherkennung (VAD) mit Silero VAD
-    detect_speech(PROCESSED_AUDIO_PATH_SPEED, ONLY_SPEECH)
+#    detect_speech(PROCESSED_AUDIO_PATH_SPEED, ONLY_SPEECH)
     
     # 5) Optional: Erstellung eines Voice-Samples für die Stimmenklonung
     create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3)
 
     # 6) Spracherkennung (Transkription) mit Whisper
-    segments = transcribe_audio_with_timestamps(ONLY_SPEECH, TRANSCRIPTION_FILE)
+    segments = transcribe_audio_with_timestamps(PROCESSED_AUDIO_PATH, TRANSCRIPTION_FILE)
     if not segments:
         logger.error("Transkription fehlgeschlagen oder keine Segmente gefunden.")
         return
@@ -1022,7 +1082,7 @@ def main():
     
 #    check_and_replace_last_char(TRANSLATION_FILE)
     # 8) Text-to-Speech (TTS) mit Stimmenklonung
-    text_to_speech_with_voice_cloning(TRANSLATION_FILE, SAMPLE_PATH_1, TRANSLATED_AUDIO_WITH_PAUSES)
+    text_to_speech_with_voice_cloning(TRANSLATION_FILE, SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3, TRANSLATED_AUDIO_WITH_PAUSES)
 
     # 9) Audio resamplen auf 44.1 kHz, Stereo (für Mixdown), inkl. separatem Lautstärke- und Geschwindigkeitsfaktor
     resample_to_44100_stereo(TRANSLATED_AUDIO_WITH_PAUSES, RESAMPLED_AUDIO_FOR_MIXDOWN, SPEED_FACTOR_RESAMPLE_44100)

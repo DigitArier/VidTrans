@@ -1,5 +1,5 @@
 # Dateipfade
-VIDEO_PATH = "Z pewnością za większość zaburzeń u dzieci odpowiada to, co zrobiliśmy ze św_HD.mp4"
+VIDEO_PATH = "its Worse than You think full documentary_000.mp4"
 ORIGINAL_AUDIO_PATH = "original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
@@ -14,7 +14,7 @@ TRANSLATION_FILE = "translation.csv"
 TRANSLATED_AUDIO_WITH_PAUSES = "translated_audio_with_pauses.wav"
 RESAMPLED_AUDIO_FOR_MIXDOWN = "resampled_audio_44100.wav"
 ADJUSTED_VIDEO_PATH = "adjusted_video.mp4"
-FINAL_VIDEO_PATH = "Z pewnością za większość zaburzeń u dzieci odpowiada to, co zrobiliśmy ze św_HD_deutsch.mp4"
+FINAL_VIDEO_PATH = "its Worse than You think full documentary_000_deutsch.mp4"
 SAMPLING_RATE = 16000
 #TORTOISE_MODEL_DIR = r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\tortoise-tts-v2\models"
 # Stimmenparameter
@@ -30,7 +30,7 @@ vocoder_pth = r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\vocoder_model
 vocoder_cfg = r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\vocoder_models--universal--libri-tts--wavegrad\config.json"      #WaveGrad
 #r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\TTS\TTS\vocoder\models\wavernn.py"
 #r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\TTS\TTS\vocoder\configs\wavernn_config.py"
-#r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\4910\best_model_16K.pth"
-#r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\4910\config_16K.json"
+#r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\vocoder_models--de--thorsten--hifigan_v1\model_file.pth.tar"
+#r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\vocoder_models--de--thorsten--hifigan_v1\config.json"
 #r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\avocodo-main\avocodo\models\generator.py"
 #r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\avocodo-main\avocodo\configs\avocodo_v1.json"
