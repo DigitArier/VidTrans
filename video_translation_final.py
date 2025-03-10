@@ -35,19 +35,11 @@ from transformers import (
     MarianTokenizer,
     PreTrainedModel,
     AutoModelForCausalLM,
-    GenerationMixin,
-    T5Config,
-    T5Tokenizer,
-    T5ForConditionalGeneration,
-    UnivNetFeatureExtractor,
-    UnivNetModel
+    GenerationMixin
     )
 from TTS.api import TTS
 from TTS.tts.configs.xtts_config import XttsConfig
-from TTS.vocoder.configs.univnet_config import UnivnetConfig
-from TTS.vocoder.models.univnet_generator import UnivnetGenerator
 from TTS.tts.models.xtts import Xtts
-from bigvgan.inference import inference
 import whisper
 from faster_whisper import vad, WhisperModel
 from pydub import AudioSegment
@@ -67,12 +59,12 @@ from silero_vad import(
 
 # Geschwindigkeitseinstellungen
 SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
-SPEED_FACTOR_RESAMPLE_44100 = 1.0   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
+SPEED_FACTOR_RESAMPLE_44100 = 1.05   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
 SPEED_FACTOR_PLAYBACK = 1.0      # Geschwindigkeitsfaktor für die Wiedergabe des Videos
 
 # Lautstärkeanpassungen
 VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
-VOLUME_ADJUSTMENT_VIDEO = 0.05   # Lautstärkefaktor für das Video
+VOLUME_ADJUSTMENT_VIDEO = 0.09   # Lautstärkefaktor für das Video
 
 # ============================== 
 # Globale Konfigurationen und Logging
@@ -132,8 +124,9 @@ def get_whisper_model():
 def get_translate_model():
     global _TRANSLATE_MODEL
     if not _TRANSLATE_MODEL:
+        configuration = MarianConfig()
+        _TRANSLATE_MODEL = MarianMTModel(configuration)
         _TRANSLATE_MODEL = MarianMTModel.from_pretrained(f"Helsinki-NLP/opus-mt-{source_lang}-{target_lang}")
-#       _TRANSLATE_MODEL = T5ForConditionalGeneration.from_pretrained("t5-large")
         _TRANSLATE_MODEL.to(torch.device("cuda"))
         torch.cuda.empty_cache()
     return _TRANSLATE_MODEL
@@ -545,7 +538,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
             patience=2.0,
             vad_filter=True,
 #            chunk_length=60,
-            compression_ratio_threshold=1.8,    # Schwellenwert für Kompressionsrate
+#            compression_ratio_threshold=1.8,    # Schwellenwert für Kompressionsrate
 #            log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
 #            no_speech_threshold=2.0,            # Schwellenwert für Stille
             temperature=(0.05, 0.1, 0.2),      # Temperatur für Sampling
@@ -796,37 +789,32 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
             logger.error("Keine Segmente gefunden!")
             return []
         model_name = (f"Helsinki-NLP/opus-mt-{source_lang}-{target_lang}")
-#        model_name = "t5-large"
         logger.info(f"Lade Übersetzungsmodell: {model_name}", exc_info=True)
         tokenizer = MarianTokenizer.from_pretrained(model_name)
-#        tokenizer = T5Tokenizer.from_pretrained(model_name, legacy=False)
         model = get_translate_model()
-#        translation_prefix = "translate English to German: "
         if tokenizer.pad_token is None:
             tokenizer.add_special_tokens({'pad_token': '[PAD]'})
             
         translated_segments = []
         for segment in segments:
-#            input_text = translation_prefix + segment["text"]
             input_text = segment["text"]
             inputs = tokenizer(input_text, return_tensors="pt", padding=True, max_length=512, truncation=True).to(device)
-            #   inputs = {k: v.to(device) for k, v in inputs.items()}  # Verschiebe alle Eingaben auf das Gerät
             outputs = model.generate(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 pad_token_id=tokenizer.eos_token_id,
-                num_beams=7,
+                num_beams=4,
                 repetition_penalty=1.3,
                 length_penalty=1.0,
                 early_stopping=True,
                 do_sample=True,
 #                return_dict=True, 
-                temperature=0.2,
+                temperature=0.15,
                 no_repeat_ngram_size=3,
 #                return_dict_in_generate=True,
 #                output_scores=True,
-                min_length=5,
-                max_length=60
+#                min_length=5,
+                max_length=90
             )
             translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
             translated_text = clean_translation(translated_text)  # Bereinigung anwenden!
@@ -961,7 +949,12 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
         config.load_json(r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_4_63\config.json")
                 
         model = Xtts.init_from_config(config)
-        model.load_checkpoint(config, checkpoint_dir=r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_4_63", checkpoint_path=r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_4_63\model.pth", use_deepspeed=False)
+        model.load_checkpoint(
+            config,
+            checkpoint_dir=r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_4_63",
+            checkpoint_path=r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_4_63\model.pth",
+            use_deepspeed=False
+            )
         model.to(torch.device("cuda"))
         
         gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(sound_norm_refs=True, audio_path=[sample_path_1, sample_path_2, sample_path_3])
@@ -989,15 +982,15 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
                         text=text,                          # Übersetzter Text
                         language="de",
 #                        speaker_wav = sample_path_1,          # Stimmenklon-Sample #1
-                        num_beams = 2,
-                        speed = 0.9,                          # Sprechgeschwindigkeit
+                        num_beams = 5,
+                        speed = 0.95,                          # Sprechgeschwindigkeit
                         temperature = 0.7,
                         length_penalty = 1.1,
                         repetition_penalty = 10.0,
 #                        do_sample=True,
                         enable_text_splitting=True,
-                        top_k=55,
-                        top_p=0.90,
+                        top_k=60,
+                        top_p=1.0,
                     )
 
                     # Extrahiere das Audio aus dem Dictionary
