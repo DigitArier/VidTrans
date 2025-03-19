@@ -3,6 +3,7 @@ import io
 import re
 from pathlib import Path
 import subprocess
+from tabnanny import verbose
 import ffmpeg
 import logging
 import librosa
@@ -12,12 +13,17 @@ import numpy as np
 import pandas as pd
 import json
 import scipy.signal as signal
+from scipy.signal import resample_poly
+from pydub import AudioSegment
+from sympy import false, true
 import torch
-torch.set_num_threads(1)
+from torch import autocast
+torch.set_num_threads(4)
 import shape as sh
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+from audiostretchy.stretch import stretch_audio
 import pyrubberband
 import time
 from datetime import datetime, timedelta
@@ -25,17 +31,22 @@ import csv
 from config import *
 from tqdm import tqdm
 from contextlib import contextmanager
-from scipy.interpolate import interp1d
+from deepmultilingualpunctuation import PunctuationModel
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     MarianConfig,
     MarianPreTrainedModel,
     MarianMTModel,
+    TFMarianMTModel,
     MarianTokenizer,
+    PreTrainedTokenizerFast,
     PreTrainedModel,
     AutoModelForCausalLM,
-    GenerationMixin
+    GenerationMixin,
+    T5Tokenizer,
+    T5TokenizerFast,
+    T5ForConditionalGeneration
     )
 from TTS.api import TTS
 from TTS.tts.configs.xtts_config import XttsConfig
@@ -59,12 +70,12 @@ from silero_vad import(
 
 # Geschwindigkeitseinstellungen
 SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
-SPEED_FACTOR_RESAMPLE_44100 = 1.05   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
+SPEED_FACTOR_RESAMPLE_44100 = 1.0   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
 SPEED_FACTOR_PLAYBACK = 1.0      # Geschwindigkeitsfaktor für die Wiedergabe des Videos
 
 # Lautstärkeanpassungen
 VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
-VOLUME_ADJUSTMENT_VIDEO = 0.09   # Lautstärkefaktor für das Video
+VOLUME_ADJUSTMENT_VIDEO = 0.06   # Lautstärkefaktor für das Video
 
 # ============================== 
 # Globale Konfigurationen und Logging
@@ -73,6 +84,7 @@ logging.basicConfig(filename='video_translation_final.log', format="%(asctime)s 
 logger = logging.getLogger(__name__)
 _WHISPER_MODEL = None
 _TRANSLATE_MODEL = None
+_TOKENIZER = None
 _TTS_MODEL = None
 
 # ============================== 
@@ -122,15 +134,18 @@ def get_whisper_model():
     return _WHISPER_MODEL
 
 def get_translate_model():
-    global _TRANSLATE_MODEL
-    if not _TRANSLATE_MODEL:
-        configuration = MarianConfig()
-        _TRANSLATE_MODEL = MarianMTModel(configuration)
-        _TRANSLATE_MODEL = MarianMTModel.from_pretrained(f"Helsinki-NLP/opus-mt-{source_lang}-{target_lang}")
-        _TRANSLATE_MODEL.to(torch.device("cuda"))
-        torch.cuda.empty_cache()
-    return _TRANSLATE_MODEL
-
+        global _TRANSLATE_MODEL, _TOKENIZER    
+        if _TRANSLATE_MODEL is None:
+            model_name = "jbochi/madlad400-3b-mt"
+            logger.info(f"Lade Übersetzungsmodell: {model_name}")
+            _TOKENIZER = T5TokenizerFast.from_pretrained(model_name, verbose=True)
+            _TRANSLATE_MODEL = T5ForConditionalGeneration.from_pretrained(model_name)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            _TRANSLATE_MODEL.to(device)
+            _TRANSLATE_MODEL.eval()
+            _TRANSLATE_MODEL = _TRANSLATE_MODEL.half()
+            torch.cuda.empty_cache()
+        return _TRANSLATE_MODEL, _TOKENIZER
 
 #def get_tts_model():
 #    global _TTS_MODEL
@@ -538,10 +553,10 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
             patience=2.0,
             vad_filter=True,
 #            chunk_length=60,
-#            compression_ratio_threshold=1.8,    # Schwellenwert für Kompressionsrate
+            compression_ratio_threshold=2.2,    # Schwellenwert für Kompressionsrate
 #            log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
 #            no_speech_threshold=2.0,            # Schwellenwert für Stille
-            temperature=(0.05, 0.1, 0.2),      # Temperatur für Sampling
+            temperature=(0.05, 0.1, 0.15, 0.2),      # Temperatur für Sampling
             word_timestamps=True,               # Zeitstempel für Wörter
 #            hallucination_silence_threshold=0.35,  # Schwellenwert für Halluzinationen
             condition_on_previous_text=True,    # Bedingung an vorherigen Text
@@ -731,6 +746,19 @@ def merge_transcript_chunks(input_file, output_file, min_dur=1, max_dur=15, max_
         print(f"Kritischer Fehler: {str(e)}")
         raise
 
+def restore_punctuation(input_file, output_file):
+    if os.path.exists(output_file):
+        if not ask_overwrite(output_file):
+            logger.info(f"Verwende vorhandene Übersetzungen: {output_file}", exc_info=True)
+            return read_translated_csv(output_file)
+
+    """Stellt die Interpunktion mit deepmultilingualpunctuation wieder her."""
+    df = pd.read_csv(input_file, sep='|')
+    model = PunctuationModel()
+    df['text'] = df['text'].apply(lambda x: model.restore_punctuation(x) if isinstance(x, str) else x)
+    df.to_csv(output_file, sep='|', index=False)
+    return output_file
+
 def read_transcripted_csv(file_path):
     """Liest die übersetzte CSV-Datei."""
     segments = []
@@ -759,8 +787,48 @@ def clean_translation(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+BATCH_SIZE = 8  # Je nach GPU-Speicher anpassen (z. B. 4, 8 oder 16)
+
+def batch_translate(segments, target_lang="de"):
+    """Übersetzt mehrere Segmente gleichzeitig im Batch-Modus."""
+    global _TOKENIZER, _TRANSLATE_MODEL  # 🔥 Stelle sicher, dass sie global verwendet werden
+
+    if _TOKENIZER is None or _TRANSLATE_MODEL is None:  # 🔥 Modell nachladen, falls nötig
+        print("⚠️  WARNUNG: Modell oder Tokenizer nicht geladen. Lade sie jetzt...")
+        get_translate_model()  
+        
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    texts = [f"<2{target_lang}> {seg['text']}" for seg in segments]  # Alle Texte sammeln
+    
+    # ✅ Batch-Tokenization (viel schneller!)
+    inputs = _TOKENIZER(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        max_length=512,
+        truncation=True
+        ).to(device)
+
+    with torch.no_grad(), autocast("cuda"):  # Kein Gradienten-Tracking & Mixed Precision für Speed
+        outputs = _TRANSLATE_MODEL.generate(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            pad_token_id=_TOKENIZER.eos_token_id,
+            num_beams=7,  
+            repetition_penalty=1.0,
+            length_penalty=1.0,
+            early_stopping=True,
+            do_sample=True,
+            temperature=0.3,
+            no_repeat_ngram_size=2,
+            max_length=90
+        )
+
+    return [_TOKENIZER.decode(out, skip_special_tokens=True).strip() for out in outputs]
+
 def translate_segments(transcription_file, translation_file, source_lang="en", target_lang="de"):
-    """Übersetzt die bereits transkribierten Segmente mithilfe von MarianMT."""
+    """Übersetzt die bereits transkribierten Segmente mithilfe von MADLAD400."""
     if os.path.exists(translation_file):
         if not ask_overwrite(translation_file):
             logger.info(f"Verwende vorhandene Übersetzungen: {translation_file}", exc_info=True)
@@ -771,7 +839,8 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
         print(f"--------------------------")
         print(f"|<< Starte Übersetzung >>|")
         print(f"--------------------------")
-        # 1) Lese die CSV-Transkription ein
+
+        # CSV-Datei mit Transkriptionen einlesen
         segments = []
         with open(transcription_file, mode='r', encoding='utf-8') as csvfile:
             csv_reader = csv.reader(csvfile, delimiter='|')
@@ -780,65 +849,62 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
                 if len(row) == 3:
                     start = sum(float(x) * 60 ** i for i, x in enumerate(reversed(row[0].split(':'))))
                     end = sum(float(x) * 60 ** i for i, x in enumerate(reversed(row[1].split(':'))))
-                    segments.append({
-                        "start": start,
-                        "end": end,
-                        "text": row[2]
-                    })
+                    segments.append({"start": start, "end": end, "text": row[2]})
+
         if not segments:
             logger.error("Keine Segmente gefunden!")
             return []
-        model_name = (f"Helsinki-NLP/opus-mt-{source_lang}-{target_lang}")
-        logger.info(f"Lade Übersetzungsmodell: {model_name}", exc_info=True)
-        tokenizer = MarianTokenizer.from_pretrained(model_name)
-        model = get_translate_model()
-        if tokenizer.pad_token is None:
-            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-            
+
+
+        # ✅ **Batch-Verarbeitung**
         translated_segments = []
-        for segment in segments:
-            input_text = segment["text"]
-            inputs = tokenizer(input_text, return_tensors="pt", padding=True, max_length=512, truncation=True).to(device)
-            outputs = model.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                pad_token_id=tokenizer.eos_token_id,
-                num_beams=4,
-                repetition_penalty=1.3,
-                length_penalty=1.0,
-                early_stopping=True,
-                do_sample=True,
-#                return_dict=True, 
-                temperature=0.15,
-                no_repeat_ngram_size=3,
-#                return_dict_in_generate=True,
-#                output_scores=True,
-#                min_length=5,
-                max_length=90
-            )
-            translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
-            translated_text = clean_translation(translated_text)  # Bereinigung anwenden!
+        for i in range(0, len(segments), BATCH_SIZE):
+            batch = segments[i:i + BATCH_SIZE]
+            print(f"⚡ Übersetze Batch {i//BATCH_SIZE + 1}/{-(-len(segments) // BATCH_SIZE)} mit {len(batch)} Segmenten...")
+            start_time = time.time()
             
-            translated_segments.append({
-                "start": segment["start"],
-                "end": segment["end"],
-                "text": translated_text 
-            })
-            with open(translation_file, mode='w', encoding='utf-8', newline='') as csvfile:
-                csv_writer = csv.writer(csvfile, delimiter='|')
-                csv_writer.writerow(['Startpunkt Zeitstempel', 'Endpunkt Zeitstempel', 'Text'])  # Header
-                for seg in translated_segments:
-                    start = str(timedelta(seconds=seg["start"])).split('.')[0]
-                    ende = str(timedelta(seconds=seg["end"])).split('.')[0]
-                    csv_writer.writerow([start, ende, seg["text"]])
-            logger.info("Übersetzung abgeschlossen!")            
+            translations = batch_translate(batch, target_lang)
+            
+            for seg, trans in zip(batch, translations):
+                translated_segments.append({"start": seg["start"], "end": seg["end"], "text": trans})
+            
+            end_time = time.time()
+            print(f"✅ Batch {i//BATCH_SIZE + 1} fertig in {end_time - start_time:.2f} Sekunden!")
+
+
+        # Ergebnisse speichern
+        with open(translation_file, mode='w', encoding='utf-8', newline='') as csvfile:
+            csv_writer = csv.writer(csvfile, delimiter='|')
+            csv_writer.writerow(['Startpunkt Zeitstempel', 'Endpunkt Zeitstempel', 'Text'])
+            for seg in translated_segments:
+                start_time_str = str(timedelta(seconds=seg["start"])).split('.')[0]
+                end_time_str = str(timedelta(seconds=seg["end"])).split('.')[0]
+                csv_writer.writerow([start_time_str, end_time_str, seg["text"]])
+
+        logger.info("Übersetzung abgeschlossen!")
         print(f"-----------------------------------")
         print(f"|<< Übersetzung abgeschlossen!! >>|")
         print(f"-----------------------------------")
+
         return translated_segments
+
     except Exception as e:
         logger.error(f"Fehler bei der Übersetzung: {e}")
+
     return []
+
+def restore_punctuation_de(input_file, output_file):
+    if os.path.exists(output_file):
+        if not ask_overwrite(output_file):
+            logger.info(f"Verwende vorhandene Übersetzungen: {output_file}", exc_info=True)
+            return read_translated_csv(output_file)
+
+    """Stellt die Interpunktion mit deepmultilingualpunctuation wieder her."""
+    df = pd.read_csv(input_file, sep='|')
+    model = PunctuationModel()
+    df['Text'] = df['Text'].apply(lambda x: model.restore_punctuation(x) if isinstance(x, str) else x)
+    df.to_csv(output_file, sep='|', index=False)
+    return output_file
 
 def read_translated_csv(file_path):
     """Liest die übersetzte CSV-Datei."""
@@ -876,7 +942,11 @@ def convert_time_to_seconds(time_str):
     else:  # Nur Sekunden
         return parts[0]
 
-def check_and_replace_last_char(file_path):
+def check_and_replace_last_char(file_path, file_out):
+    if os.path.exists(file_out):
+        if not ask_overwrite(file_out):
+            logger.info(f"Verwende vorhandene Übersetzungen: {file_out}", exc_info=True)
+            return read_translated_csv(file_out)
     # CSV-Datei lesen
     with open(file_path, 'r', encoding='utf-8') as file:
         lines = file.readlines()
@@ -926,7 +996,7 @@ def check_and_replace_last_char(file_path):
         modified_lines.append(prefix + rest_of_line + '\n')
     
     # Modifizierte Zeilen zurück in die Datei schreiben
-    with open(file_path, 'w', encoding='utf-8') as file:
+    with open(file_out, 'w', encoding='utf-8') as file:
         file.writelines(modified_lines)
 
 def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_path_2, sample_path_3, output_path):
@@ -946,13 +1016,13 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
         sampling_rate = 24000
         
         config = XttsConfig(model_param_stats=True)
-        config.load_json(r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_4_63\config.json")
+        config.load_json(r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_04_63\config.json")
                 
         model = Xtts.init_from_config(config)
         model.load_checkpoint(
             config,
-            checkpoint_dir=r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_4_63",
-            checkpoint_path=r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_4_63\model.pth",
+            checkpoint_dir=r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_04_63",
+            checkpoint_path=r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_04_63\model.pth",
             use_deepspeed=False
             )
         model.to(torch.device("cuda"))
@@ -975,23 +1045,24 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
                 print(f"🔍 Bearbeite Segment mit: {start}-{end}s mit Text:\n{text}\n")
 
                 try:
-#                    audio_clip = audio_clip[wav]
-                    result = model.inference(
-                        gpt_cond_latent=gpt_cond_latent,
-                        speaker_embedding=speaker_embedding,
-                        text=text,                          # Übersetzter Text
-                        language="de",
-#                        speaker_wav = sample_path_1,          # Stimmenklon-Sample #1
-                        num_beams = 5,
-                        speed = 0.95,                          # Sprechgeschwindigkeit
-                        temperature = 0.7,
-                        length_penalty = 1.1,
-                        repetition_penalty = 10.0,
-#                        do_sample=True,
-                        enable_text_splitting=True,
-                        top_k=60,
-                        top_p=1.0,
-                    )
+                    with torch.no_grad(), autocast("cuda"):
+    #                    audio_clip = audio_clip[wav]
+                        result = model.inference(
+                            gpt_cond_latent=gpt_cond_latent,
+                            speaker_embedding=speaker_embedding,
+                            text=text,                          # Übersetzter Text
+                            language="de",
+    #                        speaker_wav = sample_path_1,          # Stimmenklon-Sample #1
+                            num_beams = 1,
+                            speed = 0.95,                          # Sprechgeschwindigkeit
+                            temperature = 0.60,
+                            length_penalty = 1.0,
+                            repetition_penalty = 10.0,
+    #                        do_sample=True,
+                            enable_text_splitting=True,
+                            top_k=50,
+                            top_p=0.85,
+                        )
 
                     # Extrahiere das Audio aus dem Dictionary
                     if isinstance(result, dict):
@@ -1007,8 +1078,8 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
                         audio_clip = np.zeros(1000, dtype=np.float32)
                     
 #                    peak_val = np.max(np.abs(audio_clip)) if np.any(audio_clip) else 1.0
-                    peak_val = np.max(np.abs(audio_clip)) + 1e-8
-                    audio_clip /= peak_val
+#                    peak_val = np.max(np.abs(audio_clip)) + 1e-8
+#                    audio_clip /= peak_val
                     
 #                    audio_clip = audio_clip.astype(np.float32)
 #                    audio_clip /= peak_val  # Abschließende Normalisierung
@@ -1021,14 +1092,19 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
                     logger.error(f"Fehler in Segment {start}-{end}s: {segment_error}", exc_info=True)
                     continue
                                     # Speichere das finale Audio  
-
+        
         if len(final_audio) == 0:
             print("Kein Audio - Datei leer!")
             final_audio = np.zeros((1, 1000), dtype=np.float32)
 
-#        final_audio = apply_denoising(final_audio, sampling_rate)                       # Rauschfilter anwenden
+#        final_audio = apply_denoising(final_audio, sampling_rate)  # Rauschfilter anwenden
+
+        # 🔽 GLOBALE NORMALISIERUNG DES GESAMTEN AUDIOS
+        final_audio /= np.max(np.abs(final_audio)) + 1e-8  # Einheitliche Lautstärke
+
         final_audio = final_audio.astype(np.float32)                                    # In float32 konvertieren
         
+        # Falls das Audio nur 1D ist, reshape für `torchaudio.save()`
         if final_audio.ndim == 1:
             final_audio = final_audio.reshape(1, -1)  # [1, samples] statt [samples]
         
@@ -1056,48 +1132,58 @@ def resample_to_44100_stereo(input_path, output_path, speed_factor):
         print("-------------------------")
         print("|<< Starte ReSampling >>|")
         print("-------------------------")
-        # Lade Audio in mono (falls im Original), dann dupliziere ggf. auf 2 Kanäle
-        audio, sr = librosa.load(input_path, sr=None, mono=True)
-        audio = np.vstack([audio, audio])             # Duplicate mono channel to create stereo
-        audio = np.vstack([audio, audio])             # Duplicate mono channel to create stereo
-        logger.info(f"Original-Samplingrate: {sr} Hz", exc_info=True)
 
-        target_sr = 44100
-
-        # Resample auf 44.100 Hz
-        if sr != target_sr:
-            audio_resampled = np.vstack([
-                librosa.resample(audio[channel], res_type="kaiser_best", orig_sr=sr, target_sr=target_sr, scale=True, fix=True)
-                for channel in range(audio.shape[0])
-            ])
-        else:
-            audio_resampled = audio
-
-        # Wiedergabegeschwindigkeit anpassen
-        if speed_factor != 1.0:
-            stretched_channels = [
-                librosa.effects.time_stretch(audio_resampled[channel], rate=speed_factor)
-                for channel in range(audio_resampled.shape[0])
+        # Extrahiere die Originalsampling-Rate mit FFprobe für die Protokollierung
+        try:
+            probe_command = [
+                "ffprobe", 
+                "-v", "quiet", 
+                "-show_entries", "stream=sample_rate", 
+                "-of", "default=noprint_wrappers=1:nokey=1", 
+                input_path
             ]
-            audio_stretched = np.vstack(stretched_channels)
-        else:
-            audio_stretched = audio_resampled
-
-        # Wandle Daten in np.int16 um und speichere als WAV mit PCM-16
-        audio_int16 = (audio_stretched * 32767).astype(np.int16)  # Convert to int16 range
-
-        # Hier format und subtype explizit angeben:
-        sf.write(
-            output_path,
-            audio_int16.T,  # Transpose to match (samples, channels) format
-            samplerate=target_sr,
-            format="WAV",
-            subtype="PCM_16"
+            original_sr = subprocess.check_output(probe_command).decode().strip()
+            logger.info(f"Original-Samplingrate: {original_sr} Hz", exc_info=True)
+        except Exception as e:
+            logger.warning(f"Konnte Original-Samplingrate nicht ermitteln: {e}")
+            original_sr = "unbekannt"
+        
+        # Erstelle den FFmpeg-Befehl mit allen Parametern
+        # 1. Setze atempo-Filter für Geschwindigkeitsanpassung
+        atempo_filter = create_atempo_filter_string(speed_factor)
+        
+        # 2. Bereite Audiofilter vor (Resample auf 44.100 Hz, Stereo-Konvertierung, Geschwindigkeit, Lautstärke)
+        
+        # Vollständige Filterkette erstellen
+        filter_complex = (
+            f"aresample=44100:resampler=soxr:precision=28," +  # Hochwertiges Resampling auf 44.100 Hz
+            f"aformat=sample_fmts=s16:channel_layouts=stereo," +  # Ausgabeformat festlegen
+            f"{atempo_filter},"  # Geschwindigkeitsanpassung
         )
+        
+        # FFmpeg-Befehl zusammenstellen
+        command = [
+            "ffmpeg",
+            "-i", input_path,
+            "-filter:a", filter_complex,
+            "-y",  # Ausgabedatei überschreiben
+            output_path
+        ]
+        
+        # Befehl ausführen
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, stderr = process.communicate()
+        
+        if process.returncode != 0:
+            raise Exception(f"FFmpeg-Fehler: {stderr.decode()}")
+        
         logger.info("\n".join([
-            f"Audio auf {target_sr} Hz (Stereo) resampled:",
+            f"Audio auf 44100 Hz (Stereo) resampled:",
             f"- Geschwindigkeitsfaktor: {speed_factor}",
-            f"- Lautstärkeanpassung: {VOLUME_ADJUSTMENT_44100}",
             f"- Datei: {output_path}"
             ]), exc_info=True)
         print("--------------------------")
@@ -1105,6 +1191,42 @@ def resample_to_44100_stereo(input_path, output_path, speed_factor):
         print("--------------------------")
     except Exception as e:
         logger.error(f"Fehler beim Resampling auf 44.100 Hz: {e}")
+
+def create_atempo_filter_string(speed_factor):
+    """
+    Erstellt eine FFmpeg-Filterkette für die Geschwindigkeitsanpassung.
+    Der atempo-Filter unterstützt nur Faktoren zwischen 0.5 und 2.0,
+    daher müssen wir für extreme Werte mehrere Filter verketten.
+    
+    Args:
+        speed_factor (float): Geschwindigkeitsfaktor
+        
+    Returns:
+        str: FFmpeg-Filterkette für atempo
+    """
+    if 0.5 <= speed_factor <= 2.0:
+        return f"atempo={speed_factor}"
+    
+    # Für Werte außerhalb des Bereichs verketten wir mehrere atempo-Filter
+    atempo_chain = []
+    remaining_factor = speed_factor
+    
+    # Für extreme Verlangsamung
+    if remaining_factor < 0.5:
+        while remaining_factor < 0.5:
+            atempo_chain.append("atempo=0.5")
+            remaining_factor /= 0.5
+    
+    # Für extreme Beschleunigung
+    while remaining_factor > 2.0:
+        atempo_chain.append("atempo=2.0")
+        remaining_factor /= 2.0
+    
+    # Restfaktor hinzufügen
+    if 0.5 <= remaining_factor <= 2.0:
+        atempo_chain.append(f"atempo={remaining_factor}")
+    
+    return ",".join(atempo_chain)
 
 def adjust_playback_speed(video_path, adjusted_video_path, speed_factor):
     """Passt die Wiedergabegeschwindigkeit des Originalvideos an und nutzt einen separaten Lautstärkefaktor für das Video."""
@@ -1191,7 +1313,7 @@ def main():
     process_audio(ORIGINAL_AUDIO_PATH, PROCESSED_AUDIO_PATH)
 
     # 4) Audio resamplen auf 16 kHz, Mono (für TTS)
-    resample_to_16000_mono(PROCESSED_AUDIO_PATH, PROCESSED_AUDIO_PATH_SPEED, SPEED_FACTOR_RESAMPLE_16000)
+#    resample_to_16000_mono(PROCESSED_AUDIO_PATH, PROCESSED_AUDIO_PATH_SPEED, SPEED_FACTOR_RESAMPLE_16000)
 
     # 4.1) Spracherkennung (VAD) mit Silero VAD
 #    detect_speech(PROCESSED_AUDIO_PATH_SPEED, ONLY_SPEECH)
@@ -1213,14 +1335,20 @@ def main():
         max_dur=15,
         max_gap=5
     )
+    
+    # 6.2) Wiederherstellung der Interpunktion
+    restore_punctuation(MERGED_TRANSCRIPTION_FILE, PUNCTED_TRANSCRIPTION_FILE)
 
     # 7) Übersetzung der Segmente mithilfe von MarianMT
-    translated = translate_segments(MERGED_TRANSCRIPTION_FILE, TRANSLATION_FILE)
+    translated = translate_segments(PUNCTED_TRANSCRIPTION_FILE, TRANSLATION_FILE)
     if not translated:
         logger.error("Übersetzung fehlgeschlagen oder keine Segmente vorhanden.")
         return
 
-    check_and_replace_last_char(TRANSLATION_FILE)
+#    check_and_replace_last_char(TRANSLATION_FILE, CLEAN_TRANSLATION_FILE)
+    
+#    restore_punctuation_de(TRANSLATION_FILE, PUNCTED_TRANSLATION_FILE)
+    
     # 8) Text-to-Speech (TTS) mit Stimmenklonung
     text_to_speech_with_voice_cloning(TRANSLATION_FILE, SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3, TRANSLATED_AUDIO_WITH_PAUSES)
 

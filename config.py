@@ -1,5 +1,5 @@
 # Dateipfade
-VIDEO_PATH = "its Worse than You think full documentary_4.mp4"
+VIDEO_PATH = "Did the World End in 1999__HD.mp4"
 ORIGINAL_AUDIO_PATH = "original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
@@ -11,11 +11,14 @@ DOWNSAMPLED_AUDIO_PATH = "downsampled_audio.wav"
 ONLY_SPEECH = "only_speech.wav"
 TRANSCRIPTION_FILE = "transcription.csv"
 MERGED_TRANSCRIPTION_FILE = "merged_transcription.csv"
+PUNCTED_TRANSCRIPTION_FILE = "puncted_transcription.csv"
 TRANSLATION_FILE = "translation.csv"
+CLEAN_TRANSLATION_FILE = "clean_translation.csv"
+PUNCTED_TRANSLATION_FILE = "puncted_translation.csv"
 TRANSLATED_AUDIO_WITH_PAUSES = "translated_audio_with_pauses.wav"
 RESAMPLED_AUDIO_FOR_MIXDOWN = "resampled_audio_44100.wav"
 ADJUSTED_VIDEO_PATH = "adjusted_video.mp4"
-FINAL_VIDEO_PATH = "its Worse than You think full documentary_4_deutsch.mp4"
+FINAL_VIDEO_PATH = "Did the World End in 1999__HD_deutsch.mp4"
 SAMPLING_RATE = 16000
 #TORTOISE_MODEL_DIR = r"C:\Users\regme\Desktop\Translate\VidTrans\VidTrans\tortoise-tts-v2\models"
 # Stimmenparameter
