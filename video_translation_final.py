@@ -51,7 +51,8 @@ from transformers import (
 from TTS.api import TTS
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
-import whisper
+from TTS.tts.utils.text.phonemizers.gruut_wrapper import Gruut
+#import whisper
 from faster_whisper import vad, WhisperModel
 from pydub import AudioSegment
 from pydub.effects import(
@@ -67,6 +68,16 @@ from silero_vad import(
     collect_chunks
     )
 
+if torch.cuda.is_available():
+    # Cache cuDNN-Kernels für wiederkehrende Operationen
+    torch.backends.cudnn.benchmark = True
+    # Höheres Timeout für komplexe Operationen
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
+#Transkription Zusammenführung
+MIN_DUR = 0 # Minimale Segmentdauer in Sekunden 
+MAX_DUR = 10 # Maximale Segmentdauer in Sekunden
+MAX_GAP = 5 # Maximaler akzeptierter Zeitabstand zwischen Segmenten
 
 # Geschwindigkeitseinstellungen
 SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
@@ -75,7 +86,7 @@ SPEED_FACTOR_PLAYBACK = 1.0      # Geschwindigkeitsfaktor für die Wiedergabe de
 
 # Lautstärkeanpassungen
 VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
-VOLUME_ADJUSTMENT_VIDEO = 0.06   # Lautstärkefaktor für das Video
+VOLUME_ADJUSTMENT_VIDEO = 0.08   # Lautstärkefaktor für das Video
 
 # ============================== 
 # Globale Konfigurationen und Logging
@@ -94,6 +105,9 @@ _TTS_MODEL = None
 start_time = time.time()
 step_times = {}
 device = "cuda" if torch.cuda.is_available() else "cpu"
+if device == "cuda":
+    torch.backends.cudnn.benchmark = True  # Beschleunigt wiederkehrende Netzwerkstrukturen
+    torch.backends.cudnn.deterministic = False  # Für bessere Performance
 source_lang="en"
 target_lang="de"
 # Konfigurationen für die Verwendung von CUDA
@@ -546,60 +560,63 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
         print("----------------------------")
         print("|<< Starte Transkription >>|")
         print("----------------------------")
+        torch.backends.cudnn.benchmark = True  # Auto-Tuning für beste Performance
+        torch.backends.cudnn.enabled = True    # cuDNN aktivieren
         model = get_whisper_model()                                                 # Laden des vortrainierten Whisper-Modells
-        segments, info = model.transcribe(
-            audio_file,                         # Audio-Datei
-            beam_size=10,
-            patience=2.0,
-            vad_filter=True,
-#            chunk_length=60,
-            compression_ratio_threshold=2.2,    # Schwellenwert für Kompressionsrate
-#            log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
-#            no_speech_threshold=2.0,            # Schwellenwert für Stille
-            temperature=(0.05, 0.1, 0.15, 0.2),      # Temperatur für Sampling
-            word_timestamps=True,               # Zeitstempel für Wörter
-#            hallucination_silence_threshold=0.35,  # Schwellenwert für Halluzinationen
-            condition_on_previous_text=True,    # Bedingung an vorherigen Text
-            no_repeat_ngram_size=3,
-#            repetition_penalty=1.5,
-#            verbose=True,                       # Ausführliche Ausgabe
-            language="en",                       # Englische Sprache
-#            task="translate",                    # Übersetzung aktivieren
-        )
-        #segments = result["segments"]
-        segments_list = []
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            segments, info = model.transcribe(
+                audio_file,                         # Audio-Datei
+                beam_size=10,
+                patience=2.0,
+                vad_filter=False,
+    #            chunk_length=60,
+                compression_ratio_threshold=1.8,    # Schwellenwert für Kompressionsrate
+    #            log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
+    #            no_speech_threshold=1.0,            # Schwellenwert für Stille
+                temperature=(0.05, 0.1, 0.15, 0.2),      # Temperatur für Sampling
+                word_timestamps=True,               # Zeitstempel für Wörter
+                hallucination_silence_threshold=0.35,  # Schwellenwert für Halluzinationen
+                condition_on_previous_text=True,    # Bedingung an vorherigen Text
+                no_repeat_ngram_size=2,
+    #            repetition_penalty=1.5,
+    #            verbose=True,                       # Ausführliche Ausgabe
+                language="en",                       # Englische Sprache
+    #            task="translate",                    # Übersetzung aktivieren
+            )
+            #segments = result["segments"]
+            segments_list = []
         
         # Simuliere die verbose-Ausgabe
-        print("\n[ Transkriptionsdetails ]")
-        for segment in segments:
-            start = str(timedelta(seconds=segment.start)).split('.')[0]
-            end = str(timedelta(seconds=segment.end)).split('.')[0]
-            text = segment.text.strip()
-            
-            # Text bereinigen: Entferne "..." am Ende des Textes
-            text = segment.text.strip()
-            text = re.sub(r'\.\.\.$', '', text).strip()  # Entferne "..." nur am Ende
-            
-            # Ähnlich wie verbose=True bei OpenAI Whisper
-            print(f"[{start} --> {end}] {text}")
-            
-            adjusted_segment = {
-                "start": max(segment.start - 0, 0),
-                "end": max(segment.end + 0, 0),
-                "text": segment.text
-            }
-            segments_list.append(adjusted_segment)
+            print("\n[ Transkriptionsdetails ]")
+            for segment in segments:
+                start = str(timedelta(seconds=segment.start)).split('.')[0]
+                end = str(timedelta(seconds=segment.end)).split('.')[0]
+                text = segment.text.strip()
+                
+                # Text bereinigen: Entferne "..." am Ende des Textes
+                text = segment.text.strip()
+                text = re.sub(r'\.\.\.$', '', text).strip()  # Entferne "..." nur am Ende
+                
+                # Ähnlich wie verbose=True bei OpenAI Whisper
+                print(f"[{start} --> {end}] {text}")
+                
+                adjusted_segment = {
+                    "start": max(segment.start - 0, 0),
+                    "end": max(segment.end + 0, 0),
+                    "text": segment.text
+                }
+                segments_list.append(adjusted_segment)
 
         # CSV-Export
-        transcription_file = transcription_file.replace('.json', '.csv')
-        with open(transcription_file, mode='w', encoding='utf-8', newline='') as csvfile:
-            csv_writer = csv.writer(csvfile, delimiter='|')
-            csv_writer.writerow(['Startzeit', 'Endzeit', 'Text'])
-            
-            for segment in segments_list:
-                start = str(timedelta(seconds=segment["start"])).split('.')[0]
-                end = str(timedelta(seconds=segment["end"])).split('.')[0]
-                csv_writer.writerow([start, end, segment["text"]])
+            transcription_file = transcription_file.replace('.json', '.csv')
+            with open(transcription_file, mode='w', encoding='utf-8', newline='') as csvfile:
+                csv_writer = csv.writer(csvfile, delimiter='|')
+                csv_writer.writerow(['Startzeit', 'Endzeit', 'Text'])
+                
+                for segment in segments_list:
+                    start = str(timedelta(seconds=segment["start"])).split('.')[0]
+                    end = str(timedelta(seconds=segment["end"])).split('.')[0]
+                    csv_writer.writerow([start, end, segment["text"]])
         print("------------------------------------")
         print("|<< Transkription abgeschlossen! >>|")
         print("------------------------------------")
@@ -626,7 +643,7 @@ def format_time(seconds):
     """
     return str(timedelta(seconds=int(seconds)))
 
-def merge_transcript_chunks(input_file, output_file, min_dur=1, max_dur=15, max_gap=5):
+def merge_transcript_chunks(input_file, output_file, min_dur=MIN_DUR, max_dur=MAX_DUR, max_gap=MAX_GAP):
     """
     Führt Transkript-Segmente unter Berücksichtigung der spezifizierten Regeln zusammen
     
@@ -810,7 +827,7 @@ def batch_translate(segments, target_lang="de"):
         truncation=True
         ).to(device)
 
-    with torch.no_grad(), autocast("cuda"):  # Kein Gradienten-Tracking & Mixed Precision für Speed
+    with torch.no_grad(), autocast(device_type='cuda', dtype=torch.float16):  # Kein Gradienten-Tracking & Mixed Precision für Speed
         outputs = _TRANSLATE_MODEL.generate(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
@@ -820,9 +837,9 @@ def batch_translate(segments, target_lang="de"):
             length_penalty=1.0,
             early_stopping=True,
             do_sample=True,
-            temperature=0.3,
+            temperature=0.2,
             no_repeat_ngram_size=2,
-            max_length=90
+            max_length=125
         )
 
     return [_TOKENIZER.decode(out, skip_special_tokens=True).strip() for out in outputs]
@@ -1014,15 +1031,15 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
         #tts = TTS(model_name="tts_models/de/thorsten/vits", progress_bar=True).to(device)
         final_audio = np.array([], dtype=np.float32)                # Array für die kombinierten Audio-Segmente
         sampling_rate = 24000
-        
+#        phonemizer = Gruut("de")
         config = XttsConfig(model_param_stats=True)
-        config.load_json(r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_04_63\config.json")
+        config.load_json(r"D:\alltalk_tts\models\xtts\v203_10_04_63_\config.json")
                 
         model = Xtts.init_from_config(config)
         model.load_checkpoint(
             config,
-            checkpoint_dir=r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_04_63",
-            checkpoint_path=r"D:\AllTalk\alltalk_tts\models\xtts\v203_10_04_63\model.pth",
+            checkpoint_dir=r"D:\alltalk_tts\models\xtts\v203_10_04_63_",
+            checkpoint_path=r"D:\alltalk_tts\models\xtts\v203_10_04_63_\model.pth",
             use_deepspeed=False
             )
         model.to(torch.device("cuda"))
@@ -1046,7 +1063,12 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
 
                 try:
                     with torch.no_grad(), autocast("cuda"):
-    #                    audio_clip = audio_clip[wav]
+#                        try:
+#                            phonemes = phonemizer.phonemize(text)
+#                        except Exception as e:
+#                            logger.error(f"Phonemisierungsfehler: {e}")
+#                            phonemes = text  # Fallback auf Originaltext
+#                        text_for_tts = phonemes if USE_PHONEMES else text
                         result = model.inference(
                             gpt_cond_latent=gpt_cond_latent,
                             speaker_embedding=speaker_embedding,
@@ -1054,8 +1076,8 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
                             language="de",
     #                        speaker_wav = sample_path_1,          # Stimmenklon-Sample #1
                             num_beams = 1,
-                            speed = 0.95,                          # Sprechgeschwindigkeit
-                            temperature = 0.60,
+                            speed = 1,                          # Sprechgeschwindigkeit
+                            temperature = 0.65,
                             length_penalty = 1.0,
                             repetition_penalty = 10.0,
     #                        do_sample=True,
@@ -1331,9 +1353,9 @@ def main():
     merge_transcript_chunks(
         input_file=TRANSCRIPTION_FILE,
         output_file=MERGED_TRANSCRIPTION_FILE,
-        min_dur=1,
-        max_dur=15,
-        max_gap=5
+        min_dur=MIN_DUR,
+        max_dur=MAX_DUR,
+        max_gap=MAX_GAP
     )
     
     # 6.2) Wiederherstellung der Interpunktion
