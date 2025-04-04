@@ -32,6 +32,7 @@ from config import *
 from tqdm import tqdm
 from contextlib import contextmanager
 from deepmultilingualpunctuation import PunctuationModel
+from datasets import Dataset
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
@@ -53,7 +54,7 @@ from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
 from TTS.tts.utils.text.phonemizers.gruut_wrapper import Gruut
 #import whisper
-from faster_whisper import vad, WhisperModel
+from faster_whisper import WhisperModel, BatchedInferencePipeline
 from pydub import AudioSegment
 from pydub.effects import(
     high_pass_filter,
@@ -74,7 +75,10 @@ if torch.cuda.is_available():
     # Höheres Timeout für komplexe Operationen
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
-#Transkription Zusammenführung
+# Phoneme Konfiguration
+USE_PHONEMES = False
+
+# Transkription Zusammenführung
 MIN_DUR = 0 # Minimale Segmentdauer in Sekunden 
 MAX_DUR = 10 # Maximale Segmentdauer in Sekunden
 MAX_GAP = 5 # Maximaler akzeptierter Zeitabstand zwischen Segmenten
@@ -86,7 +90,7 @@ SPEED_FACTOR_PLAYBACK = 1.0      # Geschwindigkeitsfaktor für die Wiedergabe de
 
 # Lautstärkeanpassungen
 VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
-VOLUME_ADJUSTMENT_VIDEO = 0.08   # Lautstärkefaktor für das Video
+VOLUME_ADJUSTMENT_VIDEO = 0.04   # Lautstärkefaktor für das Video
 
 # ============================== 
 # Globale Konfigurationen und Logging
@@ -94,6 +98,7 @@ VOLUME_ADJUSTMENT_VIDEO = 0.08   # Lautstärkefaktor für das Video
 logging.basicConfig(filename='video_translation_final.log', format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 _WHISPER_MODEL = None
+_BATCHED_MODEL= None
 _TRANSLATE_MODEL = None
 _TOKENIZER = None
 _TTS_MODEL = None
@@ -112,8 +117,8 @@ source_lang="en"
 target_lang="de"
 # Konfigurationen für die Verwendung von CUDA
 cuda_options = {
-    'hwaccel': 'cuda',
-    'hwaccel_output_format': 'cuda'
+    "hwaccel": "cuda",
+    "hwaccel_output_format": "cuda"
 }
 def run_command(command):
     print(f"Ausführung des Befehls: {command}")
@@ -139,10 +144,11 @@ def ask_overwrite(file_path):
 
 step_start_time = time.time()
 def get_whisper_model():
-    global _WHISPER_MODEL
+    global _WHISPER_MODEL, _BATCHED_MODEL
     if not _WHISPER_MODEL:
 #        _WHISPER_MODEL = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3").to(device)
-        _WHISPER_MODEL = WhisperModel("large-v3-turbo", device=device)
+        _WHISPER_MODEL = WhisperModel("large-v3", device="cuda", compute_type="float16")
+        _BATCHED_MODEL = BatchedInferencePipeline(model=_WHISPER_MODEL)
 #        _WHISPER_MODEL.to(torch.device("cuda"))
         torch.cuda.empty_cache()
     return _WHISPER_MODEL
@@ -195,7 +201,7 @@ def extract_audio_ffmpeg(video_path, audio_output):
             logger.info(f"Verwende vorhandene Datei: {audio_output}")
             return
     try:
-        ffmpeg.input(video_path).output(
+        ffmpeg.input(video_path, hwaccel="cuda", hwaccel_output_format="cuda").output(
             audio_output,
             threads=0,      # Verwendet alle verfügbaren Threads
             f="wav",
@@ -555,22 +561,27 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
             logger.info(f"Verwende vorhandene Transkription: {transcription_file}", exc_info=True)
             return read_transcripted_csv(transcription_file)
     try:
-        logger.info("Lade Whisper-Modell (large-v3-turbo)...", exc_info=True)
+        logger.info("Lade Whisper-Modell (large-v3)...", exc_info=True)
         logger.info("Starte Transkription...", exc_info=True)
         print("----------------------------")
         print("|<< Starte Transkription >>|")
         print("----------------------------")
+        
+        global _WHISPER_MODEL,_BATCHED_MODEL
+        
         torch.backends.cudnn.benchmark = True  # Auto-Tuning für beste Performance
         torch.backends.cudnn.enabled = True    # cuDNN aktivieren
-        model = get_whisper_model()                                                 # Laden des vortrainierten Whisper-Modells
+        get_whisper_model()   # Laden des vortrainierten Whisper-Modells
+        
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-            segments, info = model.transcribe(
+            segments, info = _BATCHED_MODEL.transcribe(
                 audio_file,                         # Audio-Datei
+                batch_size=4,
                 beam_size=10,
-                patience=2.0,
-                vad_filter=False,
-    #            chunk_length=60,
-                compression_ratio_threshold=1.8,    # Schwellenwert für Kompressionsrate
+                patience=1.0,
+                vad_filter=True,
+                chunk_length=10,
+    #            compression_ratio_threshold=2.8,    # Schwellenwert für Kompressionsrate
     #            log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
     #            no_speech_threshold=1.0,            # Schwellenwert für Stille
                 temperature=(0.05, 0.1, 0.15, 0.2),      # Temperatur für Sampling
@@ -809,13 +820,13 @@ BATCH_SIZE = 8  # Je nach GPU-Speicher anpassen (z. B. 4, 8 oder 16)
 def batch_translate(segments, target_lang="de"):
     """Übersetzt mehrere Segmente gleichzeitig im Batch-Modus."""
     global _TOKENIZER, _TRANSLATE_MODEL  # 🔥 Stelle sicher, dass sie global verwendet werden
-
+    get_translate_model() 
     if _TOKENIZER is None or _TRANSLATE_MODEL is None:  # 🔥 Modell nachladen, falls nötig
-        print("⚠️  WARNUNG: Modell oder Tokenizer nicht geladen. Lade sie jetzt...")
+        print("\n⚠️  WARNUNG: Modell oder Tokenizer nicht geladen. Lade sie jetzt...")
         get_translate_model()  
         
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    _TRANSLATE_MODEL.half()
     texts = [f"<2{target_lang}> {seg['text']}" for seg in segments]  # Alle Texte sammeln
     
     # ✅ Batch-Tokenization (viel schneller!)
@@ -827,20 +838,22 @@ def batch_translate(segments, target_lang="de"):
         truncation=True
         ).to(device)
 
-    with torch.no_grad(), autocast(device_type='cuda', dtype=torch.float16):  # Kein Gradienten-Tracking & Mixed Precision für Speed
-        outputs = _TRANSLATE_MODEL.generate(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            pad_token_id=_TOKENIZER.eos_token_id,
-            num_beams=7,  
-            repetition_penalty=1.0,
-            length_penalty=1.0,
-            early_stopping=True,
-            do_sample=True,
-            temperature=0.2,
-            no_repeat_ngram_size=2,
-            max_length=125
-        )
+    with torch.no_grad():
+        with autocast(device_type='cuda', dtype=torch.float16):  # Kein Gradienten-Tracking & Mixed Precision für Speed
+            outputs = _TRANSLATE_MODEL.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                pad_token_id=_TOKENIZER.eos_token_id,
+                use_model_defaults=True,
+                num_beams=8,  
+                repetition_penalty=1.0,
+                length_penalty=1.0,
+                early_stopping=True,
+                do_sample=True,
+                temperature=0.15,
+                no_repeat_ngram_size=2,
+                max_length=90
+            )
 
     return [_TOKENIZER.decode(out, skip_special_tokens=True).strip() for out in outputs]
 
@@ -850,7 +863,24 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
         if not ask_overwrite(translation_file):
             logger.info(f"Verwende vorhandene Übersetzungen: {translation_file}", exc_info=True)
             return read_translated_csv(translation_file)
-#                return json.load(file)
+
+    
+    existing_translations = {}  # Zwischenspeicher für bereits gespeicherte Übersetzungen
+    end_times = {}  # Speichert Endzeiten für jeden Startpunkt
+    
+    # Lade existierende Übersetzungen
+    if os.path.exists(translation_file):
+        with open(translation_file, "r", encoding="utf-8") as csvfile:
+            csv_reader = csv.reader(csvfile, delimiter='|')
+            try:
+                next(csv_reader)  # Header überspringen
+                for row in csv_reader:
+                    if len(row) == 3:
+                        existing_translations[row[0]] = row[2]  # Startzeit als Key, Text als Wert
+                        end_times[row[0]] = row[1]  # Speichere Endzeit
+            except StopIteration:
+                # Leere oder nur Header-Datei
+                pass
             
     try:
         print(f"--------------------------")
@@ -866,49 +896,57 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
                 if len(row) == 3:
                     start = sum(float(x) * 60 ** i for i, x in enumerate(reversed(row[0].split(':'))))
                     end = sum(float(x) * 60 ** i for i, x in enumerate(reversed(row[1].split(':'))))
-                    segments.append({"start": start, "end": end, "text": row[2]})
+                    
+                    # Speichere Endzeit für alle Segmente
+                    end_times[row[0]] = row[1]
+                    
+                    # Falls bereits übersetzt, überspringen
+                    if row[0] in existing_translations:
+                        continue
+                    
+                    segments.append({"start": start, "end": end, "text": row[2], "start_str": row[0]})
 
         if not segments:
-            logger.error("Keine Segmente gefunden!")
-            return []
-
+            logger.info("Keine neuen Segmente zu übersetzen!")
+            return existing_translations  # Konsistente Rückgabe
 
         # ✅ **Batch-Verarbeitung**
-        translated_segments = []
-        for i in range(0, len(segments), BATCH_SIZE):
-            batch = segments[i:i + BATCH_SIZE]
-            print(f"⚡ Übersetze Batch {i//BATCH_SIZE + 1}/{-(-len(segments) // BATCH_SIZE)} mit {len(batch)} Segmenten...")
-            start_time = time.time()
-            
-            translations = batch_translate(batch, target_lang)
-            
-            for seg, trans in zip(batch, translations):
-                translated_segments.append({"start": seg["start"], "end": seg["end"], "text": trans})
-            
-            end_time = time.time()
-            print(f"✅ Batch {i//BATCH_SIZE + 1} fertig in {end_time - start_time:.2f} Sekunden!")
+        
+        # Dataset aus den Segmenten erstellen
+        dataset = Dataset.from_dict({"text": [seg["text"] for seg in segments]})
 
+        # Batch-Übersetzung auf das Dataset anwenden
+        def translate_batch(batch):
+            batch["translation"] = batch_translate([{"text": text} for text in batch["text"]], target_lang)
+            return batch
+
+        dataset = dataset.map(translate_batch, batched=True, batch_size=BATCH_SIZE)
+
+        # Neue Übersetzungen zum existing_translations Dictionary hinzufügen
+        for i, seg in enumerate(segments):
+            existing_translations[seg["start_str"]] = dataset["translation"][i]
 
         # Ergebnisse speichern
         with open(translation_file, mode='w', encoding='utf-8', newline='') as csvfile:
             csv_writer = csv.writer(csvfile, delimiter='|')
             csv_writer.writerow(['Startpunkt Zeitstempel', 'Endpunkt Zeitstempel', 'Text'])
-            for seg in translated_segments:
-                start_time_str = str(timedelta(seconds=seg["start"])).split('.')[0]
-                end_time_str = str(timedelta(seconds=seg["end"])).split('.')[0]
-                csv_writer.writerow([start_time_str, end_time_str, seg["text"]])
+            
+            # Schreibe alle Übersetzungen (alte und neue)
+            for start_str, text in existing_translations.items():
+                if start_str in end_times:  # Sicherheitscheck
+                    end_str = end_times[start_str]
+                    csv_writer.writerow([start_str, end_str, text])
 
         logger.info("Übersetzung abgeschlossen!")
         print(f"-----------------------------------")
         print(f"|<< Übersetzung abgeschlossen!! >>|")
         print(f"-----------------------------------")
 
-        return translated_segments
+        return existing_translations  # Konsistente Rückgabe
 
     except Exception as e:
         logger.error(f"Fehler bei der Übersetzung: {e}")
-
-    return []
+        return existing_translations  # Konsistente Rückgabe auch im Fehlerfall
 
 def restore_punctuation_de(input_file, output_file):
     if os.path.exists(output_file):
@@ -959,62 +997,27 @@ def convert_time_to_seconds(time_str):
     else:  # Nur Sekunden
         return parts[0]
 
-def check_and_replace_last_char(file_path, file_out):
-    if os.path.exists(file_out):
-        if not ask_overwrite(file_out):
-            logger.info(f"Verwende vorhandene Übersetzungen: {file_out}", exc_info=True)
-            return read_translated_csv(file_out)
-    # CSV-Datei lesen
-    with open(file_path, 'r', encoding='utf-8') as file:
-        lines = file.readlines()
-    print("------------------------")
-    print("|<< Zeilen aufräumen >>|")
-    print("------------------------")
-    # Zeilen modifizieren, wenn nötig
-    modified_lines = []
-    for line in lines:
-        line = line.strip()  # Zeilenendenzeichen entfernen
-        
-        # Klammern und Anführungszeichen entfernen
-        line = line.replace("(", "").replace(")", "").replace('"', '').replace('"', '')
-        
-        # Bindestriche entfernen, wenn ein Leerzeichen vorhanden ist
-        line = line.replace(" - ", " ").replace("–", " ")
-        
-        # Alle "-" entfernen, die nicht von Leerzeichen umgeben sind
-        line = ''.join([c if c != '-' or (c == '-' and (i > 0 and line[i-1].isspace()) and (i < len(line) - 1 and line[i+1].isspace())) else ' ' for i, c in enumerate(line)])
-        
-        # Zeile in zwei Teile teilen: Zeitangaben und Rest
-        prefix = line[:16]
-        rest_of_line = line[16:]
-        
-        # Sicherstellen, dass ab dem 16. Zeichen ein Buchstabe am Anfang steht
-        while rest_of_line and not rest_of_line[0].isalnum():
-            rest_of_line = rest_of_line[1:]  # Erstes Zeichen entfernen, wenn es kein Buchstabe ist
-        
-        if rest_of_line:  # Stelle sicher, dass der Rest der Zeile nicht leer ist
-            last_char = rest_of_line[-1]  # Letzten Charakter der Zeile holen
-            
-            # Vermeide mehrere Punkte hintereinander
-            if last_char == '.':
-                rest_of_line = rest_of_line[:-1]
-            
-            if last_char.isalnum():  # Wenn der letzte Charakter ein Buchstabe ist
-                rest_of_line += '.'  # Einen Punkt ans Ende hängen
-            elif last_char in [';', ':', '-']:  # Wenn es ein Komma oder ähnliches Satzzeichen ist
-                rest_of_line = rest_of_line[:-1] + '.'  # Letzten Charakter durch einen Punkt ersetzen
-            elif last_char not in [' ', ',', '.', '?', '!']:  # Wenn es ein anderes Satzzeichen ist, aber nicht ?, ! oder .
-                rest_of_line = rest_of_line[:-1] + '.'  # Letzten Charakter durch einen Punkt ersetzen
-            
-            # Vermeide Leerzeichen vor Punkten
-            rest_of_line = rest_of_line.replace(' .', '.').replace(' ?', '?').replace(' !', '!').replace(',', ',')
-        
-        # Füge die Zeitangaben und den modifizierten Text wieder zusammen
-        modified_lines.append(prefix + rest_of_line + '\n')
-    
-    # Modifizierte Zeilen zurück in die Datei schreiben
-    with open(file_out, 'w', encoding='utf-8') as file:
-        file.writelines(modified_lines)
+def phonemize_with_espeak(text, lang="de"):
+    try:
+        # ✅ Sicherstellen, dass der Text als Input übergeben wird
+        result = subprocess.run(
+            ["espeak-ng", "-q", "--ipa", "-v", lang, "--stdin"],
+            input=text.encode("utf-8"),  # 🔥 eSpeak benötigt evtl. UTF-8 Encoding!
+            capture_output=True,
+            text=False  # 🔥 Wichtig: Damit `stdout` als `bytes` zurückkommt!
+        )
+
+        if result.returncode != 0:
+            print(f"⚠️ eSpeak-Fehler: {result.stderr.decode('utf-8').strip()}")
+            return ""
+
+        phonemes = result.stdout.decode("utf-8").strip()  # 🔥 Explizites Dekodieren
+        if not phonemes:
+            raise ValueError("Leere Phoneme zurückgegeben!")
+        return phonemes
+    except Exception as e:
+        logger.warning(f"Phonemisierungsfehler mit eSpeak: {e}")
+        return ""  # Leere Zeichenkette zurückgeben, damit das Programm weiterläuft.
 
 def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_path_2, sample_path_3, output_path):
     """Führt die Umwandlung von Text zu Sprache durch (TTS), inklusive Stimmenklonung basierend auf sample.wav."""
@@ -1027,26 +1030,29 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
         print(f"|<< Starte TTS >>|")
         print(f"------------------")
         logger.info(f"Lade TTS-Modell ...", exc_info=True)
-        #tts = TTS(model_name="tts_models/de/thorsten/tacotron2-DDC", progress_bar=True).to(device)
-        #tts = TTS(model_name="tts_models/de/thorsten/vits", progress_bar=True).to(device)
+        
         final_audio = np.array([], dtype=np.float32)                # Array für die kombinierten Audio-Segmente
         sampling_rate = 24000
-#        phonemizer = Gruut("de")
+        
         config = XttsConfig(model_param_stats=True)
-        config.load_json(r"D:\alltalk_tts\models\xtts\v203_10_04_63_\config.json")
+        config.load_json(r"D:\alltalk_tts\models\xtts\v203_10_04_63\config.json")
                 
         model = Xtts.init_from_config(config)
         model.load_checkpoint(
             config,
-            checkpoint_dir=r"D:\alltalk_tts\models\xtts\v203_10_04_63_",
-            checkpoint_path=r"D:\alltalk_tts\models\xtts\v203_10_04_63_\model.pth",
+            checkpoint_dir=r"D:\alltalk_tts\models\xtts\v203_10_04_63",
+            checkpoint_path=r"D:\alltalk_tts\models\xtts\v203_10_04_63\model.pth",
+#            vocab_path=r"D:\alltalk_tts\models\xtts\v203_10_04_63\mein_tokenizer_6681.json",
             use_deepspeed=False
             )
         model.to(torch.device("cuda"))
         
-        gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(sound_norm_refs=True, audio_path=[sample_path_1, sample_path_2, sample_path_3])
+        gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(
+            sound_norm_refs=True,
+            audio_path=[sample_path_1, sample_path_2]
+        )
         # Lese die CSV-Datei mit den Zeitstempeln und Texten
-        with open(translation_file, mode="r", encoding="utf-8") as f:
+        with open(translation_file, mode="r", encoding="utf-8", errors="replace") as f:
             reader = csv.reader(f, delimiter="|")
             next(reader)  # Header überspringen
             for row in reader:
@@ -1057,54 +1063,39 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
                 end = convert_time_to_seconds(row[1])
                 text = row[2].strip("-:")
                 text = row[2].strip()
-#                text = text.strip()
 
                 print(f"🔍 Bearbeite Segment mit: {start}-{end}s mit Text:\n{text}\n")
 
                 try:
-                    with torch.no_grad(), autocast("cuda"):
-#                        try:
-#                            phonemes = phonemizer.phonemize(text)
-#                        except Exception as e:
-#                            logger.error(f"Phonemisierungsfehler: {e}")
-#                            phonemes = text  # Fallback auf Originaltext
-#                        text_for_tts = phonemes if USE_PHONEMES else text
-                        result = model.inference(
-                            gpt_cond_latent=gpt_cond_latent,
-                            speaker_embedding=speaker_embedding,
-                            text=text,                          # Übersetzter Text
-                            language="de",
-    #                        speaker_wav = sample_path_1,          # Stimmenklon-Sample #1
-                            num_beams = 1,
-                            speed = 1,                          # Sprechgeschwindigkeit
-                            temperature = 0.65,
-                            length_penalty = 1.0,
-                            repetition_penalty = 10.0,
-    #                        do_sample=True,
-                            enable_text_splitting=True,
-                            top_k=50,
-                            top_p=0.85,
-                        )
+                    with torch.no_grad():
+                        with autocast("cuda"):
+                            phonemes = phonemize_with_espeak(text)
+                            text_for_tts = phonemes if USE_PHONEMES else text
+                            logger.debug(f"📖 Original: {text} → 🎙 Phoneme: {phonemes}")
 
-                    # Extrahiere das Audio aus dem Dictionary
-                    if isinstance(result, dict):
-                        audio_clip = result.get("wav", None)
-                        if not isinstance(audio_clip, (np.ndarray, torch.Tensor)):
-                            print(f"⚠️ Warnung: `inference()` hat kein Audio für Text: {text} generiert.")
-                            audio_clip = np.zeros(1000, dtype=np.float32)  # Ersetze mit Stille
-                    audio_clip = np.array(audio_clip, dtype=np.float32)
-                    audio_clip = np.squeeze(audio_clip) if audio_clip.ndim > 1 else audio_clip      # In float32 konvertieren
+                            result = model.inference(
+                                gpt_cond_latent=gpt_cond_latent,
+                                speaker_embedding=speaker_embedding,
+                                text=text_for_tts,                          # Übersetzter Text
+                                language="de",
+                                num_beams = 1,
+                                speed = 1.0,                          # Sprechgeschwindigkeit
+                                temperature = 0.25,
+                                length_penalty = 1.0,
+                                repetition_penalty = 10.0,
+        #                        do_sample=True,
+                                enable_text_splitting=False,
+                                top_k=55,
+                                top_p=0.8,
+                            )
+
+                            audio_clip = result.get("wav", np.zeros(1000, dtype=np.float32)) if isinstance(result, dict) else np.zeros(1000, dtype=np.float32)
+                            audio_clip = np.array(audio_clip, dtype=np.float32).squeeze()
+
+                        if not audio_clip.size:
+                            logger.warning("⚠️ Leeres Audio - Ersetze mit Stille.")
+                            audio_clip = np.zeros(1000, dtype=np.float32)
                     
-                    if audio_clip.size == 0:
-                        print(f"⚠️ Warnung: `audio_clip` ist leer. Ersetze mit Stille.")
-                        audio_clip = np.zeros(1000, dtype=np.float32)
-                    
-#                    peak_val = np.max(np.abs(audio_clip)) if np.any(audio_clip) else 1.0
-#                    peak_val = np.max(np.abs(audio_clip)) + 1e-8
-#                    audio_clip /= peak_val
-                    
-#                    audio_clip = audio_clip.astype(np.float32)
-#                    audio_clip /= peak_val  # Abschließende Normalisierung
                     current_length = len(final_audio) / sampling_rate                           # Aktuelle Länge des Audios
                     silence_duration = max(0.0, start - current_length)                         # Stille vor dem Segment   
                     silence_samples = int(silence_duration * sampling_rate)                    # Stille in Samples
@@ -1113,17 +1104,13 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
                 except Exception as segment_error:
                     logger.error(f"Fehler in Segment {start}-{end}s: {segment_error}", exc_info=True)
                     continue
-                                    # Speichere das finale Audio  
-        
+                
         if len(final_audio) == 0:
             print("Kein Audio - Datei leer!")
             final_audio = np.zeros((1, 1000), dtype=np.float32)
 
-#        final_audio = apply_denoising(final_audio, sampling_rate)  # Rauschfilter anwenden
-
         # 🔽 GLOBALE NORMALISIERUNG DES GESAMTEN AUDIOS
         final_audio /= np.max(np.abs(final_audio)) + 1e-8  # Einheitliche Lautstärke
-
         final_audio = final_audio.astype(np.float32)                                    # In float32 konvertieren
         
         # Falls das Audio nur 1D ist, reshape für `torchaudio.save()`
@@ -1257,22 +1244,54 @@ def adjust_playback_speed(video_path, adjusted_video_path, speed_factor):
             logger.info(f"Verwende vorhandene Datei: {adjusted_video_path}", exc_info=True)
             return
     try:
+        print("--------------------------------")
+        print("|<< Videoanpassung gestartet >>|")
+        print("--------------------------------")
+        
         video_speed = 1 / speed_factor
         audio_speed = speed_factor
-#        ffmpeg.input(video_path, **cuda_options).output(
-#        ffmpeg.input(video_path, **cuda_options).output(
-        ffmpeg.input(video_path).output(
-            adjusted_video_path,
-            vf=f"setpts={video_speed}*PTS",
-                        af=f"atempo={audio_speed}"
-        ).run(overwrite_output=True)
+        
+        temp_output = adjusted_video_path + ".temp.mp4"
+        
+        (
+        ffmpeg
+        .input(video_path, hwaccel="cuda")
+        .output(temp_output, vcodec="h264_nvenc", acodec="copy")
+        .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
+        )
+        (
+        ffmpeg
+        .input(temp_output)
+        .output(
+                adjusted_video_path,
+                vf=f"setpts={video_speed}*PTS",
+                af=f"atempo={audio_speed}",
+                vcodec="h264_nvenc",
+                **{"max_muxing_queue_size": "1024"}
+                )
+        .run(
+            overwrite_output=True,
+            capture_stdout=True,
+            capture_stderr=True
+            )
+        )
+        
+        if os.path.exists(temp_output):
+            os.remove(temp_output)
+        
+        print("------------------------------")
+        print("|<< Videoanpassung beendet >>|")
+        print("------------------------------")
+        
         logger.info(
             f"Videogeschwindigkeit angepasst (Faktor={speed_factor}): {adjusted_video_path} ",
             exc_info=True
             #f"und Lautstärke={VOLUME_ADJUSTMENT_VIDEO}"
         )
     except ffmpeg.Error as e:
+        stderr = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else "Keine stderr-Details verfügbar"
         logger.error(f"Fehler bei der Anpassung der Wiedergabegeschwindigkeit: {e}")
+        logger.error(f"FFmpeg stderr-Ausgabe: {stderr}")
 
 def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final_video_path):
     """
@@ -1290,30 +1309,49 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
             logger.info(f"Verwende vorhandene Datei: {final_video_path}", exc_info=True)
             return
     try:
+        
+        print("----------------------------------")
+        print("|<< Starte Video-Audio-Mixdown >>|")
+        print("----------------------------------")
+        
         filter_complex = (
             f"[0:a]volume={VOLUME_ADJUSTMENT_VIDEO}[a1];"  # Reduziere die Lautstärke des Originalvideos
             f"[1:a]volume={VOLUME_ADJUSTMENT_44100}[a2];"  # Halte die Lautstärke des TTS-Audios konstant
             "[a1][a2]amix=inputs=2:duration=longest"
         )
-#        video_input = ffmpeg.input(adjusted_video_path, **cuda_options)
-#        video_input = ffmpeg.input(adjusted_video_path, **cuda_options)
-        video_input = ffmpeg.input(adjusted_video_path)
-        audio_input = ffmpeg.input(translated_audio_path)
-
-        ffmpeg.output(
-            video_input.video,
-            audio_input.audio,
+        
+        video_path = ffmpeg.input(
+                    adjusted_video_path,
+                    hwaccel="cuda"
+                    )
+        audio_path = ffmpeg.input(
+                    translated_audio_path,
+                    hwaccel="cuda"
+                    )
+        (
+        ffmpeg
+        .output(
+            video_path.video,
+            audio_path.audio,
             final_video_path,
-            vcodec="copy",
+            vcodec="h264_nvenc",
             acodec="aac",
             strict="experimental",
             filter_complex=filter_complex,
             map="0:v",
             map_metadata="-1"
-        ).overwrite_output().run()
+            )
+        .overwrite_output()
+        .run(capture_stdout=True, capture_stderr=True)
+        )
+        print("-----------------------------------")
+        print("|<< Video-Audio-Mixdown beendet >>|")
+        print("-----------------------------------")
         logger.info(f"Finales Video erstellt und gemischt: {final_video_path}", exc_info=True)
     except ffmpeg.Error as e:
+        stderr = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else "Keine stderr-Details verfügbar"
         logger.error(f"Fehler beim Kombinieren von Video und Audio: {e}")
+        logger.error(f"FFmpeg stderr-Ausgabe: {stderr}")
 
 # ==============================
 # Hauptprogramm
@@ -1332,7 +1370,7 @@ def main():
     extract_audio_ffmpeg(VIDEO_PATH, ORIGINAL_AUDIO_PATH)
 
     # 3) Audioverarbeitung (Rauschunterdrückung und Lautheitsnormalisierung)
-    process_audio(ORIGINAL_AUDIO_PATH, PROCESSED_AUDIO_PATH)
+#    process_audio(ORIGINAL_AUDIO_PATH, PROCESSED_AUDIO_PATH)
 
     # 4) Audio resamplen auf 16 kHz, Mono (für TTS)
 #    resample_to_16000_mono(PROCESSED_AUDIO_PATH, PROCESSED_AUDIO_PATH_SPEED, SPEED_FACTOR_RESAMPLE_16000)
@@ -1344,7 +1382,7 @@ def main():
     create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3)
 
     # 6) Spracherkennung (Transkription) mit Whisper
-    segments = transcribe_audio_with_timestamps(PROCESSED_AUDIO_PATH, TRANSCRIPTION_FILE)
+    segments = transcribe_audio_with_timestamps(ORIGINAL_AUDIO_PATH, TRANSCRIPTION_FILE)
     if not segments:
         logger.error("Transkription fehlgeschlagen oder keine Segmente gefunden.")
         return
@@ -1384,8 +1422,11 @@ def main():
     combine_video_audio_ffmpeg(ADJUSTED_VIDEO_PATH, RESAMPLED_AUDIO_FOR_MIXDOWN, FINAL_VIDEO_PATH)
 
     total_time = time.time() - start_time
-    print(f"\nGesamtprozessdauer: {(total_time / 60):.2f} Minuten -> {(total_time / 60 / 60):.2f} Stunden")
-
+    print("-----------------------------------")
+    print("|<< Video erfolgreich übersetzt >>|")
+    print("-----------------------------------")
+    print(f"|<< \nGesamtprozessdauer: {(total_time / 60):.2f} Minuten -> {(total_time / 60 / 60):.2f} Stunden\n >>|")
+    print("-----------------------------------")
     logger.info(f"Projekt abgeschlossen! Finale Ausgabedatei: {FINAL_VIDEO_PATH}", exc_info=True)
 
 if __name__ == "__main__":
