@@ -6,6 +6,7 @@ import subprocess
 from tabnanny import verbose
 import ffmpeg
 import logging
+from langcodes import Language
 import librosa
 import matplotlib.pyplot as plt
 import soundfile as sf
@@ -16,6 +17,8 @@ import scipy.signal as signal
 from scipy.signal import resample_poly
 from pydub import AudioSegment
 from sympy import false, true
+from tokenizers import Encoding, Tokenizer
+from tokenizers.models import BPE
 import torch
 from torch import autocast
 torch.set_num_threads(4)
@@ -82,6 +85,7 @@ USE_PHONEMES = False
 MIN_DUR = 0 # Minimale Segmentdauer in Sekunden 
 MAX_DUR = 10 # Maximale Segmentdauer in Sekunden
 MAX_GAP = 5 # Maximaler akzeptierter Zeitabstand zwischen Segmenten
+MAX_CHARS = 200 # Maximale Anzahl an Zeichen pro Segment
 
 # Geschwindigkeitseinstellungen
 SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
@@ -107,11 +111,22 @@ _TTS_MODEL = None
 # Hilfsfunktionen
 # ==============================
 
+def setup_gpu_optimization():
+    """Konfiguriert GPU-Optimierungen für maximale Leistung."""
+    # 16-bit Precision für schnellere Berechnungen aktivieren
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # Speicherzuweisung optimieren
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+    # CUDA-Streams für parallele Ausführung vorbereiten
+    return torch.cuda.Stream()
+
 start_time = time.time()
 step_times = {}
 device = "cuda" if torch.cuda.is_available() else "cpu"
 if device == "cuda":
-    torch.backends.cudnn.benchmark = True  # Beschleunigt wiederkehrende Netzwerkstrukturen
+    # cuDNN-Benchmark aktivieren (für wiederkehrende Netzwerkstrukturen)
+    torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False  # Für bessere Performance
 source_lang="en"
 target_lang="de"
@@ -576,15 +591,15 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             segments, info = _BATCHED_MODEL.transcribe(
                 audio_file,                         # Audio-Datei
-                batch_size=4,
+                batch_size=2,
                 beam_size=10,
                 patience=1.0,
                 vad_filter=True,
-                chunk_length=10,
+    #            chunk_length=8,
     #            compression_ratio_threshold=2.8,    # Schwellenwert für Kompressionsrate
     #            log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
     #            no_speech_threshold=1.0,            # Schwellenwert für Stille
-                temperature=(0.05, 0.1, 0.15, 0.2),      # Temperatur für Sampling
+                temperature=(0.05, 0.1, 0.15, 0.2, 0.25, 0.5),      # Temperatur für Sampling
                 word_timestamps=True,               # Zeitstempel für Wörter
                 hallucination_silence_threshold=0.35,  # Schwellenwert für Halluzinationen
                 condition_on_previous_text=True,    # Bedingung an vorherigen Text
@@ -654,7 +669,7 @@ def format_time(seconds):
     """
     return str(timedelta(seconds=int(seconds)))
 
-def merge_transcript_chunks(input_file, output_file, min_dur=MIN_DUR, max_dur=MAX_DUR, max_gap=MAX_GAP):
+def merge_transcript_chunks(input_file, output_file, min_dur=MIN_DUR, max_dur=MAX_DUR, max_gap=MAX_GAP, max_chars=MAX_CHARS):
     """
     Führt Transkript-Segmente unter Berücksichtigung der spezifizierten Regeln zusammen
     
@@ -664,6 +679,7 @@ def merge_transcript_chunks(input_file, output_file, min_dur=MIN_DUR, max_dur=MA
         min_dur (int): Minimale Segmentdauer in Sekunden
         max_dur (int): Maximale Segmentdauer in Sekunden
         max_gap (int): Maximaler akzeptierter Zeitabstand zwischen Segmenten
+        max_chars (int): Maximale Anzahl von Zeichen pro Segment
     """
     if os.path.exists(output_file):
         if not ask_overwrite(output_file):
@@ -756,23 +772,133 @@ def merge_transcript_chunks(input_file, output_file, min_dur=MIN_DUR, max_dur=MA
                 'text': ' '.join(current_chunk['text'])
             })
 
-        # Nachbearbeitung: Segmente unter Mindestdauer
+        # Nachbearbeitung: Segmente unter Mindestdauer filtern und zu lange Segmente aufteilen
         final_data = []
+        
         for item in merged_data:
-            duration = parse_time(item['endzeit']) - parse_time(item['startzeit'])
-            if duration >= min_dur:
+            start_time = parse_time(item['startzeit'])
+            end_time = parse_time(item['endzeit'])
+            duration = end_time - start_time
+            
+            # Segmente unter Mindestdauer überspringen
+            if duration < min_dur:
+                print(f"Segment {item['startzeit']}-{item['endzeit']} ({duration}s) unter Mindestdauer")
+                continue
+            
+            # Text auf max_chars Zeichen begrenzen ohne Sätze zu unterbrechen
+            text = item['text']
+            
+            if len(text) <= max_chars:
+                # Text ist kurz genug, direkt übernehmen
                 final_data.append(item)
             else:
-                print(f"Segment {item['startzeit']}-{item['endzeit']} ({duration}s) unter Mindestdauer")
+                # Text in Sätze aufteilen
+                sentences = split_into_sentences(text)
+                
+                # Sätze auf neue Segmente aufteilen (max. max_chars Zeichen pro Segment)
+                segment_texts = []
+                current_segment = ""
+                
+                for sentence in sentences:
+                    # Sonderfall: Einzelner Satz überschreitet bereits das Limit
+                    if len(sentence) > max_chars:
+                        # Aktuelles Segment abschließen, falls vorhanden
+                        if current_segment:
+                            segment_texts.append(current_segment)
+                            current_segment = ""
+                        
+                        # Langen Satz an Wortgrenzen aufteilen
+                        words = sentence.split()
+                        temp_segment = ""
+                        
+                        for word in words:
+                            # Prüfen, ob das Wort ins aktuelle Teilsegment passt
+                            if len(temp_segment) + len(word) + (1 if temp_segment else 0) <= max_chars:
+                                # Wort passt ins aktuelle Teilsegment
+                                if temp_segment:
+                                    temp_segment += " " + word
+                                else:
+                                    temp_segment = word
+                            else:
+                                # Teilsegment abschließen und neues beginnen
+                                segment_texts.append(temp_segment)
+                                temp_segment = word
+                        
+                        # Letztes Teilsegment hinzufügen
+                        if temp_segment:
+                            segment_texts.append(temp_segment)
+                    else:
+                        # Normaler Fall: Prüfen, ob der Satz ins aktuelle Segment passt
+                        if len(current_segment) + len(sentence) + (1 if current_segment else 0) <= max_chars:
+                            # Satz passt ins aktuelle Segment
+                            if current_segment:
+                                current_segment += " " + sentence
+                            else:
+                                current_segment = sentence
+                        else:
+                            # Satz passt nicht, aktuelles Segment abschließen und neues beginnen
+                            segment_texts.append(current_segment)
+                            current_segment = sentence
+                
+                # Letztes Segment hinzufügen, falls vorhanden
+                if current_segment:
+                    segment_texts.append(current_segment)
+                
+                # Zeitverteilung für jedes Segment berechnen
+                total_chars = sum(len(segment) for segment in segment_texts)
+                
+                for i, segment_text in enumerate(segment_texts):
+                    # Zeitproportionale Verteilung basierend auf Textlänge
+                    segment_proportion = len(segment_text) / total_chars
+                    segment_duration = duration * segment_proportion
+                    
+                    # Startzeit basierend auf vorherigen Segmenten
+                    previous_proportion = sum(len(segment_texts[j]) / total_chars for j in range(i))
+                    segment_start = start_time + (duration * previous_proportion)
+                    segment_end = segment_start + segment_duration
+                    
+                    final_data.append({
+                        'startzeit': format_time(segment_start),
+                        'endzeit': format_time(segment_end),
+                        'text': segment_text
+                    })
 
         # Ergebnis speichern
         result_df = pd.DataFrame(final_data)
         result_df.to_csv(output_file, sep='|', index=False)
         print(f"Ergebnis mit {len(result_df)} Segmenten in {output_file} gespeichert")
         
+        return result_df
+        
     except Exception as e:
         print(f"Kritischer Fehler: {str(e)}")
         raise
+
+def split_into_sentences(text):
+    """
+    Teilt einen Text in Sätze auf
+    
+    Args:
+        text (str): Zu teilender Text
+        
+    Returns:
+        list: Liste der einzelnen Sätze
+    """
+    import re
+    
+    # Erweiterte Regex für bessere Satzerkennung
+    # Berücksichtigt gängige Satzenden (., !, ?)
+    # Vermeidet Trennung bei Abkürzungen (z.B., d.h., Dr., etc.)
+    pattern = r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!)\s+'
+    
+    sentences = re.split(pattern, text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    
+    # Wenn keine Sätze gefunden wurden, geben wir den gesamten Text zurück
+    if not sentences:
+        return [text]
+    
+    return sentences
 
 def restore_punctuation(input_file, output_file):
     if os.path.exists(output_file):
@@ -1019,8 +1145,27 @@ def phonemize_with_espeak(text, lang="de"):
         logger.warning(f"Phonemisierungsfehler mit eSpeak: {e}")
         return ""  # Leere Zeichenkette zurückgeben, damit das Programm weiterläuft.
 
-def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_path_2, sample_path_3, output_path):
-    """Führt die Umwandlung von Text zu Sprache durch (TTS), inklusive Stimmenklonung basierend auf sample.wav."""
+def text_to_speech_with_voice_cloning(translation_file,
+                                    sample_path_1,
+                                    sample_path_2,
+                                    sample_path_3,
+                                    output_path,
+                                    batch_size=8):
+    """
+    Optimierte Text-to-Speech-Funktion mit Voice Cloning und verschiedenen Beschleunigung
+    Args:
+    translation_file: Pfad zur CSV-Datei mit übersetzten Texten
+    sample_paths: Liste mit Pfaden zu Sprachbeispielen für die Stimmenklonung
+    output_path: Ausgabepfad für die generierte Audiodatei
+    use_onnx: ONNX-Beschleunigung aktivieren (falls verfügbar)
+    batch_size: Größe des Batches für parallele Verarbeitung
+    """
+    # Speicher-Cache für effizientere Allokation
+    torch.cuda.empty_cache()
+
+    # CUDA-Kernels für wiederkehrende Operationen cachen
+    torch.backends.cudnn.enabled = True
+    
     if os.path.exists(output_path):
         if not ask_overwrite(output_path):
             logger.info(f"TTS-Audio bereits vorhanden: {output_path}", exc_info=True)
@@ -1031,12 +1176,13 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
         print(f"------------------")
         logger.info(f"Lade TTS-Modell ...", exc_info=True)
         
-        final_audio = np.array([], dtype=np.float32)                # Array für die kombinierten Audio-Segmente
-        sampling_rate = 24000
+        # 1. GPU-Optimierungen aktivieren
+        cuda_stream = setup_gpu_optimization()
         
+        # 2. Modell laden und auf GPU verschieben
         config = XttsConfig(model_param_stats=True)
         config.load_json(r"D:\alltalk_tts\models\xtts\v203_10_04_63\config.json")
-                
+
         model = Xtts.init_from_config(config)
         model.load_checkpoint(
             config,
@@ -1047,68 +1193,94 @@ def text_to_speech_with_voice_cloning(translation_file, sample_path_1, sample_pa
             )
         model.to(torch.device("cuda"))
         
-        gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(
-            sound_norm_refs=True,
-            audio_path=[sample_path_1, sample_path_2]
-        )
-        # Lese die CSV-Datei mit den Zeitstempeln und Texten
+        with torch.cuda.stream(cuda_stream), torch.inference_mode():
+            gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(
+                sound_norm_refs=True,
+                audio_path=[
+                    sample_path_1,
+                    sample_path_2,
+                    sample_path_3
+                ]
+            )
+        # 5. Einlesen der Texte aus der CSV
+        all_texts = []
+        timestamps = []
         with open(translation_file, mode="r", encoding="utf-8", errors="replace") as f:
             reader = csv.reader(f, delimiter="|")
             next(reader)  # Header überspringen
             for row in reader:
                 if len(row) < 3:
                     continue
+                
                 # Extrahiere Startzeit, Endzeit und Text
                 start = convert_time_to_seconds(row[0])
                 end = convert_time_to_seconds(row[1])
-                text = row[2].strip("-:")
                 text = row[2].strip()
 
-                print(f"🔍 Bearbeite Segment mit: {start}-{end}s mit Text:\n{text}\n")
-
-                try:
-                    with torch.no_grad():
-                        with autocast("cuda"):
-                            phonemes = phonemize_with_espeak(text)
-                            text_for_tts = phonemes if USE_PHONEMES else text
-                            logger.debug(f"📖 Original: {text} → 🎙 Phoneme: {phonemes}")
-
-                            result = model.inference(
-                                gpt_cond_latent=gpt_cond_latent,
-                                speaker_embedding=speaker_embedding,
-                                text=text_for_tts,                          # Übersetzter Text
-                                language="de",
-                                num_beams = 1,
-                                speed = 1.0,                          # Sprechgeschwindigkeit
-                                temperature = 0.25,
-                                length_penalty = 1.0,
-                                repetition_penalty = 10.0,
-        #                        do_sample=True,
-                                enable_text_splitting=False,
-                                top_k=55,
-                                top_p=0.8,
-                            )
-
-                            audio_clip = result.get("wav", np.zeros(1000, dtype=np.float32)) if isinstance(result, dict) else np.zeros(1000, dtype=np.float32)
-                            audio_clip = np.array(audio_clip, dtype=np.float32).squeeze()
-
-                        if not audio_clip.size:
-                            logger.warning("⚠️ Leeres Audio - Ersetze mit Stille.")
-                            audio_clip = np.zeros(1000, dtype=np.float32)
-                    
-                    current_length = len(final_audio) / sampling_rate                           # Aktuelle Länge des Audios
-                    silence_duration = max(0.0, start - current_length)                         # Stille vor dem Segment   
-                    silence_samples = int(silence_duration * sampling_rate)                    # Stille in Samples
-                    silence_segment = np.zeros(silence_samples, dtype=np.float32)
-                    final_audio = np.concatenate([final_audio, silence_segment, audio_clip])                # Alle Segmente zusammenfügen
-                except Exception as segment_error:
-                    logger.error(f"Fehler in Segment {start}-{end}s: {segment_error}", exc_info=True)
-                    continue
+                all_texts.append(text)
+                timestamps.append((start, end))
                 
+        # 6. Batches erstellen für parallele Verarbeitung
+        batches = [all_texts[i:i+batch_size] for i in range(0, len(all_texts), batch_size)]
+        timestamp_batches = [timestamps[i:i+batch_size] for i in range(0, len(timestamps), batch_size)]
+        
+        final_audio = np.array([], dtype=np.float32)                # Array für die kombinierten Audio-Segmente
+        sampling_rate = 24000
+                
+        # 8. Batch-weise TTS durchführen
+        for batch_idx, (text_batch, time_batch) in enumerate(zip(batches, timestamp_batches)):
+            print(f"Verarbeite Batch {batch_idx+1}/{len(batches)}")
+            
+            # Text für jedes Segment vorbereiten (inkl. optionaler Phonemisierung)
+            prepared_texts = []
+            for text in text_batch:
+                prepared_texts.append(text)
+            
+            phonemes = phonemize_with_espeak(text)
+            text_for_tts = phonemes if USE_PHONEMES else text
+            logger.debug(f"📖 Original: {text} → 🎙 Phoneme: {phonemes}")
+
+        # PyTorch Modell
+            with torch.cuda.stream(cuda_stream), torch.inference_mode(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                batch_results = []
+                for text in prepared_texts:
+                    result = model.inference(
+                        gpt_cond_latent=gpt_cond_latent,
+                        speaker_embedding=speaker_embedding,
+                        text=text,
+                        language="de",
+                        # Optimierte Inferenz-Parameter:
+                        num_beams=1,  # Weniger Beams für schnellere Inferenz
+                        speed=1.0,
+                        temperature=0.65,
+                        length_penalty=1.0,
+                        repetition_penalty=10.0,
+                        enable_text_splitting=False,
+                        top_k=55,
+                        top_p=0.8,
+                    )
+                    batch_results.append(result)
+
+            # 9. Audio-Segmente zum finalen Audio hinzufügen
+            for i, (result, (start, end)) in enumerate(zip(batch_results, time_batch)):
+                # Audio-Clip extrahieren
+                audio_clip = result.get("wav", np.zeros(1000, dtype=np.float32)) if isinstance(result, dict) else np.zeros(1000, dtype=np.float32)
+                audio_clip = np.array(audio_clip, dtype=np.float32).squeeze()
+
+                # Stille vor dem Segment einfügen (basierend auf Zeitstempeln)
+                current_length = len(final_audio) / sampling_rate
+                silence_duration = max(0.0, start - current_length)
+                silence_samples = int(silence_duration * sampling_rate)
+                silence_segment = np.zeros(silence_samples, dtype=np.float32)
+
+                # Audio zusammenfügen
+                final_audio = np.concatenate([final_audio, silence_segment, audio_clip])
+        
+        # 10. Audio-Nachbearbeitung
         if len(final_audio) == 0:
             print("Kein Audio - Datei leer!")
             final_audio = np.zeros((1, 1000), dtype=np.float32)
-
+                
         # 🔽 GLOBALE NORMALISIERUNG DES GESAMTEN AUDIOS
         final_audio /= np.max(np.abs(final_audio)) + 1e-8  # Einheitliche Lautstärke
         final_audio = final_audio.astype(np.float32)                                    # In float32 konvertieren
@@ -1259,6 +1431,9 @@ def adjust_playback_speed(video_path, adjusted_video_path, speed_factor):
         .output(temp_output, vcodec="h264_nvenc", acodec="copy")
         .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
         )
+        print("-----------------------------")
+        print("|<< Teil 1 von 2 erledigt >>|")
+        print("-----------------------------")
         (
         ffmpeg
         .input(temp_output)
@@ -1393,14 +1568,15 @@ def main():
         output_file=MERGED_TRANSCRIPTION_FILE,
         min_dur=MIN_DUR,
         max_dur=MAX_DUR,
-        max_gap=MAX_GAP
+        max_gap=MAX_GAP,
+        max_chars=MAX_CHARS
     )
     
     # 6.2) Wiederherstellung der Interpunktion
-    restore_punctuation(MERGED_TRANSCRIPTION_FILE, PUNCTED_TRANSCRIPTION_FILE)
+#    restore_punctuation(MERGED_TRANSCRIPTION_FILE, PUNCTED_TRANSCRIPTION_FILE)
 
     # 7) Übersetzung der Segmente mithilfe von MarianMT
-    translated = translate_segments(PUNCTED_TRANSCRIPTION_FILE, TRANSLATION_FILE)
+    translated = translate_segments(MERGED_TRANSCRIPTION_FILE, TRANSLATION_FILE)
     if not translated:
         logger.error("Übersetzung fehlgeschlagen oder keine Segmente vorhanden.")
         return
@@ -1410,7 +1586,11 @@ def main():
 #    restore_punctuation_de(TRANSLATION_FILE, PUNCTED_TRANSLATION_FILE)
     
     # 8) Text-to-Speech (TTS) mit Stimmenklonung
-    text_to_speech_with_voice_cloning(TRANSLATION_FILE, SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3, TRANSLATED_AUDIO_WITH_PAUSES)
+    text_to_speech_with_voice_cloning(TRANSLATION_FILE,
+                                    SAMPLE_PATH_1,
+                                    SAMPLE_PATH_2,
+                                    SAMPLE_PATH_3,
+                                    TRANSLATED_AUDIO_WITH_PAUSES)
 
     # 9) Audio resamplen auf 44.1 kHz, Stereo (für Mixdown), inkl. separatem Lautstärke- und Geschwindigkeitsfaktor
     resample_to_44100_stereo(TRANSLATED_AUDIO_WITH_PAUSES, RESAMPLED_AUDIO_FOR_MIXDOWN, SPEED_FACTOR_RESAMPLE_44100)
