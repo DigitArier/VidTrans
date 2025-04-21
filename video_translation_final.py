@@ -48,7 +48,6 @@ from transformers import (
     MarianConfig,
     MarianPreTrainedModel,
     MarianMTModel,
-    TFMarianMTModel,
     MarianTokenizer,
     PreTrainedTokenizerFast,
     PreTrainedModel,
@@ -157,7 +156,7 @@ def get_whisper_model():
     global _WHISPER_MODEL, _BATCHED_MODEL
     if not _WHISPER_MODEL:
 #        _WHISPER_MODEL = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3").to(device)
-        _WHISPER_MODEL = WhisperModel("large-v3", device="cuda", compute_type="int8_float16")
+        _WHISPER_MODEL = WhisperModel("large-v3", device="cuda", compute_type="bfloat16")
         _BATCHED_MODEL = BatchedInferencePipeline(model=_WHISPER_MODEL)
 #        _WHISPER_MODEL.to(torch.device("cuda"))
         torch.cuda.empty_cache()
@@ -166,33 +165,27 @@ def get_whisper_model():
 def get_translate_model():
         global _TRANSLATE_MODEL, _TOKENIZER    
         if _TRANSLATE_MODEL is None:
-            model_name = "facebook/nllb-200-3.3B"
+            model_name = "jbochi/madlad400-7b-mt"
             logger.info(f"Lade Übersetzungsmodell: {model_name}")
-#            quantization_config = BitsAndBytesConfig(
-#                load_in_8bit=True,
-#                bnb_4bit_compute_dtype= torch.bfloat16,
-#                bnb_4bit_quant_storage= torch.uint8,
-#                bnb_4bit_quant_type= "nf4"
-#                )
-#           MADLAD400:
-#            _TOKENIZER = T5TokenizerFast.from_pretrained(model_name, verbose=True)
-#            _TRANSLATE_MODEL = T5ForConditionalGeneration.from_pretrained(
-#                model_name,
-#                low_cpu_mem_usage=True,
-#                quantization_config=quantization_config,
-#                torch_dtype=torch.bfloat16
-#                )
-            _TOKENIZER = AutoTokenizer.from_pretrained(model_name, token=True, source_lang="eng_Latn")
-            _TRANSLATE_MODEL = AutoModelForSeq2SeqLM.from_pretrained(
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+#                llm_int8_enable_fp32_cpu_offload=True
+                )
+            _TOKENIZER = T5TokenizerFast.from_pretrained(model_name, verbose=True)
+#            max_memory = {
+#                0:"5.8GiB",
+#                "cpu": "35.0GiB"
+#            }
+            _TRANSLATE_MODEL = T5ForConditionalGeneration.from_pretrained(
                 model_name,
 #                device_map="auto",
-#                quantization_config=quantization_config,
-                low_cpu_mem_usage=True
+#                max_memory=max_memory,
+                low_cpu_mem_usage=True,
+                quantization_config=quantization_config,
                 )
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            _TRANSLATE_MODEL.to(device)
             _TRANSLATE_MODEL.eval()
-            _TRANSLATE_MODEL = torch.compile(_TRANSLATE_MODEL, mode="reduce-overhead")
+#            _TRANSLATE_MODEL = torch.compile(_TRANSLATE_MODEL, mode="reduce-overhead")
 #            _TRANSLATE_MODEL = _TRANSLATE_MODEL.half()
             torch.cuda.empty_cache()
         return _TRANSLATE_MODEL, _TOKENIZER
@@ -603,8 +596,8 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
                 no_repeat_ngram_size=2,
     #            repetition_penalty=1.5,
     #            verbose=True,                       # Ausführliche Ausgabe
-                language="en",                       # Englische Sprache
-    #            task="translate",                    # Übersetzung aktivieren
+                language="pl",                       # Englische Sprache
+                task="translate",                    # Übersetzung aktivieren
             )
             #segments = result["segments"]
             segments_list = []
@@ -1277,8 +1270,8 @@ def batch_translate(segments, target_lang="de"):
         
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 #    MADLAD400:
-#    texts = [f"<2{target_lang}> {seg['text']}" for seg in segments]  # Alle Texte sammeln
-    texts = [seg['text'] for seg in segments]
+    texts = [f"<2{target_lang}> {seg['text']}" for seg in segments]  # Alle Texte sammeln
+#    texts = [seg['text'] for seg in segments]
     
     # ✅ Batch-Tokenization (viel schneller!)
     inputs = _TOKENIZER(
@@ -1292,9 +1285,8 @@ def batch_translate(segments, target_lang="de"):
     with torch.no_grad():
         with autocast(device_type='cuda', dtype=torch.bfloat16):  # Kein Gradienten-Tracking & Mixed Precision für Speed
             outputs = _TRANSLATE_MODEL.generate(
-                **inputs,
-                forced_bos_token_id=_TOKENIZER.convert_tokens_to_ids("deu_Latn"),
-#                attention_mask=inputs["attention_mask"],
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
                 pad_token_id=_TOKENIZER.eos_token_id,
                 num_beams=8,  
 #                repetition_penalty=1.0,
@@ -1361,7 +1353,9 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
         print(f"--------------------------")
         print(f"|<< Starte Übersetzung >>|")
         print(f"--------------------------")
-        print(f">>> nllb-200-3.3B wird initialisiert... <<<")
+        
+        print(f">>> MADLAD400-Modell wird initialisiert... <<<")
+        
         # ✅ **Batch-Verarbeitung**
         
         # Dataset aus den Segmenten erstellen
