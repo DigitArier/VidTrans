@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 import subprocess
 from tabnanny import verbose
+import token
 import ffmpeg
 import logging
 from langcodes import Language
@@ -91,8 +92,9 @@ USE_PHONEMES = False
 MIN_DUR = 0 # Minimale Segmentdauer in Sekunden 
 MAX_DUR = 10 # Maximale Segmentdauer in Sekunden
 MAX_GAP = 5 # Maximaler akzeptierter Zeitabstand zwischen Segmenten
-MAX_CHARS = 125 # Maximale Anzahl an Zeichen pro Segment
-ITERATIONS = 10 # Durchläufe
+MAX_CHARS = 100 # Maximale Anzahl an Zeichen pro Segment
+MIN_WORDS = 7 # Minimale Anzahl an Wörtern pro Segment
+ITERATIONS = 2 # Durchläufe
 
 # Geschwindigkeitseinstellungen
 SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
@@ -164,14 +166,33 @@ def get_whisper_model():
 def get_translate_model():
         global _TRANSLATE_MODEL, _TOKENIZER    
         if _TRANSLATE_MODEL is None:
-            model_name = "jbochi/madlad400-7b-mt"
+            model_name = "facebook/nllb-200-3.3B"
             logger.info(f"Lade Übersetzungsmodell: {model_name}")
-            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-            _TOKENIZER = T5TokenizerFast.from_pretrained(model_name, verbose=True)
-            _TRANSLATE_MODEL = T5ForConditionalGeneration.from_pretrained(model_name, low_cpu_mem_usage=True, quantization_config=quantization_config)
+#            quantization_config = BitsAndBytesConfig(
+#                load_in_8bit=True,
+#                bnb_4bit_compute_dtype= torch.bfloat16,
+#                bnb_4bit_quant_storage= torch.uint8,
+#                bnb_4bit_quant_type= "nf4"
+#                )
+#           MADLAD400:
+#            _TOKENIZER = T5TokenizerFast.from_pretrained(model_name, verbose=True)
+#            _TRANSLATE_MODEL = T5ForConditionalGeneration.from_pretrained(
+#                model_name,
+#                low_cpu_mem_usage=True,
+#                quantization_config=quantization_config,
+#                torch_dtype=torch.bfloat16
+#                )
+            _TOKENIZER = AutoTokenizer.from_pretrained(model_name, token=True, source_lang="eng_Latn")
+            _TRANSLATE_MODEL = AutoModelForSeq2SeqLM.from_pretrained(
+                model_name,
+#                device_map="auto",
+#                quantization_config=quantization_config,
+                low_cpu_mem_usage=True
+                )
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#            _TRANSLATE_MODEL.to(device)
+            _TRANSLATE_MODEL.to(device)
             _TRANSLATE_MODEL.eval()
+            _TRANSLATE_MODEL = torch.compile(_TRANSLATE_MODEL, mode="reduce-overhead")
 #            _TRANSLATE_MODEL = _TRANSLATE_MODEL.half()
             torch.cuda.empty_cache()
         return _TRANSLATE_MODEL, _TOKENIZER
@@ -630,36 +651,41 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
         return []
 
 def parse_time(time_str):
-    """
-    Konvertiert Zeitangaben robust in Sekunden
-    Unterstützt H:MM:SS, HH:MM:SS und MM:SS
-    """
-    parts = time_str.strip().replace(',', '.').split(':')
-    
-    # Millisekunden extrahieren
-    if '.' in parts[-1]:
-        seconds_part, ms_part = parts[-1].split('.')
-        seconds = float(seconds_part) + float(f"0.{ms_part}")
-    else:
-        seconds = float(parts[-1])
-    
-    # Zeitkomponenten berechnen
-    if len(parts) == 3:  # HH:MM:SS oder H:MM:SS
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + seconds
-    elif len(parts) == 2:  # MM:SS
-        return int(parts[0]) * 60 + seconds
-    else:
-        raise ValueError(f"Ungültiges Zeitformat: {time_str}")
+    """Konvertiert Zeitstempel (HH:MM:SS,ms oder HH:MM:SS.ms oder SS.ms) in Sekunden."""
+    if pd.isna(time_str): return None
+    time_str = str(time_str).replace(',', '.')
+    parts = time_str.split(':')
+    try:
+        if len(parts) == 3:
+            h, m, s_ms = parts
+            s, ms = (s_ms.split('.') + ['0'])[:2]
+            total_seconds = int(h) * 3600 + int(m) * 60 + int(s) + int(ms.ljust(3, '0')) / 1000.0
+        elif len(parts) == 2:
+            m, s_ms = parts
+            s, ms = (s_ms.split('.') + ['0'])[:2]
+            total_seconds = int(m) * 60 + int(s) + int(ms.ljust(3, '0')) / 1000.0
+        elif len(parts) == 1:
+            s_ms = parts[0]
+            s, ms = (s_ms.split('.') + ['0'])[:2]
+            total_seconds = float(s) + int(ms.ljust(3, '0')) / 1000.0 # float(s) erlaubt mehr Flexibilität
+        else:
+            logger.warning(f"Ungültiges Zeitformat: {time_str}")
+            return None
+        # Runde auf Millisekunden, um Gleitkomma-Ungenauigkeiten zu minimieren
+        return round(total_seconds, 3)
+    except ValueError:
+        logger.warning(f"Fehler beim Parsen der Zeit: {time_str}")
+        return None
 
 def format_time(seconds):
-    """
-    Erzeugt immer HH:MM:SS mit führenden Nullen
-    """
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    seconds = int(round(seconds % 60))  # Sekunden runden
-    
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    """Konvertiert Sekunden in HH:MM:SS Format."""
+    if seconds is None or seconds < 0: seconds = 0
+    seconds = round(seconds, 3)
+    int_seconds = int(seconds)
+    hours = int_seconds // 3600
+    minutes = (int_seconds % 3600) // 60
+    secs = int_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02}"
 
 def split_into_sentences(text):
     """
@@ -712,277 +738,451 @@ def read_translated_csv(file_path):
     """
     return pd.read_csv(file_path, sep='|', dtype=str)
 
-def merge_transcript_chunks(input_file, output_file, min_dur, max_dur, max_gap, max_chars, iterations):
+def merge_transcript_chunks(input_file, output_file, min_dur, max_dur, max_gap, max_chars, min_words, iterations):
     """
-    Führt Transkript-Segmente unter Berücksichtigung der spezifizierten Regeln zusammen
-    
+    Führt Transkript-Segmente zusammen, ohne Text zu verwerfen.
+
     Args:
-        input_file (str): Eingabedatei mit | als Trennzeichen
-        output_file (str): Zieldatei für Ergebnisse
-        min_dur (int): Minimale Segmentdauer in Sekunden
-        max_dur (int): Maximale Segmentdauer in Sekunden
-        max_gap (int): Maximaler akzeptierter Zeitabstand zwischen Segmenten
-        max_chars (int): Maximale Anzahl von Zeichen pro Segment
-        iterations (int): Anzahl der Durchläufe für die Optimierung
+        input_file (str): Eingabedatei mit | als Trennzeichen.
+        output_file (str): Zieldatei für Ergebnisse.
+        min_dur (float): Ziel-Mindestdauer. Segmente darunter werden nach Möglichkeit zusammengeführt.
+        max_dur (float): Maximale Segmentdauer in Sekunden (wird beim initialen Mergen beachtet).
+        max_gap (float): Maximaler akzeptierter Zeitabstand für initiales Mergen.
+        max_chars (int): Maximale Anzahl von Zeichen (wird beim initialen Mergen und Splitten beachtet).
+        min_words (int): Ziel-Mindestwortzahl. Segmente darunter werden nach Möglichkeit zusammengeführt.
+        iterations (int): Anzahl der Optimierungsdurchläufe (hauptsächlich für Gap/Dauer/Char-Optimierung).
     """
-    # Prüfung, ob die Ausgabedatei bereits existiert
     if os.path.exists(output_file):
         if not ask_overwrite(output_file):
             logger.info(f"Verwende vorhandene Übersetzungen: {output_file}")
             return read_translated_csv(output_file)
-        
+
+    def force_merge_short_segments(data_list, min_dur, min_words):
+        """
+        Führt Segmente, die min_dur oder min_words nicht erfüllen, mit Nachbarn zusammen.
+        Priorität: Kein Textverlust. Modifiziert die Liste direkt.
+        Gibt True zurück, wenn Änderungen vorgenommen wurden, sonst False.
+        """
+        if not data_list: return False # Nichts zu tun bei leerer Liste
+
+        merged_something = False
+        i = 0
+        while i < len(data_list):
+            item = data_list[i]
+            start_sec = parse_time(item['startzeit'])
+            end_sec = parse_time(item['endzeit'])
+
+            # Wenn Zeiten ungültig sind, kann nicht geprüft werden -> überspringen
+            if start_sec is None or end_sec is None or start_sec > end_sec:
+                logger.warning(f"Segment {i} hat ungültige Zeiten ({item['startzeit']} / {item['endzeit']}) - wird in force_merge übersprungen.")
+                i += 1
+                continue
+
+            duration = round(end_sec - start_sec, 3)
+            word_count = len(item['text'].split()) if item.get('text') else 0
+
+            needs_merge = (duration < min_dur or word_count < min_words) and len(data_list) > 1 # Nur wenn es >1 Segment gibt
+
+            if needs_merge:
+                merged_this_iteration = False
+                # Option 1: Mit Vorgänger zusammenführen (bevorzugt)
+                if i > 0:
+                    prev_item = data_list[i-1]
+                    # Kombiniere Text (füge Leerzeichen hinzu, wenn beide Texte nicht leer sind)
+                    separator = " " if prev_item.get('text', '').strip() and item.get('text', '').strip() else ""
+                    merged_text = (prev_item.get('text', '') + separator + item.get('text', '')).strip()
+
+                    # Aktualisiere Vorgänger: Startzeit bleibt, Endzeit wird vom aktuellen genommen
+                    prev_item['endzeit'] = item['endzeit']
+                    prev_item['text'] = merged_text
+                    # Entferne aktuelles Element
+                    del data_list[i]
+                    # Index NICHT erhöhen, da das nächste Element jetzt an Position 'i' ist
+                    merged_something = True
+                    merged_this_iteration = True
+                    logger.debug(f"Segment {i+1} (war {item['startzeit']}) mit Vorgänger {i} zusammengeführt.")
+
+                # Option 2: Mit Nachfolger zusammenführen (wenn kein Vorgänger vorhanden)
+                elif i < len(data_list) - 1:
+                    next_item = data_list[i+1]
+                    # Kombiniere Text
+                    separator = " " if item.get('text', '').strip() and next_item.get('text', '').strip() else ""
+                    merged_text = (item.get('text', '') + separator + next_item.get('text', '')).strip()
+
+                    # Aktualisiere aktuelles Element: Startzeit bleibt, Endzeit wird vom Nachfolger genommen
+                    item['endzeit'] = next_item['endzeit']
+                    item['text'] = merged_text
+                    # Entferne Nachfolger
+                    del data_list[i+1]
+                    # Index NICHT erhöhen, da das aktuelle Element (jetzt vergrößert) erneut geprüft werden soll
+                    merged_something = True
+                    merged_this_iteration = True
+                    logger.debug(f"Segment {i} ({item['startzeit']}) mit Nachfolger {i+1} zusammengeführt.")
+
+                # Wenn keine Zusammenführung möglich war (z.B. einziges Segment, das Regeln verletzt)
+                if not merged_this_iteration:
+                    # Dieses Segment kann nicht zusammengeführt werden, gehe zum nächsten
+                    i += 1
+            else:
+                # Segment ist OK oder das einzige, gehe zum nächsten
+                i += 1
+
+        return merged_something # Gibt an, ob in diesem Durchlauf etwas zusammengeführt wurde
+
     try:
         print(f"Starte Verarbeitung von: {input_file}")
-        print(f"Parameter: min_dur={min_dur}s, max_dur={max_dur}s, max_gap={max_gap}s, max_chars={max_chars}, iterations={iterations}")
-        
-        # CSV mit | als Trennzeichen einlesen
-        df = pd.read_csv(
-            input_file,
-            sep='|',
-            dtype=str
-        )
-        
+        print(f"Parameter: min_dur={min_dur}s (Ziel), max_dur={max_dur}s, max_gap={max_gap}s, max_chars={max_chars}, min_words={min_words} (Ziel), iterations={iterations}")
+
+        df = pd.read_csv(input_file, sep='|', dtype=str)
         original_segment_count = len(df)
         print(f"Eingelesen: {original_segment_count} Segmente aus {input_file}")
 
-        # Spaltennamen normalisieren
         df.columns = df.columns.str.strip().str.lower().str.replace(' ', '')
-        print("Erkannte Spalten:", df.columns.tolist())
-
-        # Erforderliche Spalten validieren
         required_columns = {'startzeit', 'endzeit', 'text'}
         if not required_columns.issubset(df.columns):
             missing = required_columns - set(df.columns)
             raise ValueError(f"Fehlende Spalten: {', '.join(missing)}")
 
-        # Zeitkonvertierung mit Fehlerprotokollierung
-        def safe_parse(time_str):
-            """Wrapper für parse_time mit Fehlerprotokollierung"""
-            result = parse_time(time_str)
-            if result is None:
-                print(f"Warnung: Ungültige Zeitangabe: {time_str}")
-            return result
+        df['start_sec'] = df['startzeit'].apply(parse_time)
+        df['end_sec'] = df['endzeit'].apply(parse_time)
+        df['text'] = df['text'].astype(str).fillna('')
 
-        # Zeitkonvertierung
-        df['start_sec'] = df['startzeit'].apply(safe_parse)
-        df['end_sec'] = df['endzeit'].apply(safe_parse)
-        
-        # Ungültige Zeilen filtern, aber mit Warnung
-        invalid_mask = df['start_sec'].isna() | df['end_sec'].isna()
+        invalid_mask = df['start_sec'].isna() | df['end_sec'].isna() | (df['start_sec'] > df['end_sec'])
         if invalid_mask.any():
-            print(f"Warnung: {invalid_mask.sum()} Zeilen mit ungültigen Zeitangaben gefunden")
-            invalid_indices = df[invalid_mask].index.tolist()
-            print(f"Betroffene Zeilen: {invalid_indices}")
+            invalid_count = invalid_mask.sum()
+            print(f"Warnung: {invalid_count} Zeilen mit ungültigen/inkonsistenten Zeitangaben werden übersprungen.")
             df = df[~invalid_mask].copy()
-        
-        # Dauer berechnen
-        df['duration'] = df['end_sec'] - df['start_sec']
-        
-        # Sortierung nach Startzeit
-        df = df.sort_values('start_sec').reset_index(drop=True)
-        print(f"Nach Zeitvalidierung und Sortierung: {len(df)} Segmente")
 
-        # Mehrere Durchläufe für die Optimierung
+        if df.empty:
+            print("Keine gültigen Segmente nach initialer Zeitprüfung.")
+            # Schreibe leere Datei
+            pd.DataFrame(columns=['startzeit', 'endzeit', 'text']).to_csv(output_file, sep='|', index=False)
+            return pd.DataFrame(columns=['startzeit', 'endzeit', 'text'])
+
+
+        df['duration'] = df['end_sec'] - df['start_sec']
+        # Keine Filterung nach Dauer hier, da wir nichts verwerfen wollen.
+
+        df = df.sort_values('start_sec').reset_index(drop=True)
+        print(f"Nach Zeitvalidierung und Sortierung: {len(df)} gültige Segmente")
+
         current_df = df.copy()
-        
+        current_data_list = []
+
         for iteration in range(iterations):
-            print(f"\n--- Durchlauf {iteration+1}/{iterations} ---")
-            
-            # In DataFrame zurückverwandeln (für Folge-Iterationen)
+            print(f"\n--- Optimierungsdurchlauf {iteration+1}/{iterations} ---")
+
             if iteration > 0:
-                temp_df = pd.DataFrame(current_data)
-                temp_df['start_sec'] = temp_df['startzeit'].apply(safe_parse)
-                temp_df['end_sec'] = temp_df['endzeit'].apply(safe_parse)
+                if not current_data_list:
+                    print("Keine Segmente mehr für weiteren Durchlauf vorhanden.")
+                    break
+                temp_df = pd.DataFrame(current_data_list)
+                temp_df['start_sec'] = temp_df['startzeit'].apply(parse_time)
+                temp_df['end_sec'] = temp_df['endzeit'].apply(parse_time)
+                temp_df['text'] = temp_df['text'].astype(str).fillna('')
+
+                invalid_mask = temp_df['start_sec'].isna() | temp_df['end_sec'].isna() | (temp_df['start_sec'] > temp_df['end_sec'])
+                if invalid_mask.any():
+                    print(f"Warnung (Durchlauf {iteration+1}): {invalid_mask.sum()} Zeilen mit ungültigen Zeiten nach vorherigem Schritt entfernt.")
+                    temp_df = temp_df[~invalid_mask].copy()
+
+                if temp_df.empty:
+                    print("Keine gültigen Segmente mehr im Durchlauf.")
+                    current_data_list = []
+                    break
+
                 temp_df['duration'] = temp_df['end_sec'] - temp_df['start_sec']
                 current_df = temp_df.sort_values('start_sec').reset_index(drop=True)
                 print(f"Für Durchlauf {iteration+1}: {len(current_df)} Segmente")
-            
+
             merged_data = []
             current_chunk = None
 
-            # Phase 1: Segmente basierend auf Zeitkriterien zusammenführen
+            # Phase 1: Zeitbasiertes Zusammenführen (max_gap, max_dur, max_chars beachten)
             for _, row in current_df.iterrows():
-                if not current_chunk:
-                    # Neues Segment starten
+                row_text = str(row['text']) if pd.notna(row['text']) else ''
+
+                if current_chunk is None:
                     current_chunk = {
-                        'start': row['start_sec'],
-                        'end': row['end_sec'],
-                        'text': [row['text']],
-                        'original_start': row['startzeit'],  # Originale Startzeit speichern
-                        'original_end': row['endzeit']       # Originale Endzeit speichern
+                        'start': row['start_sec'], 'end': row['end_sec'],
+                        'text': [row_text],
+                        'original_start': row['startzeit'], 'original_end': row['endzeit']
                     }
                 else:
                     gap = row['start_sec'] - current_chunk['end']
-                    
-                    # Entscheidungslogik
-                    if (gap <= max_gap) and ((row['end_sec'] - current_chunk['start']) <= max_dur):
-                        # Segment erweitern
-                        current_chunk['end'] = row['end_sec']
-                        current_chunk['text'].append(row['text'])
-                        # Endzeit des letzten Segments übernehmen
+                    potential_new_end = row['end_sec']
+                    potential_duration = potential_new_end - current_chunk['start']
+                    # Füge Leerzeichen nur hinzu, wenn beide Teile Text haben
+                    separator = " " if current_chunk['text'] and current_chunk['text'][-1].strip() and row_text.strip() else ""
+                    potential_text_list = current_chunk['text'] + ([row_text] if row_text else [])
+                    potential_text = separator.join(potential_text_list).strip() # Korrektur: Join mit Leerzeichen?
+                    potential_text = (current_chunk['text'][-1] + separator + row_text).strip() # Nur letztes + neues prüfen? Nein, Gesamttext.
+                    # Korrekte Berechnung des potenziellen Gesamttextes
+                    temp_texts = current_chunk['text'] + [row_text]
+                    potential_full_text = ""
+                    first = True
+                    for txt in temp_texts:
+                        clean_txt = txt.strip()
+                        if clean_txt:
+                            if not first: potential_full_text += " "
+                            potential_full_text += clean_txt
+                            first = False
+                    potential_chars = len(potential_full_text)
+
+
+                    # Zusammenführen, wenn Kriterien erfüllt sind
+                    if (gap >= 0 and gap <= max_gap) and \
+                    (potential_duration <= max_dur) and \
+                    (potential_chars <= max_chars):
+                        current_chunk['end'] = potential_new_end
+                        # Füge Text nur hinzu, wenn er nicht leer ist
+                        if row_text:
+                            current_chunk['text'].append(row_text)
                         current_chunk['original_end'] = row['endzeit']
                     else:
-                        # Aktuelles Segment speichern
-                        merged_data.append({
-                            'startzeit': current_chunk['original_start'],  # Originale Startzeit beibehalten
-                            'endzeit': current_chunk['original_end'],      # Originale Endzeit beibehalten
-                            'text': ' '.join(current_chunk['text'])
-                        })
-                        # Neues Segment beginnen
+                        # Finalisiere vorherigen Chunk
+                        final_text = ""
+                        first = True
+                        for txt in current_chunk['text']:
+                            clean_txt = txt.strip()
+                            if clean_txt:
+                                if not first: final_text += " "
+                                final_text += clean_txt
+                                first = False
+                        if final_text: # Nur hinzufügen, wenn Text vorhanden
+                            merged_data.append({
+                                'startzeit': current_chunk['original_start'],
+                                'endzeit': current_chunk['original_end'],
+                                'text': final_text
+                            })
+                        # Beginne neuen Chunk
                         current_chunk = {
-                            'start': row['start_sec'],
-                            'end': row['end_sec'],
-                            'text': [row['text']],
-                            'original_start': row['startzeit'],
-                            'original_end': row['endzeit']
+                            'start': row['start_sec'], 'end': row['end_sec'],
+                            'text': [row_text] if row_text else [], # Leeren Text nicht hinzufügen
+                            'original_start': row['startzeit'], 'original_end': row['endzeit']
                         }
 
-            # Letztes Segment hinzufügen
+            # Letzten Chunk hinzufügen
             if current_chunk:
-                merged_data.append({
-                    'startzeit': current_chunk['original_start'],
-                    'endzeit': current_chunk['original_end'],
-                    'text': ' '.join(current_chunk['text'])
-                })
-            print(f"Nach Zusammenführung: {len(merged_data)} Segmente")
-            
-            # Phase 2: Segmente auf Längenbegrenzung prüfen und Sätze nicht unterbrechen
-            current_data = []
-            segmente_unter_mindestdauer = 0
-            segmente_aufgeteilt = 0
-            
+                final_text = ""
+                first = True
+                for txt in current_chunk['text']:
+                    clean_txt = txt.strip()
+                    if clean_txt:
+                        if not first: final_text += " "
+                        final_text += clean_txt
+                        first = False
+                if final_text:
+                    merged_data.append({
+                        'startzeit': current_chunk['original_start'],
+                        'endzeit': current_chunk['original_end'],
+                        'text': final_text
+                    })
+            print(f"Nach Zeit-Zusammenführung: {len(merged_data)} Segmente")
+
+            # Phase 2: Aufteilung zu langer Segmente (max_chars)
+            # Kein Verwerfen nach min_dur oder min_words hier!
+            current_data_list = []
+            segmente_aufgeteilt_max_chars = 0
+
             for item in merged_data:
-                start_time = parse_time(item['startzeit'])
-                end_time = parse_time(item['endzeit'])
-                duration = end_time - start_time
-                
-                # Segmente unter Mindestdauer überspringen (nur im letzten Durchlauf)
-                if duration < min_dur and iteration == iterations - 1:
-                    segmente_unter_mindestdauer += 1
-                    print(f"Segment {item['startzeit']}-{item['endzeit']} ({duration}s) unter Mindestdauer")
+                text = item['text'].strip()
+                start_time_sec = parse_time(item['startzeit'])
+                end_time_sec = parse_time(item['endzeit'])
+
+                if start_time_sec is None or end_time_sec is None:
+                    logger.warning(f"Überspringe Segment wegen ungültiger Zeit in Phase 2: {item}")
+                    # WICHTIG: Da wir nichts verwerfen dürfen, müssen wir es trotzdem behalten!
+                    # Füge es unverändert hinzu, auch wenn die Zeit ungültig ist.
+                    current_data_list.append(item)
                     continue
-                
-                text = item['text']
-                
-                # Prüfen, ob Text Zeichenlimit überschreitet
+
+                duration = end_time_sec - start_time_sec
+
+                # Wenn Text max_chars nicht überschreitet, direkt übernehmen
                 if len(text) <= max_chars:
-                    # Text ist kurz genug, direkt übernehmen
-                    current_data.append(item)
+                    current_data_list.append(item)
                 else:
                     # Text muss aufgeteilt werden
-                    segmente_aufgeteilt += 1
-                    print(f"Segment wird aufgeteilt: {len(text)} Zeichen > {max_chars} Limit")
-                    
-                    # Text in Sätze aufteilen
+                    segmente_aufgeteilt_max_chars += 1
+                    print(f"Info: Segment wird wg. Länge aufgeteilt: {len(text)} > {max_chars} ({item['startzeit']}-{item['endzeit']})")
+
+                    # Versuche, an Satzgrenzen zu teilen, sonst an Wortgrenzen
                     sentences = split_into_sentences(text)
-                    
-                    # Sätze auf neue Segmente aufteilen (max. max_chars Zeichen pro Segment)
-                    new_segments = []
-                    current_segment = ""
-                    
-                    # Verbesserte Textsegmentierung
-                    for sentence in sentences:
-                        # Einzelnen Satz auf maximale Länge prüfen
-                        if len(sentence) > max_chars:
-                            # Wenn der Satz selbst zu lang ist, in Chunks aufteilen
-                            if current_segment:
-                                # Vorheriges Segment abschließen
-                                new_segments.append(current_segment)
-                                current_segment = ""
-                            
-                            # Sehr langen Satz in Chunks aufteilen (so nah wie möglich an max_chars)
-                            chunks = []
-                            current_chunk = ""
-                            words = sentence.split()
-                            
-                            for word in words:
-                                if len(current_chunk) + len(word) + 1 <= max_chars:
-                                    if current_chunk:
-                                        current_chunk += " " + word
-                                    else:
-                                        current_chunk = word
-                                else:
-                                    if current_chunk:
-                                        chunks.append(current_chunk)
-                                    current_chunk = word
-                            
-                            if current_chunk:
-                                chunks.append(current_chunk)
-                            
-                            # Chunks zu neuen Segmenten hinzufügen
-                            new_segments.extend(chunks)
-                        else:
-                            # Normaler Fall: Satz hinzufügen wenn möglich
-                            proposed_segment = f"{current_segment} {sentence}".strip() if current_segment else sentence
-                            
-                            if len(proposed_segment) <= max_chars:
-                                # Satz passt noch ins aktuelle Segment
-                                current_segment = proposed_segment
+                    if not sentences: sentences = [text] # Fallback
+
+                    new_segments_text = []
+                    current_segment_text = ""
+
+                    for part in sentences: # Teile können Sätze oder Wörter sein (bei sehr langen Sätzen)
+                        part = part.strip()
+                        if not part: continue
+
+                        words_in_part = part.split()
+                        temp_part_segment = "" # Temporärer Speicher für Teile des aktuellen Parts
+
+                        for word in words_in_part:
+                            # Prüfen, ob das Wort selbst > max_chars ist
+                            if len(word) > max_chars:
+                                # Vorheriges Segment abschließen, wenn vorhanden
+                                if current_segment_text:
+                                    new_segments_text.append(current_segment_text)
+                                    current_segment_text = ""
+                                # Langen Word-Chunk abschließen, wenn vorhanden
+                                if temp_part_segment:
+                                    new_segments_text.append(temp_part_segment)
+                                    temp_part_segment = ""
+
+                                logger.warning(f"Wort länger als max_chars ({len(word)} > {max_chars}) im Segment {item['startzeit']}: '{word[:30]}...' - wird als eigenes Segment behalten.")
+                                new_segments_text.append(word) # Füge das lange Wort als eigenes Segment hinzu
+                                continue # Nächstes Wort
+
+                             # Prüfe, ob das Wort in den aktuellen *Teil*-Segment-Chunk passt
+                            proposed_temp_part = f"{temp_part_segment} {word}".strip() if temp_part_segment else word
+                            if len(proposed_temp_part) <= max_chars:
+                                temp_part_segment = proposed_temp_part
                             else:
-                                # Aktuelles Segment abschließen und neues beginnen
-                                new_segments.append(current_segment)
-                                current_segment = sentence
-                    
-                    # Letztes Segment hinzufügen
-                    if current_segment:
-                        new_segments.append(current_segment)
-                    
-                    print(f"Aufgeteilt in {len(new_segments)} Segmente")
-                    
-                    # Zeitverteilung für jedes Segment proportional berechnen
-                    num_segments = len(new_segments)
-                    total_chars = sum(len(segment) for segment in new_segments)
-                    
-                    for i, segment_text in enumerate(new_segments):
-                        # Proportionale Zeitverteilung basierend auf Textlänge
-                        segment_proportion = len(segment_text) / total_chars if total_chars > 0 else 1.0 / num_segments
-                        
-                        if i == 0:
-                            # Erstes Segment: Originale Startzeit beibehalten
-                            segment_start = start_time
-                            segment_end = start_time + (duration * segment_proportion)
-                        elif i == num_segments - 1:
-                            # Letztes Segment: Originale Endzeit beibehalten
-                            previous_proportions = sum(len(new_segments[j]) / total_chars for j in range(i)) if total_chars > 0 else i / num_segments
-                            segment_start = start_time + (duration * previous_proportions)
-                            segment_end = end_time  # Original-Endzeit beibehalten
-                        else:
-                            # Mittlere Segmente: Vollständig proportionale Berechnung
-                            previous_proportions = sum(len(new_segments[j]) / total_chars for j in range(i)) if total_chars > 0 else i / num_segments
-                            segment_start = start_time + (duration * previous_proportions)
-                            segment_end = segment_start + (duration * segment_proportion)
-                        
-                        current_data.append({
-                            'startzeit': item['startzeit'] if i == 0 else format_time(segment_start),
-                            'endzeit': item['endzeit'] if i == num_segments - 1 else format_time(segment_end),
+                                  # Teil-Segment-Chunk passt nicht mehr, prüfe ob er ins *Gesamt*-Segment passt
+                                proposed_full_segment = f"{current_segment_text} {temp_part_segment}".strip() if current_segment_text else temp_part_segment
+
+                                if len(proposed_full_segment) <= max_chars:
+                                    # Ja, füge den Teil-Chunk zum Gesamtsegment hinzu
+                                    current_segment_text = proposed_full_segment
+                                    temp_part_segment = word # Beginne neuen Teil-Chunk mit aktuellem Wort
+                                else:
+                                    # Nein, Gesamtsegment würde zu lang.
+                                    # Schließe zuerst das aktuelle Gesamtsegment ab (wenn es Inhalt hat)
+                                    if current_segment_text:
+                                        new_segments_text.append(current_segment_text)
+
+                                    # Beginne neues Gesamtsegment mit dem Teil-Chunk
+                                    # Falls der Teil-Chunk selbst leer ist (kann passieren?), starte mit dem Wort
+                                    current_segment_text = temp_part_segment if temp_part_segment else word
+                                    if not temp_part_segment and len(word) <= max_chars:
+                                        # Sonderfall: Teil-Chunk war leer, Wort passt, starte neues Segment damit
+                                        temp_part_segment = "" # Zurücksetzen, da das Wort jetzt in current_segment_text ist
+                                    elif temp_part_segment:
+                                        temp_part_segment = word # Beginne neuen Teil-Chunk
+
+                        # Nach der Word-Schleife: Prüfe den verbleibenden Teil-Chunk
+                        if temp_part_segment:
+                            proposed_full_segment = f"{current_segment_text} {temp_part_segment}".strip() if current_segment_text else temp_part_segment
+                            if len(proposed_full_segment) <= max_chars:
+                                current_segment_text = proposed_full_segment
+                            else:
+                                # Passt nicht mehr, schließe altes Segment ab und starte neues
+                                if current_segment_text:
+                                    new_segments_text.append(current_segment_text)
+                                current_segment_text = temp_part_segment
+
+                    # Letztes zusammengesetztes Segment hinzufügen
+                    if current_segment_text:
+                        new_segments_text.append(current_segment_text)
+
+                    print(f"-> Aufgeteilt in {len(new_segments_text)} Segmente")
+
+                    # Zeitverteilung proportional zur Textlänge
+                    num_new_segments = len(new_segments_text)
+                    if num_new_segments == 0: continue
+
+                    total_chars_in_split = sum(len(s) for s in new_segments_text)
+                    if total_chars_in_split == 0: # Vermeide Division durch Null
+                        # Verteile Zeit gleichmäßig, wenn keine Zeichen vorhanden sind (sollte selten sein)
+                        segment_duration = duration / num_new_segments if num_new_segments > 0 else 0
+                        current_start_time = start_time_sec
+                        for i, segment_text in enumerate(new_segments_text):
+                            segment_end_time = current_start_time + segment_duration
+                            if i == num_new_segments - 1: segment_end_time = end_time_sec # Letztes Segment exakt
+                            new_item = {
+                                'startzeit': format_time(current_start_time),
+                                'endzeit': format_time(segment_end_time),
+                                'text': segment_text
+                            }
+                            current_data_list.append(new_item)
+                            current_start_time = segment_end_time
+                        continue # Gehe zum nächsten Originalsegment
+
+
+                    current_start_time = start_time_sec
+                    cumulative_duration = 0
+                    for i, segment_text in enumerate(new_segments_text):
+                        segment_chars = len(segment_text)
+                        segment_proportion = segment_chars / total_chars_in_split
+                        segment_duration = duration * segment_proportion
+
+                        segment_end_time = current_start_time + segment_duration
+                        cumulative_duration += segment_duration
+
+                        # Korrektur für das letzte Segment, um exakte Endzeit sicherzustellen
+                        # und Rundungsfehler auszugleichen
+                        if i == num_new_segments - 1:
+                            segment_end_time = end_time_sec
+                            # Optional: leichte Anpassung der Dauer des vorletzten, wenn nötig? Eher nicht.
+
+                        new_item = {
+                            'startzeit': format_time(current_start_time),
+                            'endzeit': format_time(segment_end_time),
                             'text': segment_text
-                        })
-            
-            # Für weitere Iteration aufbereiten oder Ergebnisse speichern
-            if iteration == iterations - 1:
-                # Letzter Durchlauf - Ergebnisse speichern
-                result_df = pd.DataFrame(current_data)
-                result_df.to_csv(output_file, sep='|', index=False)
-                
-                # Abschlussbericht
-                print("\n--- Verarbeitungsstatistik ---")
-                print(f"Originale Segmente:         {original_segment_count}")
-                print(f"Nach Zeitvalidierung:       {len(df)}")
-                print(f"Nach Zusammenführung:       {len(merged_data)}")
-                print(f"Segmente unter Mindestdauer: {segmente_unter_mindestdauer}")
-                print(f"Aufgeteilte Segmente:       {segmente_aufgeteilt}")
-                print(f"Finale Segmente:            {len(current_data)}")
-                print(f"Ergebnis in {output_file} gespeichert")
-                print("----------------------------\n")
-                
-                return result_df
-            else:
-                print(f"Zwischenergebnis Durchlauf {iteration+1}: {len(current_data)} Segmente")
-                # Weiter mit dem nächsten Durchlauf
-        
+                        }
+                        current_data_list.append(new_item)
+                        current_start_time = segment_end_time # Nutze die berechnete Endzeit als Startzeit
+
+            print(f"Nach Längen-Aufteilung: {len(current_data_list)} Segmente")
+            print(f"  Segmente aufgeteilt wg. max. Zeichen: {segmente_aufgeteilt_max_chars}")
+
+            # Keine weitere Filterung hier, fahre mit nächster Iteration fort oder beende
+
+        # --- Finale Phase: Erzwinge min_dur und min_words durch Zusammenführen ---
+        print("\n--- Finale Bereinigung: Erzwinge Mindestdauer & Mindestwörter ---")
+        force_merge_iterations = 0
+        max_force_merge_iterations = len(current_data_list) # Sicherheitslimit
+        while force_merge_iterations < max_force_merge_iterations:
+            force_merge_iterations += 1
+            print(f"Bereinigungsdurchlauf {force_merge_iterations}...")
+            changed = force_merge_short_segments(current_data_list, min_dur, min_words)
+            print(f"Segmente nach Durchlauf {force_merge_iterations}: {len(current_data_list)}")
+            if not changed:
+                print("Keine weiteren Zusammenführungen nötig.")
+                break # Beenden, wenn sich nichts mehr geändert hat
+        if force_merge_iterations == max_force_merge_iterations:
+            print("Warnung: Maximalzahl an Bereinigungsdurchläufen erreicht. Möglicherweise konnten nicht alle Segmente bereinigt werden.")
+
+
+        # --- Abschluss und Speichern ---
+        if not current_data_list:
+            print("\n--- Verarbeitung abgeschlossen: KEINE finalen Segmente erzeugt ---")
+            final_df = pd.DataFrame(columns=['startzeit', 'endzeit', 'text'])
+            final_df.to_csv(output_file, sep='|', index=False)
+            print(f"Leere Ergebnisdatei {output_file} gespeichert.")
+            return final_df
+
+        result_df = pd.DataFrame(current_data_list)
+        result_df = result_df[['startzeit', 'endzeit', 'text']] # Korrekte Spaltenreihenfolge
+        result_df.to_csv(output_file, sep='|', index=False)
+
+        # Abschlussbericht
+        final_segment_count = len(result_df)
+        print("\n--- Verarbeitungsstatistik (Final) ---")
+        print(f"Originale Segmente gelesen:    {original_segment_count}")
+        print(f"Gültige Segmente nach Init-Parse: {len(df) if 'df' in locals() else 'N/A'}")
+        # Die Zählung aufgeteilter Segmente etc. ist komplexer geworden, da nichts verworfen wird.
+        print(f"Segmente nach Iterationen:     {len(current_data_list) if current_data_list else 'N/A'}") # Vor finalem Merge
+        print(f"Finale Segmente geschrieben:   {final_segment_count}")
+        print(f"Ergebnis in {output_file} gespeichert")
+        print("------------------------------------\n")
+
+        return result_df
+
+    except FileNotFoundError:
+        print(f"Fehler: Eingabedatei nicht gefunden: {input_file}")
+        raise
+    except ValueError as e:
+        print(f"Fehler bei der Datenvalidierung oder Verarbeitung: {str(e)}")
+        traceback.print_exc()
+        raise
     except Exception as e:
-        print(f"Kritischer Fehler: {str(e)}")
-        traceback.print_exc()  # Detaillierte Fehlerinformationen ausgeben
+        print(f"Ein unerwarteter Fehler ist aufgetreten: {str(e)}")
+        traceback.print_exc()
         raise
 
 def restore_punctuation(input_file, output_file):
@@ -992,9 +1192,37 @@ def restore_punctuation(input_file, output_file):
             return read_translated_csv(output_file)
 
     """Stellt die Interpunktion mit deepmultilingualpunctuation wieder her."""
-    df = pd.read_csv(input_file, sep='|')
+    df = pd.read_csv(input_file, sep='|', dtype=str)
+    
+    # Identifiziere die ursprüngliche Textspalte (ignoriere Groß/Kleinschreibung)
+    text_col_original = None
+    for col in df.columns:
+        if col.strip().lower() == 'text':
+            text_col_original = col
+            break
+    if text_col_original is None:
+        raise ValueError("Keine Spalte 'text' (unabhängig von Groß/Kleinschreibung) in der Eingabedatei gefunden.")
+    
     model = PunctuationModel()
-    df['text'] = df['text'].apply(lambda x: model.restore_punctuation(x) if isinstance(x, str) else x)
+    
+    # Wende das Modell an und speichere in einer NEUEN Spalte
+    df['punctuated_text'] = df[text_col_original].apply(lambda x: model.restore_punctuation(x) if isinstance(x, str) and x.strip() else x)
+
+    # Lösche die ursprüngliche Textspalte
+    df = df.drop(columns=[text_col_original])
+
+    # Benenne die neue Spalte in 'text' um (jetzt garantiert kleingeschrieben)
+    df = df.rename(columns={'punctuated_text': 'text'})
+
+    # Stelle sicher, dass die Spaltenreihenfolge sinnvoll ist (optional)
+    # Z.B. ['startzeit', 'endzeit', 'text']
+    cols = df.columns.tolist()
+    if 'startzeit' in cols and 'endzeit' in cols and 'text' in cols:
+        # Versuche, die Reihenfolge zu erzwingen
+        core_cols = ['startzeit', 'endzeit', 'text']
+        other_cols = [c for c in cols if c not in core_cols]
+        df = df[core_cols + other_cols]
+        
     df.to_csv(output_file, sep='|', index=False)
     return output_file
 
@@ -1048,7 +1276,9 @@ def batch_translate(segments, target_lang="de"):
         
         
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    texts = [f"<2{target_lang}> {seg['text']}" for seg in segments]  # Alle Texte sammeln
+#    MADLAD400:
+#    texts = [f"<2{target_lang}> {seg['text']}" for seg in segments]  # Alle Texte sammeln
+    texts = [seg['text'] for seg in segments]
     
     # ✅ Batch-Tokenization (viel schneller!)
     inputs = _TOKENIZER(
@@ -1056,22 +1286,22 @@ def batch_translate(segments, target_lang="de"):
         return_tensors="pt",
         padding=True,
         max_length=512,
-        truncation=True
+        truncation=True,
         ).to(device)
 
     with torch.no_grad():
-        with autocast(device_type='cuda', dtype=torch.float16):  # Kein Gradienten-Tracking & Mixed Precision für Speed
+        with autocast(device_type='cuda', dtype=torch.bfloat16):  # Kein Gradienten-Tracking & Mixed Precision für Speed
             outputs = _TRANSLATE_MODEL.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
+                **inputs,
+                forced_bos_token_id=_TOKENIZER.convert_tokens_to_ids("deu_Latn"),
+#                attention_mask=inputs["attention_mask"],
                 pad_token_id=_TOKENIZER.eos_token_id,
-                use_model_defaults=True,
                 num_beams=8,  
-                repetition_penalty=1.0,
-                length_penalty=1.0,
+#                repetition_penalty=1.0,
+#                length_penalty=1.0,
                 early_stopping=True,
-                do_sample=True,
-                temperature=0.15,
+                do_sample=False,
+#                temperature=0.15,
                 no_repeat_ngram_size=2,
                 max_length=125
             )
@@ -1131,9 +1361,7 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
         print(f"--------------------------")
         print(f"|<< Starte Übersetzung >>|")
         print(f"--------------------------")
-        
-        print(f">>> MADLAD400-Modell wird initialisiert... <<<")
-        
+        print(f">>> nllb-200-3.3B wird initialisiert... <<<")
         # ✅ **Batch-Verarbeitung**
         
         # Dataset aus den Segmenten erstellen
@@ -1173,6 +1401,27 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
         logger.error(f"Fehler bei der Übersetzung: {e}")
         return existing_translations  # Konsistente Rückgabe auch im Fehlerfall
 
+def safe_restore_punctuation(text, model_instance):
+    """ Robuste Funktion aus vorheriger Antwort, fängt Fehler ab """
+    if not isinstance(text, str):
+        # logger.warning(f"Überspringe Eintrag, da kein String: {type(text)} - {repr(text)}")
+        return text
+    if not text.strip():
+        return text
+    # Spezifische Behandlung für "Name: ..., dtype: object" Strings
+    if 'Name:' in text and 'dtype: object' in text:
+        logger.warning(f"Überspringe wahrscheinlichen Series-String: {repr(text)}")
+        return "" # Oder den Original-String zurückgeben, wenn das besser ist
+
+    try:
+        return model_instance.restore_punctuation(text)
+    except IndexError as e:
+        logger.error(f"IndexError bei Interpunktion für: {repr(text)}", exc_info=True)
+        return text # Originaltext zurückgeben
+    except Exception as e:
+        logger.error(f"Anderer Fehler bei Interpunktion für: {repr(text)}", exc_info=True)
+        return text # Originaltext zurückgeben
+
 def restore_punctuation_de(input_file, output_file):
     if os.path.exists(output_file):
         if not ask_overwrite(output_file):
@@ -1180,9 +1429,15 @@ def restore_punctuation_de(input_file, output_file):
             return read_translated_csv(output_file)
 
     """Stellt die Interpunktion mit deepmultilingualpunctuation wieder her."""
-    df = pd.read_csv(input_file, sep='|')
+    df = pd.read_csv(input_file, sep='|', dtype=str)
+    
+    # Mögliche Vorbereitung: NaN-Werte in leere Strings umwandeln, falls vorhanden
+    df['Text'] = df['Text'].fillna('')
+    # Sicherstellen, dass alles String ist (obwohl fillna('') das meist erledigt)
+    df['Text'] = df['Text'].astype(str)
+    
     model = PunctuationModel()
-    df['Text'] = df['Text'].apply(lambda x: model.restore_punctuation(x) if isinstance(x, str) else x)
+    df['Text'] = df['Text'].apply(lambda x: model.restore_punctuation(x) if x.strip() else x)
     df.to_csv(output_file, sep='|', index=False)
     return output_file
 
@@ -1252,7 +1507,7 @@ def text_to_speech_with_voice_cloning(translation_file,
                                     sample_path_2,
                                     sample_path_3,
                                     output_path,
-                                    batch_size=4):
+                                    batch_size=16):
     """
     Optimierte Text-to-Speech-Funktion mit Voice Cloning und verschiedenen Beschleunigung
     Args:
@@ -1265,9 +1520,6 @@ def text_to_speech_with_voice_cloning(translation_file,
     # Speicher-Cache für effizientere Allokation
     torch.cuda.empty_cache()
     
-    # GPU-Optimierungen
-    torch.backends.cudnn.benchmark = True
-    
     if os.path.exists(output_path):
         if not ask_overwrite(output_path):
             logger.info(f"TTS-Audio bereits vorhanden: {output_path}")
@@ -1277,7 +1529,7 @@ def text_to_speech_with_voice_cloning(translation_file,
         print(f"------------------")
         print(f"|<< Starte TTS >>|")
         print(f"------------------")
-        use_half_precision =False
+        use_half_precision = False
         # 1. GPU-Optimierungen aktivieren
         cuda_stream = setup_gpu_optimization()
         
@@ -1297,6 +1549,7 @@ def text_to_speech_with_voice_cloning(translation_file,
             )
         model.to(torch.device("cuda"))
         model.eval()
+        model = torch.compile(model, mode="reduce-overhead")
         
         with torch.cuda.stream(cuda_stream), torch.inference_mode():
             sample_paths = [
@@ -1308,7 +1561,7 @@ def text_to_speech_with_voice_cloning(translation_file,
             # Konsistenter Kontext für Mixed-Precision
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16 if use_half_precision else torch.float32):
                 gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(
-                    sound_norm_refs=True,
+                    sound_norm_refs=False,
                     audio_path=sample_paths
                 )
         
@@ -1361,12 +1614,12 @@ def text_to_speech_with_voice_cloning(translation_file,
                             text=text,
                             language="de",
                             # Optimierte Parameter
-                            num_beams=1,
-                            speed=1.0,
-                            temperature=0.6,
-                            length_penalty=1.0,
+                            speed=0.95,
+                            temperature=0.8,
                             repetition_penalty=10.0,
-                            enable_text_splitting=False
+                            enable_text_splitting=False,
+                            top_k=70,
+                            top_p=0.9
                         )
                         batch_results.append(result)
             
@@ -1699,19 +1952,21 @@ def main():
     if not translated:
         logger.error("Übersetzung fehlgeschlagen oder keine Segmente vorhanden.")
         return
-
-#    restore_punctuation_de(TRANSLATION_FILE, PUNCTED_TRANSLATION_FILE)
-
+    
+    restore_punctuation_de(TRANSLATION_FILE, PUNCTED_TRANSLATION_FILE)
+    
 # 6.1) Zusammenführen von Transkript-Segmenten
     merge_transcript_chunks(
-        input_file=TRANSLATION_FILE,
+        input_file=PUNCTED_TRANSLATION_FILE,
         output_file=MERGED_TRANSLATION_FILE,
         min_dur=MIN_DUR,
         max_dur=MAX_DUR,
         max_gap=MAX_GAP,
         max_chars=MAX_CHARS,
+        min_words=MIN_WORDS,
         iterations=ITERATIONS
     )
+
     # 8) Text-to-Speech (TTS) mit Stimmenklonung
     text_to_speech_with_voice_cloning(MERGED_TRANSLATION_FILE,
                                     SAMPLE_PATH_1,

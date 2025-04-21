@@ -8,3 +8,4 @@
 /venv/
 /venv310/
 .wolf*
+/wsl_venv/
