@@ -20,8 +20,12 @@ from sympy import false, true
 from tokenizers import Encoding, Tokenizer
 from tokenizers.models import BPE
 import torch
+import packaging
 from torch import autocast
 torch.set_num_threads(4)
+import tensor_parallel
+import deepspeed
+from deepspeed import init_inference
 from accelerate import init_empty_weights, infer_auto_device_map
 import shape as sh
 import torch.nn as nn
@@ -34,6 +38,9 @@ import time
 from datetime import datetime, timedelta
 import csv
 import traceback
+import psutil
+from functools import partial
+from mii import pipeline
 from llama_cpp import Llama
 from config import *
 from tqdm import tqdm
@@ -63,6 +70,7 @@ from TTS.tts.models.xtts import Xtts
 from TTS.tts.utils.text.phonemizers.gruut_wrapper import Gruut
 #import whisper
 from faster_whisper import WhisperModel, BatchedInferencePipeline
+from optimum.onnxruntime import ORTModelForSequenceClassification
 from pydub import AudioSegment
 from pydub.effects import(
     high_pass_filter,
@@ -83,6 +91,7 @@ torch.backends.cudnn.benchmark = True         # Optimale Kernel-Auswahl
 torch.backends.cudnn.deterministic = False    # Nicht-deterministische Optimierungen erlauben
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+os.environ["CT2_FLASH_ATTENTION"] = "1"
 
 # Phoneme Konfiguration
 USE_PHONEMES = False
@@ -152,44 +161,90 @@ def ask_overwrite(file_path):
             return False
 
 step_start_time = time.time()
-def get_whisper_model():
-    global _WHISPER_MODEL, _BATCHED_MODEL
-    if not _WHISPER_MODEL:
-#        _WHISPER_MODEL = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3").to(device)
-        _WHISPER_MODEL = WhisperModel("large-v3", device="cuda", compute_type="bfloat16")
-        _BATCHED_MODEL = BatchedInferencePipeline(model=_WHISPER_MODEL)
-#        _WHISPER_MODEL.to(torch.device("cuda"))
-        torch.cuda.empty_cache()
-    return _WHISPER_MODEL
+def load_whisper_model():
+    """
+    Lädt das Whisper-Modell in INT8-Quantisierung für schnellere GPU-Inferenz
+    und richtet die gebatchte Pipeline ein.
+    """
+    model_size = "large-v3"
+    # compute_type="int8_float16" nutzt INT8-Gewichte + FP16-Aktivierungen für Speed & geringen Speicher[4]
+    model = WhisperModel(model_size, device="cuda", compute_type="int8_float16")
+    pipeline = BatchedInferencePipeline(model=model)
+    return pipeline
 
-def get_translate_model():
-        global _TRANSLATE_MODEL, _TOKENIZER    
-        if _TRANSLATE_MODEL is None:
-            model_name = "jbochi/madlad400-7b-mt"
-            logger.info(f"Lade Übersetzungsmodell: {model_name}")
-            quantization_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-#                llm_int8_enable_fp32_cpu_offload=True
-                )
-            _TOKENIZER = T5TokenizerFast.from_pretrained(model_name, verbose=True)
-#            max_memory = {
-#                0:"5.8GiB",
-#                "cpu": "35.0GiB"
-#            }
-            _TRANSLATE_MODEL = T5ForConditionalGeneration.from_pretrained(
-                model_name,
-#                device_map="auto",
-#                max_memory=max_memory,
-                low_cpu_mem_usage=True,
-                quantization_config=quantization_config,
-                )
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            _TRANSLATE_MODEL.eval()
-#            _TRANSLATE_MODEL = torch.compile(_TRANSLATE_MODEL, mode="reduce-overhead")
-#            _TRANSLATE_MODEL = _TRANSLATE_MODEL.half()
-            torch.cuda.empty_cache()
-        return _TRANSLATE_MODEL, _TOKENIZER
+def load_translation_model(use_deepspeed=True):
+    """
+    Lädt das Madlad400-Übersetzungsmodell in 8-Bit und wrappt es für DeepSpeed-Inferenz[5].
+    """
+    model_name = "jbochi/madlad400-7b-mt"
+    # 8-Bit via BitsAndBytes für geringeren Speicher
+    compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    
+    quantization_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        #llm_int8_enable_fp32_cpu_offload=True,
+        #llm_int8_has_fp16_weight=True,
+    )
+    #logger.info("BitsAndBytes 8-bit Konfiguration (ohne CPU-Offload) erstellt.")
+    gpu_mem_fraction: float = 0.85 if use_deepspeed else 0.9 # Maybe less VRAM needed by base load if DS takes over
+    cpu_mem_fraction: float = 0.85 if use_deepspeed else 0.9
+    max_memory = {}
+    if torch.cuda.is_available():
+            max_memory[0] = torch.cuda.get_device_properties(0).total_memory * gpu_mem_fraction / (1024**3)
+    max_memory["cpu"] = psutil.virtual_memory().available * cpu_mem_fraction / (1024**3)
+    max_memory_str = {k: f"{v:.2f}GiB" for k, v in max_memory.items()}
+    logger.info(f"Max memory configuration for initial load: {max_memory_str}")
+    
+    tokenizer = T5TokenizerFast.from_pretrained(model_name)
+    model = T5ForConditionalGeneration.from_pretrained(
+        model_name,
+        #device_map="auto",
+        #max_memory=max_memory_str,
+        quantization_config=quantization_config,
+        torch_dtype=compute_dtype, # Load in specified dtype
+        torch_dtype=compute_dtype, # bf16 or fp16
+        attn_implementation="flash_attention_2"
+        #low_cpu_mem_usage=True,
+    )
+    model.eval()
+    # DeepSpeed-Inferenz mit automatischer Kernel-Injection
+    ds_model = deepspeed.init_inference(
+        model,
+        tensor_parallel={"tp_size": 1},
+        dtype=torch.bfloat16,              # BF16-Aktivierung
+        replace_with_kernel_inject=True,  # nutzt Flash-Attention-Kernels falls vorhanden[8]
+    )
 
+    model = torch.compile(model, mode="max-autotune")
+    
+    torch.cuda.empty_cache()
+    
+    return ds_model, tokenizer
+
+def load_xtts_v2():
+    """
+    Lädt Xtts v2 und konfiguriert DeepSpeed-Inferenz.
+    """
+    # 1) Konfiguration lesen
+    config = XttsConfig()
+    config.load_json(r"D:\alltalk_tts\models\xtts\v203\config.json")
+    # 2) Modell initialisieren
+    model = Xtts.init_from_config(config)
+    model.load_checkpoint(
+        config,
+        checkpoint_dir=r"D:\alltalk_tts\models\xtts\v203",  # Pfad anpassen
+        use_deepspeed=False
+    )
+    model.eval().to("cuda")
+    # 3) DeepSpeed-Inferenz aktivieren
+    ds_model = init_inference(
+        model,
+        mp_size=1,
+        dtype=torch.float32,             # Xtts v2 erwartet float32
+        replace_method="auto",
+        replace_with_kernel_inject=True, # wenn Flash-Attention-Kernels verfügbar sind[8]
+    )
+    return ds_model
 # Context Manager für GPU-Operationen
 @contextmanager
 def gpu_context():
@@ -572,67 +627,65 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
         print("|<< Starte Transkription >>|")
         print("----------------------------")
         
-        global _WHISPER_MODEL,_BATCHED_MODEL
-        
+        torch.cuda.empty_cache()
         torch.backends.cudnn.benchmark = True  # Auto-Tuning für beste Performance
         torch.backends.cudnn.enabled = True    # cuDNN aktivieren
-        get_whisper_model()   # Laden des vortrainierten Whisper-Modells
+        pipeline = load_whisper_model()   # Laden des vortrainierten Whisper-Modells
         
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-            segments, info = _BATCHED_MODEL.transcribe(
-                audio_file,                         # Audio-Datei
-                batch_size=8,
-                beam_size=10,
-                patience=1.0,
-                vad_filter=True,
-                chunk_length=15,
-    #            compression_ratio_threshold=2.8,    # Schwellenwert für Kompressionsrate
-    #            log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
-    #            no_speech_threshold=1.0,            # Schwellenwert für Stille
-                temperature=(0.05, 0.1, 0.15, 0.2, 0.25, 0.5),      # Temperatur für Sampling
-                word_timestamps=True,               # Zeitstempel für Wörter
-                hallucination_silence_threshold=0.35,  # Schwellenwert für Halluzinationen
-                condition_on_previous_text=True,    # Bedingung an vorherigen Text
-                no_repeat_ngram_size=2,
-    #            repetition_penalty=1.5,
-    #            verbose=True,                       # Ausführliche Ausgabe
-                language="pl",                       # Englische Sprache
-                task="translate",                    # Übersetzung aktivieren
-            )
+        segments, info = pipeline.transcribe(
+            audio_file,
+            batch_size=8,
+            beam_size=5,
+            patience=1.0,
+            vad_filter=True,
+            #chunk_length=15,
+            #compression_ratio_threshold=2.8,    # Schwellenwert für Kompressionsrate
+            #log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
+            #no_speech_threshold=1.0,            # Schwellenwert für Stille
+            temperature=(0.05, 0.1, 0.15, 0.2, 0.25, 0.5),      # Temperatur für Sampling
+            word_timestamps=True,               # Zeitstempel für Wörter
+            hallucination_silence_threshold=0.35,  # Schwellenwert für Halluzinationen
+            condition_on_previous_text=True,    # Bedingung an vorherigen Text
+            no_repeat_ngram_size=2,
+            repetition_penalty=1.5,
+            #verbose=True,                       # Ausführliche Ausgabe
+            language="en",                       # Englische Sprache
+            #task="translate",                    # Übersetzung aktivieren
+        )
             #segments = result["segments"]
-            segments_list = []
+        segments_list = []
         
         # Simuliere die verbose-Ausgabe
-            print("\n[ Transkriptionsdetails ]")
-            for segment in segments:
-                start = str(timedelta(seconds=segment.start)).split('.')[0]
-                end = str(timedelta(seconds=segment.end)).split('.')[0]
-                text = segment.text.strip()
-                
-                # Text bereinigen: Entferne "..." am Ende des Textes
-                text = segment.text.strip()
-                text = re.sub(r'\.\.\.$', '', text).strip()  # Entferne "..." nur am Ende
-                
-                # Ähnlich wie verbose=True bei OpenAI Whisper
-                print(f"[{start} --> {end}] {text}")
-                
-                adjusted_segment = {
-                    "start": max(segment.start - 0, 0),
-                    "end": max(segment.end + 0, 0),
-                    "text": segment.text
-                }
-                segments_list.append(adjusted_segment)
+        print("\n[ Transkriptionsdetails ]")
+        for segment in segments:
+            start = str(timedelta(seconds=segment.start)).split('.')[0]
+            end = str(timedelta(seconds=segment.end)).split('.')[0]
+            text = segment.text.strip()
+            
+            # Text bereinigen: Entferne "..." am Ende des Textes
+            text = segment.text.strip()
+            text = re.sub(r'\.\.\.$', '', text).strip()  # Entferne "..." nur am Ende
+            
+            # Ähnlich wie verbose=True bei OpenAI Whisper
+            print(f"[{start} --> {end}] {text}")
+            
+            adjusted_segment = {
+                "start": max(segment.start - 0, 0),
+                "end": max(segment.end + 0, 0),
+                "text": segment.text
+            }
+            segments_list.append(adjusted_segment)
 
         # CSV-Export
-            transcription_file = transcription_file.replace('.json', '.csv')
-            with open(transcription_file, mode='w', encoding='utf-8', newline='') as csvfile:
-                csv_writer = csv.writer(csvfile, delimiter='|')
-                csv_writer.writerow(['Startzeit', 'Endzeit', 'Text'])
-                
-                for segment in segments_list:
-                    start = str(timedelta(seconds=segment["start"])).split('.')[0]
-                    end = str(timedelta(seconds=segment["end"])).split('.')[0]
-                    csv_writer.writerow([start, end, segment["text"]])
+        transcription_file = transcription_file.replace('.json', '.csv')
+        with open(transcription_file, mode='w', encoding='utf-8', newline='') as csvfile:
+            csv_writer = csv.writer(csvfile, delimiter='|')
+            csv_writer.writerow(['Startzeit', 'Endzeit', 'Text'])
+            
+            for segment in segments_list:
+                start = str(timedelta(seconds=segment["start"])).split('.')[0]
+                end = str(timedelta(seconds=segment["end"])).split('.')[0]
+                csv_writer.writerow([start, end, segment["text"]])
         print("------------------------------------")
         print("|<< Transkription abgeschlossen! >>|")
         print("------------------------------------")
@@ -1258,47 +1311,42 @@ def sanitize_for_csv_and_tts(text):
         text = text.replace(old, new)
     return text
 
-BATCH_SIZE = 8  # Je nach GPU-Speicher anpassen (z. B. 4, 8 oder 16)
+BATCH_SIZE = 2  # Je nach GPU-Speicher anpassen (z. B. 4, 8 oder 16)
 
-def batch_translate(segments, target_lang="de"):
-    """Übersetzt mehrere Segmente gleichzeitig im Batch-Modus."""
-    global _TOKENIZER, _TRANSLATE_MODEL  # 🔥 Stelle sicher, dass sie global verwendet werden
-    get_translate_model() 
-    if _TOKENIZER is None or _TRANSLATE_MODEL is None:  # 🔥 Modell nachladen, falls nötig
-        print("\n⚠️  WARNUNG: Modell oder Tokenizer nicht geladen. Lade sie jetzt...")
-        
-        
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#    MADLAD400:
-    texts = [f"<2{target_lang}> {seg['text']}" for seg in segments]  # Alle Texte sammeln
+def batch_translate(batch_texts, ds_model, target_lang="de"):
+
+    torch.cuda.empty_cache()
+    #MADLAD400:
+    texts = [f"<2{target_lang}> {seg['text']}" for seg in batch_texts]  # Alle Texte sammeln
 #    texts = [seg['text'] for seg in segments]
-    
+    ds_model, tokenizer = load_translation_model()
     # ✅ Batch-Tokenization (viel schneller!)
-    inputs = _TOKENIZER(
+    inputs = tokenizer(
         texts,
         return_tensors="pt",
         padding=True,
         max_length=512,
         truncation=True,
-        ).to(device)
+        )
 
     with torch.no_grad():
-        with autocast(device_type='cuda', dtype=torch.bfloat16):  # Kein Gradienten-Tracking & Mixed Precision für Speed
-            outputs = _TRANSLATE_MODEL.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                pad_token_id=_TOKENIZER.eos_token_id,
-                num_beams=8,  
-#                repetition_penalty=1.0,
-#                length_penalty=1.0,
-                early_stopping=True,
-                do_sample=False,
-#                temperature=0.15,
-                no_repeat_ngram_size=2,
-                max_length=125
-            )
-
-    return [_TOKENIZER.decode(out, skip_special_tokens=True).strip() for out in outputs]
+        outputs = ds_model.generate(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            pad_token_id=tokenizer.eos_token_id,
+            num_beams=7,  
+#           repetition_penalty=1.0,
+#           length_penalty=1.0,
+            early_stopping=True,
+            do_sample=True,
+#           temperature=0.15,
+            no_repeat_ngram_size=2,
+            max_length=150
+        )
+        
+    translations= tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    
+    return [t.strip() for t in translations]
 
 def translate_segments(transcription_file, translation_file, source_lang="en", target_lang="de"):
     """Übersetzt die bereits transkribierten Segmente mithilfe von MADLAD400."""
@@ -1327,6 +1375,14 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
         else:
             logger.info(f"Starte neue Übersetzung, vorhandene Datei wird ignoriert: {translation_file}")
     try:
+        logger.info("Lade Übersetzungsmodell und Tokenizer...")
+        use_ds = True
+        model, tokenizer = load_translation_model(use_deepspeed=use_ds)
+        if model is None or tokenizer is None:
+            logger.error("Modell oder Tokenizer konnte nicht geladen werden. Breche Übersetzung ab.")
+            return {} # Return empty dict or appropriate error signal
+
+        logger.info(f"Übersetzungsmodell {'mit DeepSpeed' if use_ds else 'ohne DeepSpeed'} initialisiert.")
         # CSV-Datei mit Transkriptionen einlesen
         segments = []
         with open(transcription_file, mode='r', encoding='utf-8') as csvfile:
@@ -1368,6 +1424,18 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
 
         dataset = dataset.map(translate_batch, batched=True, batch_size=BATCH_SIZE)
 
+        # --- Use partial to pass model and tokenizer to the map function ---
+        translate_func = partial(batch_translate, ds_model=model, tokenizer=tokenizer, target_lang=target_lang)
+        
+        # Apply batch translation using map
+        # Note: map returns results in order, corresponding to the input dataset
+        results = dataset.map(
+            lambda batch: {'translation': translate_func(batch['text'])}, # Apply translate_func to the 'text' field
+            batched=True,
+            batch_size=BATCH_SIZE, # Use your defined BATCH_SIZE
+            desc="Übersetze Segmente" # Progress bar description
+        )
+        
         # Neue Übersetzungen zum existing_translations Dictionary hinzufügen
         for i, seg in enumerate(segments):
             existing_translations[seg["start_str"]] = dataset["translation"][i]
@@ -1501,7 +1569,7 @@ def text_to_speech_with_voice_cloning(translation_file,
                                     sample_path_2,
                                     sample_path_3,
                                     output_path,
-                                    batch_size=16):
+                                    batch_size=4):
     """
     Optimierte Text-to-Speech-Funktion mit Voice Cloning und verschiedenen Beschleunigung
     Args:
@@ -1530,21 +1598,7 @@ def text_to_speech_with_voice_cloning(translation_file,
         # 2. Modell laden und auf GPU verschieben
         
         print(f"TTS-Modell wird initialisiert...")
-
-        config = XttsConfig(model_param_stats=True)
-        config.load_json(r"D:\alltalk_tts\models\xtts\v203\config.json")
-
-        model = Xtts.init_from_config(config)
-        model.load_checkpoint(
-            config,
-            checkpoint_dir=r"D:\alltalk_tts\models\xtts\v203",
-            checkpoint_path=r"D:\alltalk_tts\models\xtts\v203\model.pth",
-            use_deepspeed=False
-            )
-        model.to(torch.device("cuda"))
-        model.eval()
-        model = torch.compile(model, mode="reduce-overhead")
-        
+        ds_model=load_xtts_v2()
         with torch.cuda.stream(cuda_stream), torch.inference_mode():
             sample_paths = [
                 sample_path_1,
@@ -1553,8 +1607,8 @@ def text_to_speech_with_voice_cloning(translation_file,
                 ]
             
             # Konsistenter Kontext für Mixed-Precision
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16 if use_half_precision else torch.float32):
-                gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(
+            with torch.inference_mode(device_type='cuda', dtype=torch.float32):
+                gpt_cond_latent, speaker_embedding = ds_model.get_conditioning_latents(
                     sound_norm_refs=False,
                     audio_path=sample_paths
                 )
@@ -1597,25 +1651,24 @@ def text_to_speech_with_voice_cloning(translation_file,
             batch_results = []
             
             # Mixed-Precision Inferenz
-            with torch.cuda.stream(cuda_stream), torch.inference_mode():
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16 if use_half_precision else torch.float32):
-                    for text in text_batch:
-                        text
-                            
-                        result = model.inference(
-                            gpt_cond_latent=gpt_cond_latent,
-                            speaker_embedding=speaker_embedding,
-                            text=text,
-                            language="de",
-                            # Optimierte Parameter
-                            speed=0.95,
-                            temperature=0.8,
-                            repetition_penalty=10.0,
-                            enable_text_splitting=False,
-                            top_k=70,
-                            top_p=0.9
-                        )
-                        batch_results.append(result)
+            with torch.cuda.stream(cuda_stream), torch.inference_mode(device_type='cuda', dtype=torch.float32):
+                for text in text_batch:
+                    text
+                        
+                    result = ds_model.tts_inference(
+                        gpt_cond_latent=gpt_cond_latent,
+                        speaker_embedding=speaker_embedding,
+                        text=text,
+                        language="de",
+                        # Optimierte Parameter
+                        speed=1.0,
+                        temperature=0.7,
+                        repetition_penalty=10.0,
+                        enable_text_splitting=False,
+                        top_k=65,
+                        top_p=0.85
+                    )
+                    batch_results.append(result)
             
             # Effiziente Audio-Zusammenführung
             for i, (result, (start, end)) in enumerate(zip(batch_results, time_batch)):
