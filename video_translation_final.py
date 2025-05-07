@@ -1,11 +1,26 @@
 import os
+import logging
+
+# ==============================
+# Globale Konfigurationen und Logging
+# ==============================
+# Logging so früh wie möglich konfigurieren
+logging.basicConfig(
+    filename='video_translation_final.log',
+    format="%(asctime)s - %(levelname)s - %(name)s - %(funcName)s:%(lineno)d - %(message)s", # Detaillierteres Format
+    level=logging.INFO,
+    filemode='a',  # 'w' zum Überschreiben bei jedem Start, 'a' zum Anhängen (Standard)
+    force=True     # Wichtig für Python 3.8+: Stellt sicher, dass diese Konfiguration greift
+)
+logger = logging.getLogger(__name__) # Logger für dieses Modul holen
+
+# Test-Log-Nachricht direkt nach der Initialisierung
+logger.info("Logging wurde erfolgreich initialisiert.")
+
 import re
 from pathlib import Path
 import subprocess
-from tabnanny import verbose
-import token
 import ffmpeg
-import logging
 from langcodes import Language
 import librosa
 import matplotlib.pyplot as plt
@@ -16,7 +31,6 @@ import json
 import scipy.signal as signal
 from scipy.signal import resample_poly
 from pydub import AudioSegment
-from sympy import false, true
 from tokenizers import Encoding, Tokenizer
 from tokenizers.models import BPE
 import torch
@@ -64,8 +78,10 @@ from transformers import (
     QuantoConfig,
     T5Tokenizer,
     T5TokenizerFast,
-    T5ForConditionalGeneration
+    T5ForConditionalGeneration,
+    TorchAoConfig
     )
+from torchao.quantization import Int8WeightOnlyConfig
 from TTS.api import TTS
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
@@ -101,7 +117,7 @@ USE_PHONEMES = False
 # Transkription Zusammenführung
 MIN_DUR = 0 # Minimale Segmentdauer in Sekunden 
 MAX_DUR = 10 # Maximale Segmentdauer in Sekunden
-MAX_GAP = 5 # Maximaler akzeptierter Zeitabstand zwischen Segmenten
+MAX_GAP = 3 # Maximaler akzeptierter Zeitabstand zwischen Segmenten
 MAX_CHARS = 100 # Maximale Anzahl an Zeichen pro Segment
 MIN_WORDS = 7 # Minimale Anzahl an Wörtern pro Segment
 ITERATIONS = 2 # Durchläufe
@@ -117,12 +133,6 @@ SPEED_FACTOR_PLAYBACK = 1.0     # Geschwindigkeitsfaktor für die Wiedergabe des
 # Lautstärkeanpassungen
 VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
 VOLUME_ADJUSTMENT_VIDEO = 0.04   # Lautstärkefaktor für das Video
-
-# ============================== 
-# Globale Konfigurationen und Logging
-# ==============================
-logging.basicConfig(filename='video_translation_final.log', format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # ============================== 
 # Hilfsfunktionen
@@ -160,7 +170,6 @@ def ask_overwrite(file_path):
         elif choice == "" or choice in ["n", "nein"]:
             return False
 
-step_start_time = time.time()
 def load_whisper_model():
     """
     Lädt das Whisper-Modell in INT8-Quantisierung für schnellere GPU-Inferenz
@@ -168,8 +177,8 @@ def load_whisper_model():
     """
     model_size = "large-v3"
     # compute_type="int8_float16" nutzt INT8-Gewichte + FP16-Aktivierungen für Speed & geringen Speicher
-    model = WhisperModel(model_size, device="auto", compute_type="int8_float16")
-    pipeline = BatchedInferencePipeline(model=model)
+    fw_model = WhisperModel(model_size, device="auto", compute_type="int8_float16")
+    pipeline = BatchedInferencePipeline(model=fw_model)
     return pipeline
 
 def load_translation_model():
@@ -192,24 +201,24 @@ def load_translation_model():
     max_memory = {}
     if torch.cuda.is_available():
             max_memory[0] = torch.cuda.get_device_properties(0).total_memory * gpu_mem_fraction / (1024**3)
-    max_memory["cpu"] = psutil.virtual_memory().available * cpu_mem_fraction / (1024**3)
-    max_memory_str = {k: f"{v:.2f}GiB" for k, v in max_memory.items()}
+            max_memory["cpu"] = psutil.virtual_memory().available * cpu_mem_fraction / (1024**3)
+            max_memory_str = {k: f"{v:.2f}GiB" for k, v in max_memory.items()}
     logger.info(f"Max memory configuration for initial load: {max_memory_str}")
     
-    tokenizer = T5TokenizerFast.from_pretrained(model_name)
-    model = T5ForConditionalGeneration.from_pretrained(
+    mad_tokenizer = T5TokenizerFast.from_pretrained(model_name)
+    mad_model = T5ForConditionalGeneration.from_pretrained(
         model_name,
         #device_map="auto",
-        max_memory=max_memory_str,
+        #max_memory=max_memory_str,
         quantization_config=quantization_config,
         #torch_dtype=compute_dtype, # bf16 or fp16
         low_cpu_mem_usage=True,
     )
-    model.eval()
+    mad_model.eval()
 
-    #model = torch.compile(model, mode="max-autotune")
+    mad_model = torch.compile(mad_model, mode="max-autotune")
     
-    return model, tokenizer
+    return mad_model, mad_tokenizer
 
 def load_xtts_v2():
     """
@@ -219,16 +228,16 @@ def load_xtts_v2():
     config = XttsConfig()
     config.load_json(r"D:\alltalk_tts\models\xtts\v203\config.json")
     # 2) Modell initialisieren
-    model = Xtts.init_from_config(config)
-    model.load_checkpoint(
+    xtts_model = Xtts.init_from_config(config)
+    xtts_model.load_checkpoint(
         config,
         checkpoint_dir=r"D:\alltalk_tts\models\xtts\v203",  # Pfad anpassen
         use_deepspeed=False
     )
-    model.to(torch.device("cuda:0"))
-    model.eval()
+    xtts_model.to(torch.device("cuda:0"))
+    xtts_model.eval()
 
-    return model
+    return xtts_model
 # Context Manager für GPU-Operationen
 @contextmanager
 def gpu_context():
@@ -1296,28 +1305,28 @@ def sanitize_for_csv_and_tts(text):
         text = text.replace(old, new)
     return text
 
-BATCH_SIZE = 4  # Je nach GPU-Speicher anpassen (z. B. 4, 8 oder 16)
+BATCH_SIZE = 6  # Je nach GPU-Speicher anpassen (z. B. 4, 8 oder 16)
 
-def batch_translate(batch_texts, model, tokenizer, target_lang="de"):
+def batch_translate(batch_texts, mad_model, mad_tokenizer, target_lang="de"):
 
     #MADLAD400:
     texts = [f"<2{target_lang}> {seg['text']}" for seg in batch_texts]  # Alle Texte sammeln
     #texts = [seg['text'] for seg in segments]
 
     # ✅ Batch-Tokenization (viel schneller!)
-    inputs = tokenizer(
+    inputs = mad_tokenizer(
         texts,
         return_tensors="pt",
         padding=True,
         max_length=512,
         truncation=True,
-        ).to(model.device)  # Auf GPU verschieben, wenn verfügbar
+        ).to(mad_model.device)  # Auf GPU verschieben, wenn verfügbar
 
     with torch.no_grad():
-        outputs = model.generate(
+        outputs = mad_model.generate(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
-            pad_token_id=tokenizer.eos_token_id,
+            pad_token_id=mad_tokenizer.eos_token_id,
             num_beams=7,  
 #           repetition_penalty=1.0,
 #           length_penalty=1.0,
@@ -1328,7 +1337,7 @@ def batch_translate(batch_texts, model, tokenizer, target_lang="de"):
             max_length=150
         )
             
-        translations= tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        translations= mad_tokenizer.batch_decode(outputs, skip_special_tokens=True)
     
     return [t.strip() for t in translations]
 
@@ -1387,7 +1396,7 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
         print(f"--------------------------")
         
         print(f">>> MADLAD400-Modell wird initialisiert... <<<")
-        model, tokenizer = load_translation_model()
+        mad_model, mad_tokenizer = load_translation_model()
         print(f">>> MADLAD400-Modell initialisiert. Übersetzung startet... <<<")
         # ✅ **Batch-Verarbeitung**
         
@@ -1398,8 +1407,8 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
         def translate_batch(batch):
             batch["translation"] = batch_translate(
                 [{"text": text} for text in batch["text"]],
-                model,
-                tokenizer,
+                mad_model,
+                mad_tokenizer,
                 target_lang
             )
             return batch
@@ -2217,22 +2226,39 @@ def main():
     
     # 5) Optional: Erstellung eines Voice-Samples für die Stimmenklonung
     create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3)
-
+    
     # 6) Spracherkennung (Transkription) mit Whisper
+    step_start_time = time.time()
+    
     segments = transcribe_audio_with_timestamps(ORIGINAL_AUDIO_PATH, TRANSCRIPTION_FILE)
     if not segments:
         logger.error("Transkription fehlgeschlagen oder keine Segmente gefunden.")
         return
-
+    
+    step_end_time = time.time() - step_start_time
+    logger.info(f"Step execution time: {step_end_time:.4f} seconds")
+    print(f"{(step_end_time):.2f} Sekunden")
+    print(f"{(step_end_time / 60 ):.2f} Minuten")
+    print(f"{(step_end_time / 3600):.2f} Stunden")
+    
+    
     # 6.1) Wiederherstellung der Interpunktion
     restore_punctuation(TRANSCRIPTION_FILE, PUNCTED_TRANSCRIPTION_FILE)
 
     # 7) Übersetzung der Segmente mithilfe von MADLAD400
+    step_start_time = time.time()
+    
     translated = translate_segments(PUNCTED_TRANSCRIPTION_FILE, TRANSLATION_FILE)
     if not translated:
         logger.error("Übersetzung fehlgeschlagen oder keine Segmente vorhanden.")
         return
-
+    
+    step_end_time = time.time() - step_start_time
+    logger.info(f"Step execution time: {step_end_time:.4f} seconds")
+    print(f"{(step_end_time):.2f} Sekunden")
+    print(f"{(step_end_time / 60 ):.2f} Minuten")
+    print(f"{(step_end_time / 3600):.2f} Stunden")
+    
     restore_punctuation_de(TRANSLATION_FILE, PUNCTED_TRANSLATION_FILE)
 
     logger.info("Starte optionalen Schritt: Qualitätsprüfung der Übersetzung.")
@@ -2267,6 +2293,8 @@ def main():
     logger.info("Generierung semantischer Embeddings (optional) abgeschlossen.")
 
     # 8) Text-to-Speech (TTS) mit Stimmenklonung
+    step_start_time = time.time()
+    
     text_to_speech_with_voice_cloning(MERGED_TRANSLATION_FILE,
                                     SAMPLE_PATH_1,
                                     SAMPLE_PATH_2,
@@ -2274,13 +2302,27 @@ def main():
                                     SAMPLE_PATH_4,
                                     SAMPLE_PATH_5,
                                     TRANSLATED_AUDIO_WITH_PAUSES)
-
+    
+    step_end_time = time.time() - step_start_time
+    logger.info(f"Step execution time: {step_end_time:.4f} seconds")
+    print(f"{(step_end_time):.2f} Sekunden")
+    print(f"{(step_end_time / 60 ):.2f} Minuten")
+    print(f"{(step_end_time / 3600):.2f} Stunden")
+    
     # 9) Audio resamplen auf 44.1 kHz, Stereo (für Mixdown), inkl. separatem Lautstärke- und Geschwindigkeitsfaktor
     resample_to_44100_stereo(TRANSLATED_AUDIO_WITH_PAUSES, RESAMPLED_AUDIO_FOR_MIXDOWN, SPEED_FACTOR_RESAMPLE_44100)
 
     # 10) Wiedergabegeschwindigkeit des Videos anpassen (separater Lautstärkefaktor für Video)
+    step_start_time = time.time()
+    
     adjust_playback_speed(VIDEO_PATH, ADJUSTED_VIDEO_PATH, SPEED_FACTOR_PLAYBACK)
-
+    
+    step_end_time = time.time() - step_start_time
+    logger.info(f"Step execution time: {step_end_time:.4f} seconds")
+    print(f"{(step_end_time):.2f} Sekunden")
+    print(f"{(step_end_time / 60 ):.2f} Minuten")
+    print(f"{(step_end_time / 3600):.2f} Stunden")
+    
     # 11) Kombination von angepasstem Video und übersetztem Audio
     combine_video_audio_ffmpeg(ADJUSTED_VIDEO_PATH, RESAMPLED_AUDIO_FOR_MIXDOWN, FINAL_VIDEO_PATH)
 
