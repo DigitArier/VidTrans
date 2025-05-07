@@ -9,7 +9,7 @@ logging.basicConfig(
     filename='video_translation_final.log',
     format="%(asctime)s - %(levelname)s - %(name)s - %(funcName)s:%(lineno)d - %(message)s", # Detaillierteres Format
     level=logging.INFO,
-    filemode='a',  # 'w' zum Überschreiben bei jedem Start, 'a' zum Anhängen (Standard)
+    filemode='w',  # 'w' zum Überschreiben bei jedem Start, 'a' zum Anhängen (Standard)
     force=True     # Wichtig für Python 3.8+: Stellt sicher, dass diese Konfiguration greift
 )
 logger = logging.getLogger(__name__) # Logger für dieses Modul holen
@@ -36,7 +36,7 @@ from tokenizers.models import BPE
 import torch
 import packaging
 from torch import autocast
-torch.set_num_threads(4)
+#torch.set_num_threads(12)
 import tensor_parallel
 import deepspeed
 from deepspeed import init_inference, DeepSpeedConfig
@@ -81,6 +81,8 @@ from transformers import (
     T5ForConditionalGeneration,
     TorchAoConfig
     )
+import ctranslate2
+import transformers
 from torchao.quantization import Int8WeightOnlyConfig
 from TTS.api import TTS
 from TTS.tts.configs.xtts_config import XttsConfig
@@ -185,15 +187,22 @@ def load_translation_model():
     """
     Lädt das Madlad400-Übersetzungsmodell in 8-Bit und wrappt es für DeepSpeed-Inferenz.
     """
-    model_name = "jbochi/madlad400-7b-mt"
+    model_name = "jbochi/madlad400-10b-mt"
     # 8-Bit via BitsAndBytes für geringeren Speicher
     #compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     
     quantization_config = BitsAndBytesConfig(
-        load_in_8bit=True,
-        #llm_int8_enable_fp32_cpu_offload=True
+        load_in_4bit=True,
+        #llm_int8_enable_fp32_cpu_offload=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_storage=torch.uint8
     )
 
+#    quant_config = Int8WeightOnlyConfig(group_size=128)
+#    quantization_config = TorchAoConfig(quant_type=quant_config)
+    
     logger.info("BitsAndBytes 8-bit Konfiguration erstellt.")
     
     gpu_mem_fraction: float = 0.9 # Maybe less VRAM needed by base load if DS takes over
@@ -205,13 +214,16 @@ def load_translation_model():
             max_memory_str = {k: f"{v:.2f}GiB" for k, v in max_memory.items()}
     logger.info(f"Max memory configuration for initial load: {max_memory_str}")
     
+#    mad_model = ctranslate2.Translator(model_name)
+#    mad_tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
+    
     mad_tokenizer = T5TokenizerFast.from_pretrained(model_name)
     mad_model = T5ForConditionalGeneration.from_pretrained(
         model_name,
         #device_map="auto",
         #max_memory=max_memory_str,
         quantization_config=quantization_config,
-        #torch_dtype=compute_dtype, # bf16 or fp16
+        #torch_dtype="auto", # bf16 or fp16
         low_cpu_mem_usage=True,
     )
     mad_model.eval()
@@ -1305,7 +1317,7 @@ def sanitize_for_csv_and_tts(text):
         text = text.replace(old, new)
     return text
 
-BATCH_SIZE = 6  # Je nach GPU-Speicher anpassen (z. B. 4, 8 oder 16)
+BATCH_SIZE = 4  # Je nach GPU-Speicher anpassen (z. B. 4, 8 oder 16)
 
 def batch_translate(batch_texts, mad_model, mad_tokenizer, target_lang="de"):
 
@@ -1394,7 +1406,7 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
         print(f"--------------------------")
         print(f"|<< Starte Übersetzung >>|")
         print(f"--------------------------")
-        
+        torch.cuda.empty_cache()
         print(f">>> MADLAD400-Modell wird initialisiert... <<<")
         mad_model, mad_tokenizer = load_translation_model()
         print(f">>> MADLAD400-Modell initialisiert. Übersetzung startet... <<<")
