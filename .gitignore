@@ -2,6 +2,7 @@
 *.wav
 *.bak
 *.json
+*.opus
 /TTS/
 /rubberband-4.0.0/
 /#fertig/
