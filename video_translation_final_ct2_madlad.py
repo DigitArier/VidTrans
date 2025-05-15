@@ -34,6 +34,7 @@ from pydub import AudioSegment
 from tokenizers import Encoding, Tokenizer
 from tokenizers.models import BPE
 import packaging
+import spacy
 from torch import autocast
 #torch.set_num_threads(12)
 import tensor_parallel
@@ -54,6 +55,9 @@ import csv
 import traceback
 import psutil
 import language_tool_python
+from language_tool_python import LanguageTool
+from functools import partial
+from multiprocessing import Pool, cpu_count
 from functools import partial
 from llama_cpp import Llama
 from config import *
@@ -187,7 +191,7 @@ def load_whisper_model():
     pipeline = BatchedInferencePipeline(model=fw_model)
     return pipeline
 # Batch-Größe für die Übersetzung
-BATCH_SIZE = 4  # Anpassen je nach verfügbarem Speicher
+BATCH_SIZE = 4
 def load_translation_model(model_path=None):
     """
     Lädt das quantisierte MADLAD400-Übersetzungsmodell mit CTranslate2.
@@ -642,6 +646,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
         transcription_start_time = time.time()
         
         torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
         torch.backends.cudnn.benchmark = True  # Auto-Tuning für beste Performance
         torch.backends.cudnn.enabled = True    # cuDNN aktivieren
         with gpu_context():
@@ -649,7 +654,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
             
             segments, info = pipeline.transcribe(
                 audio_file,
-                batch_size=8,
+                batch_size=4,
                 beam_size=7,
                 patience=1.0,
                 vad_filter=True,
@@ -720,41 +725,88 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
         return []
 
 def parse_time(time_str):
-    """Konvertiert Zeitstempel (HH:MM:SS,ms oder HH:MM:SS.ms oder SS.ms) in Sekunden."""
-    if pd.isna(time_str): return None
-    time_str = str(time_str).replace(',', '.')
-    parts = time_str.split(':')
-    try:
-        if len(parts) == 3:
-            h, m, s_ms = parts
-            s, ms = (s_ms.split('.') + ['0'])[:2]
-            total_seconds = int(h) * 3600 + int(m) * 60 + int(s) + int(ms.ljust(3, '0')) / 1000.0
-        elif len(parts) == 2:
-            m, s_ms = parts
-            s, ms = (s_ms.split('.') + ['0'])[:2]
-            total_seconds = int(m) * 60 + int(s) + int(ms.ljust(3, '0')) / 1000.0
-        elif len(parts) == 1:
-            s_ms = parts[0]
-            s, ms = (s_ms.split('.') + ['0'])[:2]
-            total_seconds = float(s) + int(ms.ljust(3, '0')) / 1000.0 # float(s) erlaubt mehr Flexibilität
-        else:
-            logger.warning(f"Ungültiges Zeitformat: {time_str}")
-            return None
-        # Runde auf Millisekunden, um Gleitkomma-Ungenauigkeiten zu minimieren
-        return round(total_seconds, 3)
-    except ValueError:
-        logger.warning(f"Fehler beim Parsen der Zeit: {time_str}")
+    """Strikte Zeitanalyse ohne Millisekunden"""
+    if pd.isna(time_str) or not isinstance(time_str, str):
         return None
+    
+    # Normalisierung: Entferne Leerzeichen und überflüssige Zeichen
+    clean_str = re.sub(r"[^\d:.,]", "", time_str.strip())
+    
+    # Fall 1: HH:MM:SS
+    if match := re.match(r"^(\d+):(\d{1,2}):(\d{1,2})$", clean_str):
+        h, m, s = map(int, match.groups())
+        if m >= 60 or s >= 60:
+            raise ValueError(f"Ungültige Zeit: {time_str}")
+        return h * 3600 + m * 60 + s
+    
+    # Fall 2: MM:SS
+    if match := re.match(r"^(\d+):(\d{1,2})$", clean_str):
+        m, s = map(int, match.groups())
+        if m >= 60 or s >= 60:
+            raise ValueError(f"Ungültige Zeit: {time_str}")
+        return m * 60 + s
+    
+    # Fall 3: SS
+    if clean_str.isdigit():
+        return int(clean_str)
+    
+    return None
+
+def process_chunk(args):
+    chunk, lang, lt_config = args
+    tool = lt_config(lang)
+    
+    try:
+        # Zeitkonvertierung mit verbessertem Parsing
+        chunk['start_sec'] = chunk['startzeit'].apply(
+            lambda x: parse_time(x) or 0.0  # Fallback auf 0 bei Fehlern
+        )
+        chunk['end_sec'] = chunk['endzeit'].apply(
+            lambda x: parse_time(x) or 0.0
+        )
+        
+        # Zeitliche Konsistenzprüfung
+        invalid_times = (
+            (chunk['start_sec'] >= chunk['end_sec']) |
+            (chunk['start_sec'] < 0) |
+            (chunk['end_sec'] < 0)
+        )
+        if invalid_times.any():
+            logger.warning(f"{invalid_times.sum()} ungültige Zeitpaare gefunden, korrigiere...")
+            # Auto-Korrektur: Endzeit = Startzeit + 1s bei ungültigen Werten
+            chunk.loc[invalid_times, 'end_sec'] = chunk['start_sec'] + 1.0
+        
+        # Restliche Verarbeitung unverändert...
+        return chunk.explode('sentences')
+    
+    except Exception as e:
+        logger.error(f"Fehler in Prozess-Chunk: {e}")
+        return pd.DataFrame()
 
 def format_time(seconds):
-    """Konvertiert Sekunden in HH:MM:SS Format."""
-    if seconds is None or seconds < 0: seconds = 0
-    seconds = round(seconds, 3)
-    int_seconds = int(seconds)
-    hours = int_seconds // 3600
-    minutes = (int_seconds % 3600) // 60
-    secs = int_seconds % 60
-    return f"{hours:02d}:{minutes:02d}:{secs:02}"
+    """Konvertiert Sekunden in HH:MM:SS mit Validierung"""
+    if seconds is None or seconds < 0:
+        logger.warning("Ungültige Sekundenangabe, setze auf 0")
+        return "00:00:00"
+    
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = int(seconds % 60)
+    
+    # Overflow-Handling
+    if minutes >= 60:
+        hours += minutes // 60
+        minutes %= 60
+    
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+# === SATZSEGMENTIERUNG MIT spaCy ===
+nlp = spacy.blank('de')
+nlp.add_pipe('sentencizer')
+
+def split_sentences(text):
+    """Text in natürliche Sätze segmentieren"""
+    return [sent.text.strip() for sent in nlp(text).sents if sent.text.strip()]
 
 def split_into_sentences(text):
     """
@@ -778,6 +830,7 @@ def split_into_sentences(text):
         return [text]
     
     return sentences
+
     """
     Fragt den Benutzer, ob eine vorhandene Datei überschrieben werden soll
 
@@ -1315,6 +1368,7 @@ def correct_grammar_transcription(input_file, output_file, lang="en-US"):
 
     try:
         # LanguageTool initialisieren
+        import language_tool_python
         tool = language_tool_python.LanguageTool(lang)
         
         logger.info(f"Starte Grammatikkorrektur für Transkription in {lang}...")
@@ -1769,7 +1823,7 @@ def convert_time_to_seconds(time_str):
         except ValueError:
             return 0
 
-def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embeddings=False, embeddings_file=None):
+
     """
     Optimiert übersetzte Segmente für TTS, indem Grammatik korrigiert und sichergestellt wird, 
     dass jedes Segment als abgeschlossener Satz endet (mit Satzzeichen).
@@ -1792,7 +1846,6 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
 
     try:
         # LanguageTool initialisieren
-        import language_tool_python
         tool = language_tool_python.LanguageTool(lang)
         
         logger.info(f"Starte TTS-Formatierung für {lang}...")
@@ -2067,6 +2120,184 @@ def generate_semantic_embeddings(input_csv_path, output_npz_path, output_csv_pat
             del st_model
         torch.cuda.empty_cache()
         logger.info("Sentence Transformer Ressourcen freigegeben.")
+
+def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embeddings=False, embeddings_file=None):
+    """
+    Optimiert übersetzte Segmente für TTS, indem Grammatik korrigiert und sichergestellt wird, 
+    dass jedes Segment als abgeschlossener Satz endet (mit Satzzeichen).
+    
+    Args:
+        input_file (str): Pfad zur CSV-Datei mit den übersetzten Segmenten
+        output_file (str): Pfad zur Ausgabedatei mit formatierten Segmenten
+        lang (str): Sprachcode für LanguageTool (z.B. "de-DE")
+        use_embeddings (bool): Ob semantische Embeddings für die Analyse verwendet werden sollen
+        embeddings_file (str): Pfad zur NPZ-Datei mit Embeddings
+    
+    Returns:
+        str: Pfad zur Ausgabedatei mit formatierten Segmenten
+    """
+    # Datei-Existenzprüfung
+    if os.path.exists(output_file):
+        if not ask_overwrite(output_file):
+            logger.info(f"Verwende vorhandene Datei: {output_file}")
+            return output_file
+
+    try:
+        # LanguageTool initialisieren
+        import language_tool_python
+        tool = language_tool_python.LanguageTool(lang)
+        
+        logger.info(f"Starte TTS-Formatierung für {lang}...")
+        print("----------------------------------")
+        print("|<< Starte TTS-Formatierung >>|")
+        print("----------------------------------")
+        
+        # CSV-Datei einlesen
+        df = pd.read_csv(input_file, sep='|', dtype=str)
+        df.columns = df.columns.str.strip().str.lower()
+        
+        # Prüfen, ob erforderliche Spalten vorhanden sind
+        required_cols = ['text', 'startzeit', 'endzeit']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            logger.error(f"Fehlende Spalten in {input_file}: {', '.join(missing_cols)}")
+            return None
+        
+        # Embeddings laden, falls gewünscht (optional für semantische Analyse)
+        embeddings = None
+        if use_embeddings and embeddings_file and os.path.exists(embeddings_file):
+            try:
+                logger.info(f"Lade semantische Embeddings für Satzanalyse...")
+                embeddings_data = np.load(embeddings_file)
+                embeddings = embeddings_data['embeddings']
+            except Exception as e:
+                logger.error(f"Fehler beim Laden der Embeddings: {e}")
+                use_embeddings = False
+        
+        # Hilfsfunktion zum Überprüfen abgeschlossener Sätze
+        def is_complete_sentence(text):
+            """Prüft, ob der Text mit einem Satzendzeichen endet."""
+            if not text:
+                return False
+            # Erkennt auch Satzzeichen innerhalb von Anführungszeichen am Ende
+            return bool(re.search(r'[.!?][\"\'\)]?$', text.strip()))
+        
+        # Liste für formatierte Segmente
+        formatted_segments = []
+        total_segments = len(df)
+        split_count = 0
+        completion_count = 0
+        
+        for i, row in tqdm(df.iterrows(), total=total_segments, desc="Formatiere Segmente"):
+            # Zeiten parsen
+            start_time = parse_time(row['startzeit'])
+            end_time = parse_time(row['endzeit'])
+
+            # Strikte Validierung
+            if None in (start_time, end_time) or start_time >= end_time:
+                logger.error(f"Ungültiges Zeitintervall: {start_time} - {end_time}")
+                continue
+                
+            text = row['text'].strip()
+            
+            if not text:
+                logger.debug(f"Leeres Segment {i}, wird übersprungen.")
+                continue
+                
+            # 1. Grammatikkorrektur durchführen
+            corrected_text = tool.correct(text)
+            
+            # 2. Prüfen, ob es ein vollständiger Satz ist
+            if is_complete_sentence(corrected_text):
+                # Direktes Hinzufügen vollständiger Sätze
+                formatted_segments.append({
+                    'startzeit': row['startzeit'],
+                    'endzeit': row['endzeit'],
+                    'text': sanitize_for_csv_and_tts(corrected_text)
+                })
+            else:
+                # 3. Text in Sätze aufteilen für unvollständige Segmente
+                sentences = split_into_sentences(corrected_text)
+                
+                if not sentences:
+                    # Kein vollständiger Satz erkannt, Punkt hinzufügen
+                    completion_count += 1
+                    corrected_text = corrected_text.rstrip() + "."
+                    formatted_segments.append({
+                        'startzeit': row['startzeit'],
+                        'endzeit': row['endzeit'],
+                        'text': sanitize_for_csv_and_tts(corrected_text)
+                    })
+                elif len(sentences) == 1:
+                    # Ein Satz erkannt, aber möglicherweise nicht vollständig
+                    sentence = sentences[0]
+                    if not is_complete_sentence(sentence):
+                        completion_count += 1
+                        sentence = sentence.rstrip() + "."
+                        
+                    formatted_segments.append({
+                        'startzeit': row['startzeit'],
+                        'endzeit': row['endzeit'],
+                        'text': sanitize_for_csv_and_tts(sentence)
+                    })
+                else:
+                    # Mehrere Sätze erkannt, verteile auf neue Segmente
+                    split_count += 1
+                    
+                    # Zeitdauer proportional zur Textlänge aufteilen
+                    total_chars = sum(len(s) for s in sentences)
+                    if total_chars == 0:
+                        logger.warning("Leerer Text, überspringe Segment")
+                        continue
+                    segment_duration = end_time - start_time
+                    
+                    current_start = start_time
+                    
+                    for j, sentence in enumerate(sentences):
+                        # Proportionale Zeitaufteilung
+                        char_proportion = len(sentence) / total_chars
+                        this_duration = segment_duration * char_proportion
+                        
+                        # Letztes Segment bekommt exakt die Endzeit
+                        segment_end = end_time if j == len(sentences) - 1 else current_start + this_duration
+                            
+                        # Sicherstellen, dass jeder Satz vollständig ist
+                        if not is_complete_sentence(sentence):
+                            completion_count += 1
+                            sentence = sentence.rstrip() + "."
+                            
+                        formatted_segments.append({
+                            'startzeit': format_time(current_start),
+                            'endzeit': format_time(segment_end),
+                            'text': sanitize_for_csv_and_tts(sentence)
+                        })
+                        
+                        current_start = segment_end
+        
+        # Ergebnisse in DataFrame konvertieren und speichern
+        if formatted_segments:
+            result_df = pd.DataFrame(formatted_segments)
+            result_df.to_csv(output_file, sep='|', index=False, encoding='utf-8')
+            
+            logger.info(f"TTS-Formatierung abgeschlossen: {len(formatted_segments)} Segmente erzeugt.")
+            print(f"Ergebnis: {len(formatted_segments)} formatierte Segmente")
+            print(f"  - {split_count} Segmente wurden in mehrere Sätze aufgeteilt")
+            print(f"  - {completion_count} unvollständigen Sätzen wurde ein Satzzeichen hinzugefügt")
+            print("----------------------------------")
+            
+            return output_file
+        else:
+            logger.warning("Keine formatierten Segmente erstellt.")
+            return input_file
+            
+    except ImportError:
+        logger.error("language_tool_python nicht installiert. Bitte installieren Sie es mit 'pip install language-tool-python'.")
+        return input_file
+    except Exception as e:
+        logger.error(f"Fehler bei der TTS-Formatierung: {e}", exc_info=True)
+        traceback.print_exc()
+        return input_file
+
 # Synthetisieren
 def text_to_speech_with_voice_cloning(translation_file,
                                     sample_path_1,
@@ -2087,6 +2318,7 @@ def text_to_speech_with_voice_cloning(translation_file,
     """
     # Speicher-Cache für effizientere Allokation
     torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
     
     if os.path.exists(output_path):
         if not ask_overwrite(output_path):
@@ -2151,7 +2383,7 @@ def text_to_speech_with_voice_cloning(translation_file,
         # WICHTIG: Gib das Basismodell frei, wenn es nicht mehr gebraucht wird (optional, DS behält Referenz)
         del base_model
         torch.cuda.empty_cache()
-
+        torch.cuda.reset_peak_memory_stats()
 
         # --- Schritt 4: Lese Daten und führe TTS-Loop mit optimiertem Modell aus ---
         # CSV-Datei einlesen und Texte extrahieren
@@ -2208,8 +2440,8 @@ def text_to_speech_with_voice_cloning(translation_file,
                         temperature=0.7,
                         repetition_penalty=5.0,
                         enable_text_splitting=False,
-                        top_k=60,
-                        top_p=0.7
+                        top_k=70,
+                        top_p=0.75
                     )
                     batch_results.append(result)
             
