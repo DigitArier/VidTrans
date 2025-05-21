@@ -197,54 +197,42 @@ def load_whisper_model():
 BATCH_SIZE = 6
 def load_translation_model(model_path=None):
     """
-    Lädt das quantisierte MADLAD400-Übersetzungsmodell mit CTranslate2.
+    Lädt das MarianMT-Übersetzungsmodell für die Verwendung auf der GPU oder CPU.
     
     Args:
-        model_path: Pfad zum quantisierten Modell. Wenn None, wird das Modell heruntergeladen.
+        model_path: Pfad zum Modell. Wenn None, wird ein Standardmodell geladen.
     
     Returns:
-        Ein Tuple mit Translator und Tokenizer
+        Ein Tuple mit Modell und Tokenizer.
     """
-    # Falls kein Modellpfad angegeben, prüfe lokalen Pfad oder lade von HuggingFace
+    # Standardmodell für Englisch nach Deutsch, falls kein Pfad angegeben
     if model_path is None:
-        model_path = "madlad400-10b-mt-ct2-int8_float32"
-        
-        # Prüfe, ob das Modell lokal vorhanden ist
-        if not os.path.exists(model_path):
-            logger.info(f"Quantisiertes Modell nicht lokal gefunden. Versuche es von HuggingFace zu laden...")
-            from huggingface_hub import snapshot_download
-            try:
-                # Alternative: Ein bereits quantisiertes Modell herunterladen
-                model_path = snapshot_download("Nextcloud-AI/madlad400-10b-mt-ct2-int8_float32")
-                logger.info(f"Modell von HuggingFace heruntergeladen nach: {model_path}")
-            except Exception as e:
-                logger.error(f"Fehler beim Herunterladen des quantisierten Modells: {e}")
-                logger.info("Bitte stellen Sie sicher, dass Sie das Modell bereits quantisiert haben.")
-                raise
+        model_path = "Helsinki-NLP/opus-mt-en-de"
     
-    logger.info(f"Lade CTranslate2 Translator von {model_path}...")
+    logger.info(f"Lade MarianMT-Modell von {model_path}...")
+    
+    # Gerät bestimmen (GPU bevorzugt)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Verwende Gerät: {device}")
+    
+    # Speicher freigeben, um Platz für das Modell zu schaffen
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-
-    # Gerät bestimmen
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    compute_type = "float32"  # Automatisch den besten verfügbaren Berechnungstyp auswählen
     
-    # CTranslate2 Translator laden
-    translator = ctranslate2.Translator(
-        model_path, 
-        device="cpu",
-        compute_type=compute_type,
-        inter_threads=10,  # Parallelisierung für mehrere Eingaben
-        intra_threads=os.cpu_count()//2  # Parallelisierung innerhalb einer Eingabe
-    )
-    
-    # Original-Tokenizer laden (nötig für Tokenisierung/Detokenisierung)
-    # Der Tokenizer sollte aus demselben Verzeichnis geladen werden
-    tokenizer = transformers.T5TokenizerFast.from_pretrained(model_path)
-    
-    logger.info(f"CTranslate2 Translator geladen (Gerät: {device}, Compute-Typ: {compute_type})")
-    return translator, tokenizer
+    try:
+        # Tokenizer und Modell laden
+        tokenizer = MarianTokenizer.from_pretrained(model_path)
+        model = MarianMTModel.from_pretrained(model_path)
+        
+        # Modell auf das entsprechende Gerät verschieben
+        model.to(device)
+        model.eval()  # Inferenzmodus aktivieren
+        
+        logger.info(f"MarianMT-Modell erfolgreich geladen auf {device}.")
+        return model, tokenizer
+    except Exception as e:
+        logger.error(f"Fehler beim Laden des MarianMT-Modells: {e}")
+        raise
 
 def load_xtts_v2():
     """
@@ -1469,67 +1457,66 @@ def safe_encode(text):
     fixed = fix_encoding(text)  
     return fixed.encode('utf-8', 'replace').decode('utf-8') 
 # Übersetzen
-def batch_translate(batch_texts, translator, tokenizer, target_lang):
+def batch_translate(batch_texts, model, tokenizer, target_lang):
     """
-    Übersetzt einen Batch von Texten mit CTranslate2.
+    Übersetzt einen Batch von Texten mit dem MarianMT-Modell.
     
     Args:
-        batch_texts: Liste von Dictionaries mit 'text'-Schlüssel
-        translator: CTranslate2-Translator-Instanz
-        tokenizer: Der HuggingFace-Tokenizer für Tokenisierung/Detokenisierung
-        target_lang: Zielsprache-Code (z.B. 'de' für Deutsch)
+        batch_texts: Liste von Dictionaries mit 'text'-Schlüssel.
+        model: MarianMT-Modell für die Übersetzung.
+        tokenizer: Tokenizer für das MarianMT-Modell.
+        target_lang: Zielsprache-Code (z.B. 'de' für Deutsch).
     
     Returns:
-        Liste von übersetzten Texten
+        Liste von übersetzten Texten.
     """
     try:
-        # Batch-Verarbeitung vorbereiten
+        # Extrahiere die Texte aus dem Batch
         source_texts = []
         for item in batch_texts:
             text = item['text'].strip() if isinstance(item, dict) and 'text' in item else str(item).strip()
-            # Sprachpräfix für jedes Segment hinzufügen
-            fixed = ftfy.fix_text(text)
-            prefixed_text = f"<2{target_lang}> {fixed}"
-            source_texts.append(prefixed_text)
+            source_texts.append(text)
         
-        # Tokenisiere alle Texte auf einmal
-        all_tokens = []
-        for text in source_texts:
-            # Texte zu Token-IDs und dann zu Token-Strings umwandeln (CT2-Anforderung)
-            tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(text))
-            all_tokens.append(tokens)
+        # Tokenisiere die Eingabetexte
+        inputs = tokenizer(source_texts, return_tensors="pt", padding=True, truncation=True, max_length=512)
         
-        # Batch-Übersetzung durchführen
-        results = translator.translate_batch(
-            all_tokens,
-            batch_type="tokens",
-            max_batch_size=1024,  # Anpassen je nach verfügbarem Speicher
-            beam_size=6,          # Anpassen nach Qualität/Geschwindigkeit
-            patience=1.2,         # Geduld für Beam-Search
-            num_hypotheses=1,     # Anzahl der zu generierenden Hypothesen
-            repetition_penalty=2.0,
-            no_repeat_ngram_size=3
-        )
+        # Verschiebe die Eingaben auf das gleiche Gerät wie das Modell
+        device = model.device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
         
-        # Ergebnisse verarbeiten
-        translations = []
-        for i, result in enumerate(results):
-            output_tokens = result.hypotheses[0]  # Erste (beste) Hypothese
-            # Tokens zu IDs und dann zu Text dekodieren
-            output_ids = tokenizer.convert_tokens_to_ids(output_tokens)
-            translated_text = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
-            translations.append(translated_text)
+        # Führe die Übersetzung durch
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_length=512,
+                num_beams=8,
+                early_stopping=True
+                )
         
+        # Dekodiere die Ausgaben
+        translations = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        
+        logger.info(f"Batch mit {len(translations)} Texten erfolgreich übersetzt.")
         return translations
     
     except Exception as e:
-        logger.error(f"Fehler bei der Batch-Übersetzung: {e}", exc_info=True)
+        logger.error(f"Fehler bei der Batch-Übersetzung mit MarianMT: {e}", exc_info=True)
         # Fallback: Leere Strings zurückgeben
         return ["" for _ in range(len(batch_texts))]
 
 def translate_segments(transcription_file, translation_file, source_lang="en", target_lang="de"):
-    """Übersetzt die bereits transkribierten Segmente mithilfe des quantisierten MADLAD400-Modells."""
+    """
+    Übersetzt die bereits transkribierten Segmente mithilfe des MarianMT-Modells.
     
+    Args:
+        transcription_file: Pfad zur Datei mit den transkribierten Segmenten.
+        translation_file: Pfad zur Ausgabedatei für die Übersetzungen.
+        source_lang: Quellsprache (z.B. 'en').
+        target_lang: Zielsprache (z.B. 'de').
+    
+    Returns:
+        Dictionary mit den Übersetzungen.
+    """
     existing_translations = {}  # Zwischenspeicher für bereits gespeicherte Übersetzungen
     end_times = {}  # Speichert Endzeiten für jeden Startpunkt
     
@@ -1548,9 +1535,9 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
                             end_times[row[0]] = row[1]
                 except StopIteration:
                     pass  # Datei ist leer oder nur Header
-            return existing_translations  # ⬅️ Sofortiger Exit, keine neue Übersetzung
+            return existing_translations  # Sofortiger Exit, keine neue Übersetzung
         else:
-            logger.info(f"Starte neue Übersetzung, vorhandene Datei wird ignoriert: {translation_file}")
+            logger.info(f"Starte neue Übersetzung, vorhandene Datei wird überschrieben: {translation_file}")
     
     try:
         # CSV-Datei mit Transkriptionen einlesen
@@ -1581,9 +1568,9 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        print(f">>> CTranslate2-Modell wird initialisiert... <<<")
-        translator, tokenizer = load_translation_model()
-        print(f">>> CTranslate2-Modell initialisiert. Übersetzung startet... <<<")
+        print(f">>> MarianMT-Modell wird initialisiert... <<<")
+        model, tokenizer = load_translation_model()
+        print(f">>> MarianMT-Modell initialisiert. Übersetzung startet... <<<")
         
         # Segmente in Batches aufteilen
         segment_batches = [segments[i:i+BATCH_SIZE] for i in range(0, len(segments), BATCH_SIZE)]
@@ -1594,7 +1581,7 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
             print(f"Verarbeite Batch {batch_idx+1}/{len(segment_batches)} ({len(batch)} Segmente)...")
 
             # Batch übersetzen
-            translations = batch_translate(batch, translator, tokenizer, target_lang)
+            translations = batch_translate(batch, model, tokenizer, target_lang)
             
             # Übersetzungen speichern
             for i, seg in enumerate(batch):
@@ -2142,14 +2129,14 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
     dass jedes Segment als abgeschlossener Satz endet (mit Satzzeichen).
     
     Args:
-        input_file (str): Pfad zur CSV-Datei mit den übersetzten Segmenten
-        output_file (str): Pfad zur Ausgabedatei mit formatierten Segmenten
-        lang (str): Sprachcode für LanguageTool (z.B. "de-DE")
-        use_embeddings (bool): Ob semantische Embeddings für die Analyse verwendet werden sollen
-        embeddings_file (str): Pfad zur NPZ-Datei mit Embeddings
+        input_file (str): Pfad zur CSV-Datei mit den übersetzten Segmenten.
+        output_file (str): Pfad zur Ausgabedatei mit formatierten Segmenten.
+        lang (str): Sprachcode für LanguageTool (z.B. "de-DE").
+        use_embeddings (bool): Ob semantische Embeddings für die Analyse verwendet werden sollen.
+        embeddings_file (str): Pfad zur NPZ-Datei mit Embeddings.
     
     Returns:
-        str: Pfad zur Ausgabedatei mit formatierten Segmenten
+        str: Pfad zur Ausgabedatei mit formatierten Segmenten.
     """
     # Datei-Existenzprüfung
     if os.path.exists(output_file):
@@ -2158,17 +2145,16 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
             return output_file
 
     try:
-        # LanguageTool initialisieren - einmal für alle Segmente
-        import language_tool_python
+        # LanguageTool initialisieren
         tool = language_tool_python.LanguageTool(lang)
         
-        logger.info(f"Starte optimierte TTS-Formatierung für {lang}...")
+        logger.info(f"Starte TTS-Formatierung für {lang}...")
         print("----------------------------------")
         print("|<< Starte TTS-Formatierung >>|")
         print("----------------------------------")
         
-        # CSV-Datei einlesen mit expliziten Datentypen
-        df = pd.read_csv(input_file, sep='|', dtype={'startzeit': str, 'endzeit': str, 'text': str})
+        # CSV-Datei einlesen
+        df = pd.read_csv(input_file, sep='|', dtype=str)
         df.columns = df.columns.str.strip().str.lower()
         
         # Prüfen, ob erforderliche Spalten vorhanden sind
@@ -2202,21 +2188,23 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
         total_segments = len(df)
         split_count = 0
         completion_count = 0
-        
-        for row in tqdm(df.itertuples(), total=total_segments, desc="Formatiere Segmente"):
+
+        for i, row in tqdm(df.iterrows(), total=total_segments, desc="Formatiere Segmente"):
+            # Zeiten parsen
             start_time = parse_time(row.startzeit)
             end_time = parse_time(row.endzeit)
 
-            # Strikte Validierung
-            if None in (start_time, end_time) or start_time >= end_time:
-                return None
-                
+            if pd.isna(start_time) or pd.isna(end_time) or start_time >= end_time:
+                logger.warning(f"Ungültige Zeiten in Segment {i}: {row.startzeit} - {row.endzeit}")
+                continue
+
             text = row.text.strip()
-            
+
             if not text:
-                return None
+                logger.debug(f"Leeres Segment {i}, wird übersprungen.")
+                continue
                 
-            # Grammatikkorrektur durchführen
+            # 1. Grammatikkorrektur durchführen
             corrected_text = tool.correct(text)
             
             # 2. Prüfen, ob es ein vollständiger Satz ist
@@ -2258,9 +2246,6 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
                     
                     # Zeitdauer proportional zur Textlänge aufteilen
                     total_chars = sum(len(s) for s in sentences)
-                    if total_chars == 0:
-                        logger.warning("Leerer Text, überspringe Segment")
-                        continue
                     segment_duration = end_time - start_time
                     
                     current_start = start_time
@@ -2311,27 +2296,30 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
         return input_file
 
 # Synthetisieren
-def text_to_speech_with_voice_cloning(translation_file,
-                                    sample_path_1,
-                                    sample_path_2,
-                                    #sample_path_3,
-                                    #sample_path_4,
-                                    #sample_path_5,
-                                    output_path,
-                                    batch_size=8):
+def text_to_speech_with_voice_cloning(
+    translation_file,
+    sample_path_1,
+    sample_path_2,
+    sample_path_3,
+    sample_path_4,
+    #sample_path_5,
+    output_path,
+    batch_size=8
+):
     """
-    Optimierte Text-to-Speech-Funktion mit Voice Cloning und verschiedenen Beschleunigung
+    Optimiert Text-to-Speech mit Voice Cloning und verschiedenen Beschleunigungen.
+
     Args:
-    translation_file: Pfad zur CSV-Datei mit übersetzten Texten
-    sample_paths: Liste mit Pfaden zu Sprachbeispielen für die Stimmenklonung
-    output_path: Ausgabepfad für die generierte Audiodatei
-    use_onnx: ONNX-Beschleunigung aktivieren (falls verfügbar)
-    batch_size: Größe des Batches für parallele Verarbeitung
+        translation_file: Pfad zur CSV-Datei mit übersetzten Texten.
+        sample_path_1, sample_path_2: Pfade zu Sprachbeispielen für die Stimmenklonung.
+        output_path: Ausgabepfad für die generierte Audiodatei.
+        batch_size: Größe des Batches für parallele Verarbeitung.
     """
-    # Speicher-Cache für effizientere Allokation
+    # Speicher freigeben, um Platz für das TTS-Modell zu schaffen
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     
+    # Überprüfen, ob die Ausgabedatei bereits existiert und ob sie überschrieben werden soll
     if os.path.exists(output_path):
         if not ask_overwrite(output_path):
             logger.info(f"TTS-Audio bereits vorhanden: {output_path}")
@@ -2344,61 +2332,50 @@ def text_to_speech_with_voice_cloning(translation_file,
 
         tts_start_time = time.time()
 
-        use_half_precision = False
-        # 1. GPU-Optimierungen aktivieren
+        # GPU-Optimierungen aktivieren für maximale Leistung
         cuda_stream = setup_gpu_optimization()
         
-        # 2. Modell laden und auf GPU verschieben
-        
+        # TTS-Modell laden und auf GPU verschieben
         print(f"TTS-Modell wird initialisiert...")
-        base_model=load_xtts_v2()
+        base_model = load_xtts_v2()
+        
+        # Bedingungen für die Stimme (Latent und Embedding) aus den Sprachbeispielen generieren
         with torch.cuda.stream(cuda_stream), torch.inference_mode():
             sample_paths = [
                 sample_path_1,
                 sample_path_2,
-                #sample_path_3,
-                #sample_path_4,
+                sample_path_3,
+                sample_path_4,
                 #sample_path_5
-                ]
-            
-            # Konsistenter Kontext für Mixed-Precision
-            with torch.inference_mode():
-                gpt_cond_latent, speaker_embedding = base_model.get_conditioning_latents(
-                    sound_norm_refs=False,
-                    audio_path=sample_paths,
-                    load_sr=22050,
-                )
+            ]
+            gpt_cond_latent, speaker_embedding = base_model.get_conditioning_latents(
+                sound_norm_refs=False,
+                audio_path=sample_paths,
+                load_sr=22050,
+            )
 
-        # --- Schritt 3: Initialisiere DeepSpeed Inference mit dem Basismodell ---
+        # DeepSpeed Inference für TTS initialisieren
         print(f"Initialisiere DeepSpeed Inference für TTS...")
-        # Aktualisierte Parameter für init_inference
         ds_config = {
-            "enable_cuda_graph": False, # CUDA Graphs sind bei variabler Inputlänge (Text) oft schwierig
-            "dtype": torch.float32,     # Wie im Originalcode
-            "replace_with_kernel_inject": True # Beibehalten
-            # "tensor_parallel": {"tp_size": 1} # Neuer Weg, mp_size zu setzen
-            # mp_size ist veraltet, aber vielleicht funktioniert es noch
+            "enable_cuda_graph": False,  # CUDA Graphs sind bei variabler Inputlänge schwierig
+            "dtype": torch.float32,      # Float32 für Kompatibilität
+            "replace_with_kernel_inject": True  # Optimierung für Inferenz
         }
-        # Entferne veraltete Parameter direkt im Aufruf
         ds_engine = deepspeed.init_inference(
             model=base_model,
-            # mp_size=1, # Veraltet
-            tensor_parallel={"tp_size": 1}, # Neuer Weg
+            tensor_parallel={"tp_size": 1},  # Tensor-Parallelismus auf 1 setzen
             dtype=torch.float32,
-            # replace_method="auto", # Veraltet und entfernt
             replace_with_kernel_inject=True,
-            # config=ds_config # Optional: Wenn mehr Konfig benötigt wird
         )
-        # Das optimierte Modell für die Inferenz
         optimized_tts_model = ds_engine.module
         logger.info("DeepSpeed Inference für TTS initialisiert.")
-        # WICHTIG: Gib das Basismodell frei, wenn es nicht mehr gebraucht wird (optional, DS behält Referenz)
+        
+        # Basismodell freigeben, um Speicher zu sparen
         del base_model
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        # --- Schritt 4: Lese Daten und führe TTS-Loop mit optimiertem Modell aus ---
-        # CSV-Datei einlesen und Texte extrahieren
+        # CSV-Datei mit übersetzten Texten einlesen
         all_texts = []
         timestamps = []
         with open(translation_file, mode="r", encoding="utf-8", errors="replace") as f:
@@ -2407,25 +2384,23 @@ def text_to_speech_with_voice_cloning(translation_file,
             for row in reader:
                 if len(row) < 3:
                     continue
-                
-                # Extrahiere Startzeit, Endzeit und Text
+                # Start- und Endzeit in Sekunden umwandeln
                 start = convert_time_to_seconds(row[0])
                 end = convert_time_to_seconds(row[1])
                 text = row[2].strip()
-
                 all_texts.append(text)
                 timestamps.append((start, end))
         
-        # Batches erstellen
+        # Batches für die parallele Verarbeitung erstellen
         batches = [all_texts[i:i+batch_size] for i in range(0, len(all_texts), batch_size)]
         timestamp_batches = [timestamps[i:i+batch_size] for i in range(0, len(timestamps), batch_size)]
         
-        # Maximale Audiolänge schätzen (für effiziente Vorallokation)
+        # Maximale Audiolänge schätzen für effiziente Vorallokation
         sampling_rate = 24000
         max_length_seconds = timestamps[-1][1] if timestamps else 0
         max_audio_length = int(max_length_seconds * sampling_rate) + 100000  # Sicherheitspuffer
         
-        # Audio-Array vorallozieren (effizienter als np.concatenate)
+        # Audio-Array vorallozieren für effiziente Zusammenführung
         final_audio = np.zeros(max_audio_length, dtype=np.float32)
         current_position_samples = 0
         
@@ -2435,29 +2410,25 @@ def text_to_speech_with_voice_cloning(translation_file,
             print(f"Verarbeite Batch {batch_idx+1}/{len(batches)}...")
             
             batch_results = []
-
-            # Mixed-Precision Inferenz
+            # Inferenz mit optimiertem Modell durchführen
             with torch.cuda.stream(cuda_stream), torch.inference_mode():
                 for text in text_batch:
-                    text
-                        
                     result = optimized_tts_model.inference(
                         gpt_cond_latent=gpt_cond_latent,
                         speaker_embedding=speaker_embedding,
                         text=text,
-                        language="de",
-                        # Optimierte Parameter
-                        length_penalty=1.0,
-                        speed=0.85,
-                        temperature=0.9,
-                        repetition_penalty=10.0,
-                        enable_text_splitting=False,
-                        top_k=60,
-                        top_p=0.9
+                        language="de",  # Sprache auf Deutsch setzen, passend zu MarianMT-Übersetzung
+                        length_penalty=1.2,  # Strafe für Länge der Ausgabe
+                        speed=0.85,  # Geschwindigkeit der Stimme anpassen
+                        temperature=0.9,  # Temperatur für Zufälligkeit der Ausgabe
+                        repetition_penalty=10.0,  # Strafe für Wiederholungen
+                        enable_text_splitting=False,  # Textaufteilung deaktivieren
+                        top_k=65,  # Top-K-Sampling für Qualität
+                        top_p=0.95  # Top-P-Sampling für Qualität
                     )
                     batch_results.append(result)
             
-            # Effiziente Audio-Zusammenführung
+            # Audioergebnisse in das finale Array einfügen
             for i, (result, (start, end)) in enumerate(zip(batch_results, time_batch)):
                 audio_clip = result.get("wav", np.zeros(1000, dtype=np.float32))
                 audio_clip = np.array(audio_clip, dtype=np.float32).squeeze()
@@ -2480,24 +2451,25 @@ def text_to_speech_with_voice_cloning(translation_file,
                 # Position aktualisieren
                 current_position_samples = end_pos_samples
 
-            # Final audio auf tatsächlich verwendete Länge trimmen
+            # Finales Audio auf tatsächlich verwendete Länge trimmen
             final_audio = final_audio[:current_position_samples]
             batch_end_time = time.time() - batch_start_time
             print(f"Batch {batch_idx+1}/{len(batches)} in {batch_end_time:.2f} Sekunden verarbeitet.")
-
-        # 10. Audio-Nachbearbeitung
+        
+        # Audio-Nachbearbeitung, falls kein Audio generiert wurde
         if len(final_audio) == 0:
             print("Kein Audio - Datei leer!")
             final_audio = np.zeros((1, 1000), dtype=np.float32)
                 
-        # 🔽 GLOBALE NORMALISIERUNG DES GESAMTEN AUDIOS
+        # Globale Normalisierung des gesamten Audios
         final_audio /= np.max(np.abs(final_audio)) + 1e-8  # Einheitliche Lautstärke
-        final_audio = final_audio.astype(np.float32)                                    # In float32 konvertieren
+        final_audio = final_audio.astype(np.float32)  # In float32 konvertieren
         
         # Für torchaudio.save formatieren
         if final_audio.ndim == 1:
             final_audio = final_audio.reshape(1, -1)
         
+        # Audio speichern
         torchaudio.save(output_path, torch.from_numpy(final_audio), sampling_rate)
         
         print(f"---------------------------")
@@ -2512,7 +2484,7 @@ def text_to_speech_with_voice_cloning(translation_file,
 
         logger.info(f"TTS-Audio mit geklonter Stimme erstellt: {output_path}")
     except Exception as e:
-        logger.error(f"Fehler: {str(e)}")
+        logger.error(f"Fehler bei der TTS-Synthese: {str(e)}")
         raise
 
 class nullcontext:
@@ -2852,8 +2824,8 @@ def main():
     text_to_speech_with_voice_cloning(MERGED_TRANSLATION_FILE,
                                     SAMPLE_PATH_1,
                                     SAMPLE_PATH_2,
-                                    #SAMPLE_PATH_3,
-                                    #SAMPLE_PATH_4,
+                                    SAMPLE_PATH_3,
+                                    SAMPLE_PATH_4,
                                     #SAMPLE_PATH_5,
                                     TRANSLATED_AUDIO_WITH_PAUSES)
     
