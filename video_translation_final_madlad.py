@@ -173,12 +173,12 @@ def load_whisper_model():
     """
     model_size = "large-v3"
     # compute_type="int8_float16" nutzt INT8-Gewichte + FP16-Aktivierungen für Speed & geringen Speicher
-    fw_model = WhisperModel(model_size, device="auto", compute_type="bfloat16")
+    fw_model = WhisperModel(model_size, device="auto", compute_type="bfloat16", cpu_threads=12, local_files_only=True)
     pipeline = BatchedInferencePipeline(model=fw_model)
     return pipeline
 
 # Batch-Größe für die Übersetzung
-BATCH_SIZE = 6
+BATCH_SIZE = 4
 def load_translation_model(model_path=None):
     """
     Lädt das MADLAD400-Übersetzungsmodell für die Verwendung auf der GPU oder CPU.
@@ -199,13 +199,10 @@ def load_translation_model(model_path=None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Verwende Gerät: {device}")
     
-    num_threads=8
+    num_threads=10
     
     torch.set_num_threads(num_threads)
     logger.info(f"Setze PyTorch auf {num_threads} CPU-Threads für maximale Leistung.")
-    
-    os.environ["OMP_NUM_THREADS"] = str(num_threads)
-    logger.info(f"Setze OMP_NUM_THREADS auf {num_threads} für OpenMP-Parallelisierung.")
     
     # Speicher freigeben, um Platz für das Modell zu schaffen
     torch.cuda.empty_cache()
@@ -213,7 +210,7 @@ def load_translation_model(model_path=None):
     
     try:
         # Tokenizer und Modell laden
-        tokenizer = T5Tokenizer.from_pretrained(model_path)
+        tokenizer = T5TokenizerFast.from_pretrained(model_path)
         model = T5ForConditionalGeneration.from_pretrained(model_path)
         
         # Modell auf das entsprechende Gerät verschieben
@@ -653,22 +650,22 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
             
             segments, info = pipeline.transcribe(
                 audio_file,
-                batch_size=4,
-                beam_size=8,
-                patience=1.0,
+                batch_size=6,
+                beam_size=10,
+                patience=1.2,
                 vad_filter=True,
                 vad_parameters=vad_params,
                 #chunk_length=15,
-                compression_ratio_threshold=2.8,    # Schwellenwert für Kompressionsrate
+                #compression_ratio_threshold=2.8,    # Schwellenwert für Kompressionsrate
                 #log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
                 #no_speech_threshold=1.0,            # Schwellenwert für Stille
                 #temperature=(0.05, 0.1, 0.15, 0.2, 0.25, 0.5),      # Temperatur für Sampling
-                temperature=0.0,                  # Temperatur für Sampling
+                temperature=0.5,                  # Temperatur für Sampling
                 word_timestamps=True,               # Zeitstempel für Wörter
-                hallucination_silence_threshold=0.35,  # Schwellenwert für Halluzinationen
+                hallucination_silence_threshold=0.2,  # Schwellenwert für Halluzinationen
                 condition_on_previous_text=True,    # Bedingung an vorherigen Text
                 no_repeat_ngram_size=0,
-                repetition_penalty=1.5,
+                repetition_penalty=1.0,
                 #verbose=True,                       # Ausführliche Ausgabe
                 language="en",                       # Englische Sprache
                 #task="translate",                    # Übersetzung aktivieren
@@ -1571,8 +1568,10 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
         print(f"--------------------------")
         
         translate_start_time = time.time()
+        
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+        
         with gpu_context():
             print(f">>> MADLAD400-Modell wird initialisiert... <<<")
             model, tokenizer = load_translation_model()
@@ -1589,6 +1588,11 @@ def translate_segments(transcription_file, translation_file, source_lang="en", t
                 # Batch übersetzen
                 translations = batch_translate(batch, model, tokenizer, target_lang)
                 
+                # Übersetzungen anzeigen
+                print(f"Übersetzte Texte für Batch {batch_idx+1}:")
+                for i, seg in enumerate(batch):
+                    print(f"Segment {i+1} (Start: {seg['start_str']}): {translations[i]}")
+                    
                 # Übersetzungen speichern
                 for i, seg in enumerate(batch):
                     existing_translations[seg["start_str"]] = translations[i]
@@ -2263,7 +2267,7 @@ def text_to_speech_with_voice_cloning(
     #sample_path_4,
     #sample_path_5,
     output_path,
-    batch_size=8
+    batch_size=24
 ):
     """
     Optimiert Text-to-Speech mit Voice Cloning und verschiedenen Beschleunigungen.
@@ -2387,38 +2391,38 @@ def text_to_speech_with_voice_cloning(
                         )
                         batch_results.append(result)
             
-            # Audioergebnisse in das finale Array einfügen
-            for i, (result, (start, end)) in enumerate(zip(batch_results, time_batch)):
-                audio_clip = result.get("wav", np.zeros(1000, dtype=np.float32))
-                audio_clip = np.array(audio_clip, dtype=np.float32).squeeze()
-                
-                # Startposition in Samples berechnen
-                start_pos_samples = int(start * sampling_rate)
-                
-                # Sicherstellen, dass wir nicht rückwärts gehen
-                if start_pos_samples < current_position_samples:
-                    start_pos_samples = current_position_samples
-                
-                # Audio an der richtigen Position einfügen
-                end_pos_samples = start_pos_samples + len(audio_clip)
-                if end_pos_samples > len(final_audio):
-                    # Array bei Bedarf vergrößern
-                    final_audio = np.pad(final_audio, (0, end_pos_samples - len(final_audio)), 'constant')
-                
-                final_audio[start_pos_samples:end_pos_samples] = audio_clip
-                
-                # Position aktualisieren
-                current_position_samples = end_pos_samples
+                # Audioergebnisse in das finale Array einfügen
+                for i, (result, (start, end)) in enumerate(zip(batch_results, time_batch)):
+                    audio_clip = result.get("wav", np.zeros(1000, dtype=np.float32))
+                    audio_clip = np.array(audio_clip, dtype=np.float32).squeeze()
+                    
+                    # Startposition in Samples berechnen
+                    start_pos_samples = int(start * sampling_rate)
+                    
+                    # Sicherstellen, dass wir nicht rückwärts gehen
+                    if start_pos_samples < current_position_samples:
+                        start_pos_samples = current_position_samples
+                    
+                    # Audio an der richtigen Position einfügen
+                    end_pos_samples = start_pos_samples + len(audio_clip)
+                    if end_pos_samples > len(final_audio):
+                        # Array bei Bedarf vergrößern
+                        final_audio = np.pad(final_audio, (0, end_pos_samples - len(final_audio)), 'constant')
+                    
+                    final_audio[start_pos_samples:end_pos_samples] = audio_clip
+                    
+                    # Position aktualisieren
+                    current_position_samples = end_pos_samples
 
-            # Finales Audio auf tatsächlich verwendete Länge trimmen
-            final_audio = final_audio[:current_position_samples]
-            batch_end_time = time.time() - batch_start_time
-            print(f"Batch {batch_idx+1}/{len(batches)} in {batch_end_time:.2f} Sekunden verarbeitet.")
+                # Finales Audio auf tatsächlich verwendete Länge trimmen
+                final_audio = final_audio[:current_position_samples]
+                batch_end_time = time.time() - batch_start_time
+                print(f"Batch {batch_idx+1}/{len(batches)} in {batch_end_time:.2f} Sekunden verarbeitet.")
         
-        # Audio-Nachbearbeitung, falls kein Audio generiert wurde
-        if len(final_audio) == 0:
-            print("Kein Audio - Datei leer!")
-            final_audio = np.zeros((1, 1000), dtype=np.float32)
+            # Audio-Nachbearbeitung, falls kein Audio generiert wurde
+            if len(final_audio) == 0:
+                print("Kein Audio - Datei leer!")
+                final_audio = np.zeros((1, 1000), dtype=np.float32)
                 
         # Globale Normalisierung des gesamten Audios
         final_audio /= np.max(np.abs(final_audio)) + 1e-8  # Einheitliche Lautstärke
