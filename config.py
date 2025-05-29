@@ -1,6 +1,6 @@
 # Dateipfade
-VIDEO_PATH = "Doctor Dies, Sees Future, Beings, & Says I am not Freaking You Out_Full-HD.mp4"
-FINAL_VIDEO_PATH = "Doctor Dies, Sees Future, Beings, & Says I am not Freaking You Out_Full-HD_203_deutsch.mp4"
+VIDEO_PATH = "The Most Twisted DXM Stories In Existence_HD.mp4"
+FINAL_VIDEO_PATH = "The Most Twisted DXM Stories In Existence_HD_deutsch.mp4"
 ORIGINAL_AUDIO_PATH = "original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
@@ -12,7 +12,7 @@ SAMPLE_PATH_3 = "JRE_sample-03.wav"
 SPEECH_TIMESTAMPS = "speech_timestamps.json"
 DOWNSAMPLED_AUDIO_PATH = "downsampled_audio.wav"
 ONLY_SPEECH = "only_speech.wav"
-SAMPLING_RATE_VAD = 16000
+SAMPLING_RATE_VAD = 16000   
 #Transkription
 TRANSCRIPTION_FILE = "transcription.csv"
 MERGED_TRANSCRIPTION_FILE = "merged_transcription.csv"
