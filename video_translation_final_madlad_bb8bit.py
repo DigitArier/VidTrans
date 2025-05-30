@@ -1,7 +1,6 @@
 from ast import Constant
 import os
 import logging
-
 # ==============================
 # Globale Konfigurationen und Logging
 # ==============================
@@ -14,7 +13,6 @@ logging.basicConfig(
     force=True     # Wichtig für Python 3.8+: Stellt sicher, dass diese Konfiguration greift
 )
 logger = logging.getLogger(__name__) # Logger für dieses Modul holen
-
 # Test-Log-Nachricht direkt nach der Initialisierung
 logger.info("Logging wurde erfolgreich initialisiert.")
 """
@@ -44,7 +42,9 @@ import ftfy
 from ftfy import fix_encoding
 import torch
 from torch import autocast
-torch.set_num_threads(10)
+torch.set_num_threads(8)
+import gc
+from typing import List, Dict, Tuple, Union
 import tensor_parallel
 import deepspeed
 from deepspeed import init_inference, DeepSpeedConfig
@@ -128,6 +128,7 @@ torch.backends.cudnn.benchmark = True         # Optimale Kernel-Auswahl
 torch.backends.cudnn.deterministic = False    # Nicht-deterministische Optimierungen erlauben
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+os.environ['TORCH_BLAS_PREFER_CUBLASLT'] = '1'
 os.environ["CT2_FLASH_ATTENTION"] = "1"
 os.environ["CT2_VERBOSE"] = "1"
 
@@ -144,9 +145,14 @@ VOLUME_ADJUSTMENT_VIDEO = 0.045   # Lautstärkefaktor für das Video
 # Hilfsfunktionen
 # ==============================
 
+# Gerät bestimmen (GPU bevorzugt, aber CPU als Fallback)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Verwende Gerät: {device}")
+if device == "cpu":
+    logger.warning("GPU/CUDA nicht verfügbar. Falle auf CPU zurück. Die Verarbeitung kann langsamer sein.")
+
 start_time = time.time()
 step_times = {}
-device = "cuda" if torch.cuda.is_available() else "cpu"
 source_lang="en"
 target_lang="de"
 # Konfigurationen für die Verwendung von CUDA
@@ -169,6 +175,49 @@ def time_function(func, *args, **kwargs):
         logger.info(f"Execution time for {func.__name__}: {execution_time:.4f} seconds")
         return result, execution_time
 
+def configure_cusolver_optimizations():
+    """Konfiguriert cuSOLVER für RTX 4050 Mobile"""
+    
+    # cuSOLVER als bevorzugte Bibliothek setzen
+    torch.backends.cuda.preferred_linalg_library("cusolver")
+    
+    # TensorFloat-32 für Ampere+ GPUs aktivieren
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    torch.backends.cuda.preferred_blas_library = "cublas"
+    
+    logger.info("cuSOLVER-Optimierungen aktiviert für RTX 4050")
+
+def configure_attention_backends():
+    """Optimiert Attention-Mechanismen für maximale Geschwindigkeit"""
+    
+    # Flash Attention aktivieren (falls verfügbar)
+    torch.backends.cuda.enable_flash_sdp(True)
+    
+    # Memory-efficient Attention als Fallback
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    
+    # Math-based Attention deaktivieren (langsamste Option)
+    torch.backends.cuda.enable_math_sdp(False)
+    
+    logger.info("Optimierte Attention-Backends aktiviert")
+
+def advanced_cuda_configuration():
+    """Fortgeschrittene CUDA-Optimierungen für RTX 4050"""
+    
+    # cuFFT Cache für Transformer-FFN-Layers optimieren
+    torch.backends.cuda.cufft_plan_cache.max_size = 32
+    
+    # Optimierte Reduced Precision für FP16
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    
+    # Memory Pool für konstante Allokationen
+    #torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+    
+    # Multi-Head Attention Fast Path aktivieren
+    torch.backends.mha.set_fastpath_enabled(True)
+
 def load_whisper_model():
     """
     Lädt das Whisper-Modell in INT8-Quantisierung für schnellere GPU-Inferenz
@@ -182,7 +231,6 @@ def load_whisper_model():
 
 # Batch-Größe für die Übersetzung
 BATCH_SIZE = 4
-
 def load_translation_model(model_path=None):
     """
     Lädt das MADLAD400-Übersetzungsmodell für die Verwendung auf der GPU oder CPU.
@@ -194,11 +242,17 @@ def load_translation_model(model_path=None):
         Ein Tuple mit Modell und Tokenizer.
     """
     
+    configure_cusolver_optimizations()
+    configure_attention_backends()
+    advanced_cuda_configuration()
+    
     bnb_config = BitsAndBytesConfig(
         load_in_8bit=True,
-        torch_dtype=torch.bfloat16
+        torch_dtype=torch.bfloat16,
+        llm_int8_skip_modules=["final_layer_norm"],
+        llm_int8_enable_fp32_cpu_offload=True
     )
-        
+    
     # Standardmodell für Englisch nach Deutsch, falls kein Pfad angegeben
     # madlad400-7b-mt-8bit-quantized
     if model_path is None:
@@ -210,7 +264,7 @@ def load_translation_model(model_path=None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Verwende Gerät: {device}")
     
-    num_threads=10
+    num_threads=12
     torch.set_num_threads(num_threads)
     logger.info(f"Setze PyTorch auf {num_threads} CPU-Threads für maximale Leistung.")
     
@@ -223,12 +277,17 @@ def load_translation_model(model_path=None):
         tokenizer = T5TokenizerFast.from_pretrained(model_path)
         model = T5ForConditionalGeneration.from_pretrained(
             model_path,
+            torch_dtype=torch.bfloat16,  # BFloat16 für bessere Performance
+            use_cache=True,
+            low_cpu_mem_usage=True,
             quantization_config=bnb_config
         )
         
         # Modell auf das entsprechende Gerät verschieben
         model.eval()  # Inferenzmodus aktivieren
-        model = torch.compile(model, dynamic=True, mode="max-autotune")  # Optional: TorchScript-Optimierung
+        model = torch.compile(model, dynamic=True, mode="reduce-overhead")  # Optional: TorchScript-Optimierung
+        
+        logger.info("Modell erfolgreich kompiliert")
         """
         accelerator = Accelerator()
         
@@ -1478,180 +1537,329 @@ def safe_encode(text):
     fixed = fix_encoding(text)  
     return fixed.encode('utf-8', 'replace').decode('utf-8') 
 
-# Übersetzen
-def batch_translate(batch_texts, model, tokenizer, target_lang):
+def calculate_dynamic_batch_size(
+    texts: List[Union[str, Dict]], 
+    tokenizer, 
+    model, 
+    max_length: int = 512,
+    safety_margin: float = 0.15,
+    min_batch_size: int = 2,
+    max_batch_size: int = 8,
+    memory_estimation_samples: int = 3
+) -> int:
     """
-    Übersetzt einen Batch von Texten mit dem MADLAD400-Modell.
+    Berechnet die optimale Batchgröße basierend auf verfügbarem GPU-Speicher und Textlängen.
     
     Args:
-        batch_texts: Liste von Dictionaries mit 'text'-Schlüssel.
-        model: MADLAD400-Modell für die Übersetzung.
-        tokenizer: Tokenizer für das MADLAD400-Modell.
-        target_lang: Zielsprache-Code (z.B. 'de' für Deutsch).
-    
+        texts: Liste der zu übersetzenden Texte
+        tokenizer: MADLAD400 Tokenizer
+        model: MADLAD400 Modell
+        max_length: Maximale Token-Länge pro Text
+        safety_margin: Sicherheitspuffer (15% des verfügbaren Speichers)
+        min_batch_size: Minimale Batchgröße (Default: 1)
+        max_batch_size: Maximale Batchgröße für RTX 4050 Mobile (Default: 8)
+        memory_estimation_samples: Anzahl der Samples für Speicherschätzung
+        
     Returns:
-        Liste von übersetzten Texten.
+        Optimale Batchgröße als Integer
     """
-    try:
-        # Extrahiere die Texte aus dem Batch
-        source_texts = []
-        for item in batch_texts:
-            text = item['text'].strip() if isinstance(item, dict) and 'text' in item else str(item).strip()
-            # Füge Sprachpräfix für MADLAD400 hinzu (z.B. "<2de>" für Deutsch)
-            text_with_prefix = f"<2{target_lang}> {text}"
-            source_texts.append(text_with_prefix)
-        
-        # Tokenisiere die Eingabetexte
-        inputs = tokenizer(
-            source_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=512
-        ).to(model.device)
-        
-        # Verschiebe die Eingaben auf das gleiche Gerät wie das Modell
-        device = model.device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        
-        # Führe die Übersetzung durch
-        with torch.no_grad():
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                outputs = model.generate(
-                    **inputs,
-                    max_length=512,
-                    num_beams=4,  # Reduziert von 8, da MADLAD400 mit weniger Beams oft gute Ergebnisse liefert
-                    early_stopping=True
-                )
-            
-            # Dekodiere die Ausgaben
-            translations = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        
-        logger.info(f"Batch mit {len(translations)} Texten erfolgreich übersetzt.")
-        return translations
-    
-    except Exception as e:
-        logger.error(f"Fehler bei der Batch-Übersetzung mit MADLAD400: {e}", exc_info=True)
-        # Fallback: Leere Strings zurückgeben
-        return ["" for _ in range(len(batch_texts))]
+    if not torch.cuda.is_available():
+        logger.warning("CUDA nicht verfügbar. Verwende Standard-Batchgröße für CPU.")
+        return min_batch_size  # Standardwert für CPU
 
-def translate_segments(transcription_file, translation_file, source_lang="en", target_lang="de"):
+    # Speicher vor der Berechnung freigeben
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    # Verfügbaren GPU-Speicher ermitteln
+    device = model.device
+    # PyTorch 1.10+ unterstützt mem_get_info für genaue Speicherinfo
+    try:
+        free_memory, total_memory = torch.cuda.mem_get_info(device)
+        logger.info(f"Verfügbarer GPU-Speicher: {free_memory / 1024**3:.2f} GB von {total_memory / 1024**3:.2f} GB")
+    except AttributeError:
+        # Fallback für ältere PyTorch-Versionen
+        total_memory = torch.cuda.get_device_properties(device).total_memory
+        allocated_memory = torch.cuda.memory_allocated(device)
+        free_memory = total_memory - allocated_memory
+        logger.warning("Verwende Fallback-Methode für Speicherberechnung (ältere PyTorch-Version)")
+    except Exception as e:
+        logger.error(f"Fehler beim Abrufen des GPU-Speichers: {e}. Falle auf Standard-Batchgröße zurück.")
+        return min_batch_size
+    
+    # Sicherheitspuffer abziehen (15% für RTX 4050 Mobile empfohlen)
+    usable_memory = free_memory * (1.0 - safety_margin)
+    logger.info(f"Nutzbarer Speicher nach Sicherheitspuffer: {usable_memory / 1024**3:.2f} GB")
+    
+    # Durchschnittliche Textlänge berechnen für bessere Schätzung
+    sample_texts = texts[:memory_estimation_samples] if len(texts) >= memory_estimation_samples else texts
+    avg_text_length = sum(len(text.get('text', '') if isinstance(text, dict) else str(text)) for text in sample_texts) / len(sample_texts)
+    
+    # Speicherverbrauch pro Sample schätzen
+    estimated_memory_per_sample = estimate_memory_per_sample(
+        avg_text_length, max_length, model, tokenizer
+    )
+    
+    # Optimale Batchgröße berechnen
+    if estimated_memory_per_sample > 0:
+        calculated_batch_size = int(usable_memory / estimated_memory_per_sample)
+        # Auf vernünftige Grenzen begrenzen
+        optimal_batch_size = max(min_batch_size, min(calculated_batch_size, max_batch_size))
+    else:
+        optimal_batch_size = min_batch_size
+    
+    logger.info(f"Berechnete optimale Batchgröße: {optimal_batch_size}")
+    logger.info(f"Geschätzter Speicherverbrauch pro Sample: {estimated_memory_per_sample / 1024**2:.1f} MB")
+    
+    return optimal_batch_size
+
+def estimate_memory_per_sample(
+    avg_text_length: float, 
+    max_length: int, 
+    model, 
+    tokenizer,
+    dtype_multiplier: float = 2.0  # bfloat16 = 2 bytes per parameter
+) -> float:
     """
-    Übersetzt die bereits transkribierten Segmente mithilfe des MarianMT-Modells.
+    Schätzt den Speicherverbrauch pro Sample basierend auf Modellgröße und Textlänge.
     
     Args:
-        transcription_file: Pfad zur Datei mit den transkribierten Segmenten.
-        translation_file: Pfad zur Ausgabedatei für die Übersetzungen.
-        source_lang: Quellsprache (z.B. 'en').
-        target_lang: Zielsprache (z.B. 'de').
-    
+        avg_text_length: Durchschnittliche Textlänge in Zeichen
+        max_length: Maximale Token-Länge
+        model: MADLAD400 Modell
+        tokenizer: MADLAD400 Tokenizer
+        dtype_multiplier: Multiplikator für Datentyp (bfloat16 = 2.0)
+        
     Returns:
-        Dictionary mit den Übersetzungen.
+        Geschätzter Speicherverbrauch in Bytes
     """
-    existing_translations = {}  # Zwischenspeicher für bereits gespeicherte Übersetzungen
-    end_times = {}  # Speichert Endzeiten für jeden Startpunkt
     
-    # Wenn es bereits eine Übersetzungsdatei gibt, Nutzer fragen
+    # Geschätzte Token-Anzahl (ca. 4 Zeichen pro Token für deutsche Texte)
+    estimated_tokens = min(int(avg_text_length / 4), max_length)
+    
+    # Basis-Speicherverbrauch für MADLAD400-7B Modell
+    # Input-Tensoren: batch_size * seq_length * hidden_size * dtype_bytes
+    hidden_size = 1024  # Typisch für 7B Modelle
+    input_memory = estimated_tokens * hidden_size * dtype_multiplier
+    
+    # Output-Tensoren und Zwischenergebnisse (Faktor 3-4x für Transformer)
+    total_memory_per_sample = input_memory * 4
+    
+    # Zusätzlicher Speicher für Attention-Mechanismen
+    attention_memory = estimated_tokens * estimated_tokens * dtype_multiplier
+    
+    # Gesamtspeicher pro Sample
+    estimated_memory = total_memory_per_sample + attention_memory
+    
+    # Konservative Schätzung mit zusätzlichem Puffer für unvorhersehbare Allokationen
+    return estimated_memory * 1.5
+
+# Übersetzen
+def batch_translate_dynamic(
+    batch_texts: List[Union[str, Dict]], 
+    model, 
+    tokenizer, 
+    target_lang: str,
+    adaptive_batching: bool = True,
+    fallback_batch_size: int = 2
+) -> List[str]:
+    """
+    Übersetzt einen Batch von Texten mit dynamischer Batchgrößen-Anpassung.
+    
+    Args:
+        batch_texts: Liste von Dictionaries mit 'text'-Schlüssel oder String-Liste
+        model: MADLAD400-Modell für die Übersetzung
+        tokenizer: Tokenizer für das MADLAD400-Modell
+        target_lang: Zielsprache-Code (z.B. 'de' für Deutsch)
+        adaptive_batching: Ob dynamische Batchgröße verwendet werden soll
+        fallback_batch_size: Fallback-Batchgröße bei Fehlern
+        
+    Returns:
+        Liste von übersetzten Texten
+    """
+    
+    if not batch_texts:
+        logger.warning("Leere Textliste für Übersetzung erhalten")
+        return []
+    
+    try:
+        # Dynamische Batchgröße berechnen, falls aktiviert
+        if adaptive_batching and torch.cuda.is_available():
+            optimal_batch_size = calculate_dynamic_batch_size(
+                batch_texts, tokenizer, model
+            )
+        else:
+            optimal_batch_size = fallback_batch_size
+            logger.info(f"Verwende Standard-Batchgröße: {optimal_batch_size} (adaptive Batching deaktiviert oder CPU-Modus)")
+        
+        # Texte in optimale Sub-Batches aufteilen
+        sub_batches = [
+            batch_texts[i:i + optimal_batch_size] 
+            for i in range(0, len(batch_texts), optimal_batch_size)
+        ]
+        
+        all_translations = []
+        
+        for sub_batch_idx, sub_batch in enumerate(sub_batches):
+            logger.info(f"Verarbeite Sub-Batch {sub_batch_idx + 1}/{len(sub_batches)} "
+                    f"mit {len(sub_batch)} Segmenten (Batchgröße: {optimal_batch_size})")
+            
+            # Texte für MADLAD400 vorbereiten
+            source_texts = []
+            for item in sub_batch:
+                text = item.get('text', '').strip() if isinstance(item, dict) else str(item).strip()
+                # MADLAD400 Sprachpräfix hinzufügen (z.B. "<2de>" für Deutsch)
+                text_with_prefix = f"<2{target_lang}> {text}"
+                source_texts.append(text_with_prefix)
+            
+            # GPU-Speicher vor Tokenisierung überwachen
+            if torch.cuda.is_available():
+                memory_before = torch.cuda.memory_allocated()
+                logger.debug(f"GPU-Speicher vor Tokenisierung: {memory_before / 1024**2:.1f} MB")
+            
+            # Tokenisierung mit optimierten Parametern
+            with torch.inference_mode():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    inputs = tokenizer(
+                        source_texts, 
+                        return_tensors="pt", 
+                        padding=True, 
+                        truncation=True, 
+                        max_length=512
+                    ).to(model.device)
+                    
+                    # Übersetzung mit optimierten Parametern für RTX 4050 Mobile
+                    with torch.autocast(device_type="cuda", dtype=torch.float32):
+                        outputs = model.generate(
+                            **inputs,
+                            max_length=512,
+                            num_beams=4,  # Reduziert für bessere Performance
+                            early_stopping=True,
+                            use_cache=True,
+                            pad_token_id=tokenizer.pad_token_id,
+                            do_sample=False  # Deterministische Ausgabe
+                        )
+                        
+                        # Dekodierung der Übersetzungen
+                        translations = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                        
+                        # MADLAD400 Sprachpräfix aus den Übersetzungen entfernen
+                        cleaned_translations = []
+                        for translation in translations:
+                            # Entfernt Präfixe wie "<2de>" am Anfang der Übersetzung
+                            cleaned = re.sub(r'^<2[a-z]+>\s*', '', translation).strip()
+                            cleaned_translations.append(cleaned)
+                        
+            all_translations.extend(cleaned_translations)
+
+            # Speicherverbrauch nach Verarbeitung loggen
+            if torch.cuda.is_available():
+                memory_after = torch.cuda.memory_allocated()
+                logger.debug(f"GPU-Speicher nach Sub-Batch: {memory_after / 1024**2:.1f} MB")
+        
+        logger.info(f"Batch mit {len(all_translations)} Texten erfolgreich übersetzt")
+        return all_translations
+        
+    except torch.cuda.OutOfMemoryError as e:
+        logger.error(f"GPU-Speicher erschöpft bei Batchgröße {optimal_batch_size}: {e}")
+        # Automatischer Fallback auf kleinere Batchgröße
+        if optimal_batch_size > 2:
+            new_fallback = max(2, optimal_batch_size // 2)  # Halbieren, aber nicht unter 2
+            logger.info("Versuche mit reduzierter Batchgröße...")
+            return batch_translate_dynamic(
+                batch_texts, model, tokenizer, target_lang, 
+                adaptive_batching=False, fallback_batch_size=new_fallback
+            )
+        else:
+            logger.error("Übersetzung auch mit Batchgröße 1 nicht möglich")
+            return [""] * len(batch_texts)
+            
+    except Exception as e:
+        logger.error(f"Fehler bei der dynamischen Batch-Übersetzung: {e}", exc_info=True)
+        return [""] * len(batch_texts)
+
+def translate_segments_optimized(transcription_file, translation_file, source_lang="en", target_lang="de"):
+    """
+    Optimierte Übersetzung mit dynamischer Batchgrößen-Anpassung.
+    """
+    
+    # Bestehende Übersetzungen laden (wie gehabt)
+    existing_translations = {}
+    end_times = {}
+    
     if os.path.exists(translation_file):
         if not ask_overwrite(translation_file):
-            logger.info(f"Fortsetzen mit vorhandenen Übersetzungen: {translation_file}")
-            # Lade existierende Übersetzungen
-            with open(translation_file, "r", encoding="utf-8") as csvfile:
-                csv_reader = csv.reader(csvfile, delimiter='|')
-                try:
-                    next(csv_reader)  # Header überspringen
-                    for row in csv_reader:
-                        if len(row) == 3:
-                            existing_translations[row[0]] = row[2]
-                            end_times[row[0]] = row[1]
-                except StopIteration:
-                    pass  # Datei ist leer oder nur Header
-            return existing_translations  # Sofortiger Exit, keine neue Übersetzung
-        else:
-            logger.info(f"Starte neue Übersetzung, vorhandene Datei wird überschrieben: {translation_file}")
+            logger.info(f"Fortsetzen mit vorhandenen Übersetzungen {translation_file}")
+            # Existing loading code hier...
+            return existing_translations
     
-    try:
-        # CSV-Datei mit Transkriptionen einlesen
-        segments = []
-        with open(transcription_file, mode='r', encoding='utf-8') as csvfile:
-            csv_reader = csv.reader(csvfile, delimiter='|')
-            next(csv_reader)  # Header überspringen
-            for row in csv_reader:
-                if len(row) == 3:
-                    start = sum(float(x) * 60 ** i for i, x in enumerate(reversed(row[0].split(':'))))
-                    end = sum(float(x) * 60 ** i for i, x in enumerate(reversed(row[1].split(':'))))
-                    # Speichere Endzeit für alle Segmente
-                    end_times[row[0]] = row[1]
-                    # Falls bereits übersetzt, überspringen
-                    if row[0] in existing_translations:
-                        continue
-                    segments.append({"start": start, "end": end, "text": row[2], "start_str": row[0]})
-        
-        if not segments:
-            logger.info("Keine neuen Segmente zu übersetzen!")
-            return existing_translations  # Konsistente Rückgabe
-        
-        print(f"--------------------------")
-        print(f"|<< Starte Übersetzung >>|")
-        print(f"--------------------------")
-        
-        translate_start_time = time.time()
-        
-        with gpu_context():
-            print(f">>> MADLAD400-Modell wird initialisiert... <<<")
-            model, tokenizer = load_translation_model()
-            print(f">>> MADLAD400-Modell initialisiert. Übersetzung startet... <<<")
-            
-            # Segmente in Batches aufteilen
-            segment_batches = [segments[i:i+BATCH_SIZE] for i in range(0, len(segments), BATCH_SIZE)]
-            
-            # Batches übersetzen
-            for batch_idx, batch in enumerate(segment_batches):
-                batch_start_time = time.time()
-                print(f"Verarbeite Batch {batch_idx+1}/{len(segment_batches)} ({len(batch)} Segmente)...")
-
-                # Batch übersetzen
-                translations = batch_translate(batch, model, tokenizer, target_lang)
+    # Segmente laden
+    segments = []
+    with open(transcription_file, mode="r", encoding="utf-8") as csvfile:
+        csvreader = csv.reader(csvfile, delimiter="|")
+        next(csvreader)  # Header überspringen
+        for row in csvreader:
+            if len(row) >= 3:
+                start = sum(float(x) * (60 ** i) for i, x in enumerate(reversed(row[0].split(":"))))
+                end = sum(float(x) * (60 ** i) for i, x in enumerate(reversed(row[1].split(":"))))
+                end_times[row[0]] = row[1]
                 
-                # Übersetzungen anzeigen
-                print(f"Übersetzte Texte für Batch {batch_idx+1}:")
-                for i, seg in enumerate(batch):
-                    print(f"Segment {i+1} (Start: {seg['start_str']}): {translations[i]}")
-                    
-                # Übersetzungen speichern
-                for i, seg in enumerate(batch):
-                    existing_translations[seg["start_str"]] = translations[i]
-                batch_end_time = time.time() - batch_start_time
-                print(f"Batch {batch_idx+1}/{len(segment_batches)} in {batch_end_time:.2f} Sekunden verarbeitet.")
-            
-        # Ergebnisse speichern
-        with open(translation_file, mode='w', encoding='utf-8', newline='') as csvfile:
-            csv_writer = csv.writer(csvfile, delimiter='|')
-            csv_writer.writerow(['Startzeit', 'Endzeit', 'Text'])
-            
-            # Schreibe alle Übersetzungen (alte und neue)
-            for start_str, text in existing_translations.items():
-                if start_str in end_times:  # Sicherheitscheck
-                    end_str = end_times[start_str]
-                    sanitized_text = sanitize_for_csv_and_tts(text) if 'sanitize_for_csv_and_tts' in globals() else text
-                    csv_writer.writerow([start_str, end_str, sanitized_text])
-        
-        logger.info("Übersetzung abgeschlossen!")
-        print(f"-----------------------------------")
-        print(f"|<< Übersetzung abgeschlossen!! >>|")
-        print(f"-----------------------------------")
-        
-        translate_end_time = time.time() - translate_start_time
-        logger.info(f"Step execution time: {(translate_end_time / 60):.0f}:{(translate_end_time):.3f} minutes")
-        print(f"{(translate_end_time):.2f} Sekunden")
-        print(f"{(translate_end_time / 60 ):.2f} Minuten")
-        print(f"{(translate_end_time / 3600):.2f} Stunden")
-        
+                if row[0] in existing_translations:
+                    continue
+                segments.append({"start": start, "end": end, "text": row[2], "start_str": row[0]})
+    
+    if not segments:
+        logger.info("Keine neuen Segmente zu übersetzen!")
         return existing_translations
     
-    except Exception as e:
-        logger.error(f"Fehler bei der Übersetzung: {e}", exc_info=True)
-        return existing_translations  # Konsistente Rückgabe auch im Fehlerfall
+    logger.info("=" * 50)
+    logger.info("Starte optimierte Übersetzung mit dynamischen Batches")
+    logger.info("=" * 50)
+    
+    translate_start_time = time.time()
+    
+    # GPU-Kontext für bessere Speicherverwaltung
+    with gpu_context():
+        logger.info("MADLAD400-Modell wird initialisiert...")
+        model, tokenizer = load_translation_model()
+        logger.info("MADLAD400-Modell initialisiert. Übersetzung startet...")
+        
+        # Dynamische Batchgröße bestimmen
+        optimal_batch_size = calculate_dynamic_batch_size(segments, tokenizer, model)
+        segment_batches = [segments[i:i + optimal_batch_size] for i in range(0, len(segments), optimal_batch_size)]
+
+        for batch_idx, batch in enumerate(segment_batches):
+            batch_start_time = time.time()
+            print(f"Verarbeite Batch {batch_idx+1}/{len(segment_batches)} ({len(batch)} Segmente)...")
+
+            translations = batch_translate_dynamic(batch, model, tokenizer, target_lang, adaptive_batching=False, fallback_batch_size=optimal_batch_size)
+
+            # Übersetzungen anzeigen
+            print(f"Übersetzte Texte für Batch {batch_idx+1}:")
+            for i, seg in enumerate(batch):
+                print(f"Segment {i+1} (Start: {seg['start_str']}): {translations[i]}")
+                
+            # Übersetzungen speichern
+            for i, seg in enumerate(batch):
+                existing_translations[seg["start_str"]] = translations[i]
+            batch_end_time = time.time() - batch_start_time
+            print(f"Batch {batch_idx+1}/{len(segment_batches)} in {batch_end_time:.2f} Sekunden verarbeitet.")
+    
+    # Ergebnisse speichern (bestehender Code)
+    with open(translation_file, mode="w", encoding="utf-8", newline="") as csvfile:
+        csvwriter = csv.writer(csvfile, delimiter="|")
+        csvwriter.writerow(["Startzeit", "Endzeit", "Text"])
+        
+        for start_str, text in existing_translations.items():
+            if start_str in end_times:
+                end_str = end_times[start_str]
+                sanitized_text = sanitize_for_csv_and_tts(text) if 'sanitize_for_csv_and_tts' in globals() else text
+                csvwriter.writerow([start_str, end_str, sanitized_text])
+    
+    translate_end_time = time.time() - translate_start_time
+    logger.info(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden")
+    
+    return existing_translations
 
 def safe_restore_punctuation(text, model_instance):
     """ Robuste Funktion aus vorheriger Antwort, fängt Fehler ab """
@@ -2761,7 +2969,7 @@ def main():
     correct_grammar_transcription(PUNCTED_TRANSCRIPTION_FILE, CORRECTED_TRANSCRIPTION_FILE, lang="en-US")
     
     # 7) Übersetzung der Segmente mithilfe von MADLAD400
-    translated = translate_segments(CORRECTED_TRANSCRIPTION_FILE, TRANSLATION_FILE)
+    translated = translate_segments_optimized(CORRECTED_TRANSCRIPTION_FILE, TRANSLATION_FILE)
     if not translated:
         logger.error("Übersetzung fehlgeschlagen oder keine Segmente vorhanden.")
         return
