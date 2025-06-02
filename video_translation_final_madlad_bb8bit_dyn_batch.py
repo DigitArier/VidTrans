@@ -20,6 +20,8 @@ import coverage
 cov = coverage.Coverage(branch=True)
 cov.start()
 """
+import sys
+import ctypes
 import re
 from pathlib import Path
 import subprocess
@@ -42,7 +44,7 @@ import ftfy
 from ftfy import fix_encoding
 import torch
 from torch import autocast
-torch.set_num_threads(8)
+torch.set_num_threads(12)
 import gc
 from typing import List, Dict, Tuple, Union
 import tensor_parallel
@@ -68,6 +70,7 @@ import psutil
 import language_tool_python
 from language_tool_python import LanguageTool
 from functools import partial
+import multiprocessing as mp
 from multiprocessing import Pool, cpu_count
 from functools import partial
 from llama_cpp import Llama
@@ -122,6 +125,31 @@ from silero_vad import(
     collect_chunks
     )
 
+# Sofortige P-Core-Optimierung
+def optimize_for_video_translation():
+    """Optimiert CPU-Konfiguration für Video-Übersetzung"""
+    try:
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            # P-Core-Affinität setzen
+            current_process = psutil.Process(os.getpid())
+            current_process.cpu_affinity(list(range(0, 12)))
+            
+            # PyTorch für P-Cores optimieren
+            torch.set_num_threads(12)  # Ihre bestehende Zeile anpassen
+            os.environ["OMP_NUM_THREADS"] = "12"  # Ihre bestehende Zeile anpassen
+            
+            print("✓ Video-Übersetzung für P-Cores optimiert")
+            return True
+    except:
+        pass
+    return False
+
+# Direkte Ausführung
+optimize_for_video_translation()
+
+# Multiprocessing-Setup
+mp.set_start_method('spawn', force=True)
+
 torch.backends.cuda.matmul.allow_tf32 = True  # Schnellere Matrix-Multiplikationen
 torch.backends.cudnn.allow_tf32 = True        # TF32 für cuDNN aktivieren
 torch.backends.cudnn.benchmark = True         # Optimale Kernel-Auswahl
@@ -150,7 +178,6 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Verwende Gerät: {device}")
 if device == "cpu":
     logger.warning("GPU/CUDA nicht verfügbar. Falle auf CPU zurück. Die Verarbeitung kann langsamer sein.")
-
 start_time = time.time()
 step_times = {}
 source_lang="en"
@@ -230,7 +257,6 @@ def load_whisper_model():
     return pipeline
 
 # Batch-Größe für die Übersetzung
-BATCH_SIZE = 4
 def load_translation_model(model_path=None):
     """
     Lädt das MADLAD400-Übersetzungsmodell für die Verwendung auf der GPU oder CPU.
@@ -246,9 +272,23 @@ def load_translation_model(model_path=None):
     configure_attention_backends()
     advanced_cuda_configuration()
     
+    # Konservative Strategie für höchste Qualität
+    critical_layers_exclude = [
+        "final_layer_norm",          # Numerische Stabilität
+        "shared",                    # Embedding Layer
+        "lm_head",                   # Output Projection
+        "encoder.embed_tokens",      # Encoder Embeddings
+        "decoder.embed_tokens",      # Decoder Embeddings
+        "encoder.layers.0",          # Erste Encoder Layer
+        "decoder.layers.0",          # Erste Decoder Layer
+        "layer_norm",                # Alle Layer Norms
+        "k_proj", "q_proj", "o_proj" # Attention Projektionen
+    ]
+
     bnb_config = BitsAndBytesConfig(
         load_in_8bit=True,
         torch_dtype=torch.bfloat16,
+        #llm_int8_skip_modules=critical_layers_exclude,
         llm_int8_skip_modules=["final_layer_norm"],
         llm_int8_enable_fp32_cpu_offload=True
     )
@@ -264,14 +304,16 @@ def load_translation_model(model_path=None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Verwende Gerät: {device}")
     
-    num_threads=12
-    torch.set_num_threads(num_threads)
-    logger.info(f"Setze PyTorch auf {num_threads} CPU-Threads für maximale Leistung.")
-    
     # Speicher freigeben, um Platz für das Modell zu schaffen
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     
+    max_memory = {}
+    if torch.cuda.is_available():
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+        max_memory[0] = int(total_memory * 0.95)  # 95% des GPU-Speichers für Gerät 0
+        logger.info(f"Setze max_memory für GPU 0 auf {max_memory[0] / 1024**3:.2f} GB (95% des verfügbaren Speichers)")
+        
     try:
         # Tokenizer und Modell laden
         tokenizer = T5TokenizerFast.from_pretrained(model_path)
@@ -280,12 +322,13 @@ def load_translation_model(model_path=None):
             torch_dtype=torch.bfloat16,  # BFloat16 für bessere Performance
             use_cache=True,
             low_cpu_mem_usage=True,
-            quantization_config=bnb_config
+            quantization_config=bnb_config,
+            #max_memory=max_memory
         )
         
         # Modell auf das entsprechende Gerät verschieben
         model.eval()  # Inferenzmodus aktivieren
-        model = torch.compile(model, dynamic=True, mode="reduce-overhead")  # Optional: TorchScript-Optimierung
+        model = torch.compile(model, dynamic=True, mode="max-autotune")  # Optional: TorchScript-Optimierung
         
         logger.info("Modell erfolgreich kompiliert")
         """
@@ -730,12 +773,12 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
             
             segments, info = pipeline.transcribe(
                 audio_file,
-                batch_size=6,
+                batch_size=4,
                 beam_size=10,
                 patience=1.2,
                 vad_filter=True,
                 vad_parameters=vad_params,
-                #chunk_length=15,
+                chunk_length=15,
                 #compression_ratio_threshold=2.8,    # Schwellenwert für Kompressionsrate
                 #log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
                 #no_speech_threshold=1.0,            # Schwellenwert für Stille
@@ -1543,8 +1586,8 @@ def calculate_dynamic_batch_size(
     model, 
     max_length: int = 512,
     safety_margin: float = 0.15,
-    min_batch_size: int = 2,
-    max_batch_size: int = 8,
+    min_batch_size: int = 3,
+    max_batch_size: int = 4,
     memory_estimation_samples: int = 3
 ) -> int:
     """
@@ -1733,11 +1776,12 @@ def batch_translate_dynamic(
                         outputs = model.generate(
                             **inputs,
                             max_length=512,
-                            num_beams=4,  # Reduziert für bessere Performance
+                            num_beams=7,  # Reduziert für bessere Performance
                             early_stopping=True,
                             use_cache=True,
                             pad_token_id=tokenizer.pad_token_id,
-                            do_sample=False  # Deterministische Ausgabe
+                            do_sample=False,  # Deterministische Ausgabe
+                            #cache_implementation="static"
                         )
                         
                         # Dekodierung der Übersetzungen
@@ -1857,7 +1901,11 @@ def translate_segments_optimized(transcription_file, translation_file, source_la
                 csvwriter.writerow([start_str, end_str, sanitized_text])
     
     translate_end_time = time.time() - translate_start_time
+    
     logger.info(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden")
+    print(f"-----------------------------------")
+    print(f"|<< Übersetzung abgeschlossen!! >>|")
+    print(f"-----------------------------------")
     
     return existing_translations
 
@@ -2218,7 +2266,8 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
         if not ask_overwrite(output_file):
             logger.info(f"Verwende vorhandene Datei: {output_file}")
             return output_file
-
+        
+    format_for_tts_start = time.time()
     try:
         logger.info(f"Starte TTS-Formatierung für {lang}...")
         print("----------------------------------")
@@ -2278,10 +2327,10 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
         
         # SpaCy-Modell für Namenerkennung laden (offline nutzbar)
         try:
-            nlp = spacy.load("de_core_news_sm")  # Kleines deutsches Modell
+            nlp = spacy.load("de_core_news_lg")  # Kleines deutsches Modell
             logger.info("SpaCy-Modell für Namenerkennung geladen.")
         except OSError:
-            logger.error("SpaCy-Modell 'de_core_news_sm' nicht gefunden. Bitte installieren Sie es mit 'python -m spacy download de_core_news_sm'.")
+            logger.error("SpaCy-Modell 'de_core_news_lg' nicht gefunden. Bitte installieren Sie es mit 'python -m spacy download de_core_news_lg'.")
             tool.close()
             lt_process.terminate()
             return input_file
@@ -2466,10 +2515,14 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
             print(f"  - {split_count} Segmente wurden aufgrund der Zeichenbegrenzung aufgeteilt")
             print(f"  - {segments_exceeding_limit} Segmente überschreiten das 175-Zeichen-Limit (3-Wörter-Regel angewendet)")
             print("----------------------------------")
-            
             tool.close()
             lt_process.terminate()
             logger.info("LanguageTool-Server beendet.")
+            format_for_tts = time.time() - format_for_tts_start
+            logger.info(f"Step execution time: {(format_for_tts / 60):.0f}:{(format_for_tts):.3f} minutes")
+            print(f"{(format_for_tts):.2f} Sekunden")
+            print(f"{(format_for_tts / 60 ):.2f} Minuten")
+            print(f"{(format_for_tts / 3600):.2f} Stunden")
             return output_file
         else:
             logger.warning("Keine formatierten Segmente erstellt.")
@@ -2615,12 +2668,12 @@ def text_to_speech_with_voice_cloning(
                             speaker_embedding=speaker_embedding,
                             text=text,
                             language="de",  # Sprache auf Deutsch setzen, passend zu MarianMT-Übersetzung
-                            speed=0.85,  # Geschwindigkeit der Stimme anpassen
-                            temperature=0.9,  # Temperatur für Zufälligkeit der Ausgabe
+                            speed=0.8,  # Geschwindigkeit der Stimme anpassen
+                            temperature=0.95,  # Temperatur für Zufälligkeit der Ausgabe
                             repetition_penalty=10.0,  # Strafe für Wiederholungen
                             enable_text_splitting=False,  # Textaufteilung deaktivieren
-                            top_k=65,  # Top-K-Sampling für Qualität
-                            top_p=0.95  # Top-P-Sampling für Qualität
+                            top_k=70,  # Top-K-Sampling für Qualität
+                            top_p=1.0  # Top-P-Sampling für Qualität
                         )
                         batch_results.append(result)
             
