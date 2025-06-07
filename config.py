@@ -1,12 +1,12 @@
 # Dateipfade
-VIDEO_PATH = "The Most Twisted DXM Stories In Existence_HD.mp4"
-FINAL_VIDEO_PATH = "The Most Twisted DXM Stories In Existence_HD_deutsch.mp4"
+VIDEO_PATH = "3 True Roommate Horror Stories Animated_Full-HD.mp4"
+FINAL_VIDEO_PATH = "3 True Roommate Horror Stories Animated_Full-HD_deutsch.mp4"
 ORIGINAL_AUDIO_PATH = "original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
-SAMPLE_PATH_1 = "JRE_sample-01.wav"
-SAMPLE_PATH_2 = "JRE_sample-02.wav"
-SAMPLE_PATH_3 = "JRE_sample-03.wav"
+SAMPLE_PATH_1 = "asleep_sample-01.wav"
+SAMPLE_PATH_2 = "asleep_sample-02.wav"
+SAMPLE_PATH_3 = "asleep_sample-03.wav"
 #SAMPLE_PATH_4 = "papa_sample-04.wav"
 #SAMPLE_PATH_5 = "papa_sample-05.wav"
 SPEECH_TIMESTAMPS = "speech_timestamps.json"
@@ -18,6 +18,15 @@ TRANSCRIPTION_FILE = "transcription.csv"
 MERGED_TRANSCRIPTION_FILE = "merged_transcription.csv"
 PUNCTED_TRANSCRIPTION_FILE = "puncted_transcription.csv"
 CORRECTED_TRANSCRIPTION_FILE = "corrected_transcription.csv"
+TRANSCRIPTION_CLEANED = "transcription_cleaned.csv"
+MERGED_TRANSCRIPTION_FILE = "merged_transcription.csv"
+# Zusammenführung Transkription
+MIN_DUR = 1.0 # Minimale Segmentdauer in Sekunden 
+MAX_DUR = 15 # Maximale Segmentdauer in Sekunden
+MAX_GAP = 0.5 # Maximaler akzeptierter Zeitabstand zwischen Segmenten
+MAX_CHARS = 150 # Maximale Anzahl an Zeichen pro Segment
+MIN_WORDS = 10 # Minimale Anzahl an Wörtern pro Segment
+ITERATIONS = 2 # Durchläufe
 #Translation
 TRANSLATION_FILE = "translation.csv"
 MERGED_TRANSLATION_FILE = "merged_translation.csv"
@@ -26,13 +35,13 @@ REPAIRED_TRANSLATION_FILE = "repaired_translation_file.csv"
 CLEAN_TRANSLATION_FILE = "clean_translation.csv"
 PUNCTED_TRANSLATION_FILE = "puncted_translation.csv"
 TTS_FORMATTED_TRANSLATION_FILE = "tts_formatted_translation.csv"
-# Zusammenführung
-MIN_DUR = 1.5 # Minimale Segmentdauer in Sekunden 
-MAX_DUR = 15 # Maximale Segmentdauer in Sekunden
-MAX_GAP = 0.5 # Maximaler akzeptierter Zeitabstand zwischen Segmenten
-MAX_CHARS = 300 # Maximale Anzahl an Zeichen pro Segment
-MIN_WORDS = 7 # Minimale Anzahl an Wörtern pro Segment
-ITERATIONS = 2 # Durchläufe
+# Zusammenführung Übersetzung
+MIN_DUR_TRANSLATION = 1.5 # Minimale Segmentdauer in Sekunden
+MAX_DUR_TRANSLATION = 15 # Maximale Segmentdauer in Sekunden
+MAX_GAP_TRANSLATION = 0.5 # Maximaler akzeptierter Zeitabstand zwischen Segmenten
+MAX_CHARS_TRANSLATION = 200 # Maximale Anzahl an Zeichen pro Segment
+MIN_WORDS_TRANSLATION = 7 # Minimale Anzahl an Wörtern pro Segment
+ITERATIONS_TRANSLATION = 2 # Durchläufe
 #Quality_Report
 ST_QUALITY_MODEL = "paraphrase-multilingual-mpnet-base-v2"
 TRANSLATION_QUALITY_REPORT = "translation_quality_report.csv"
