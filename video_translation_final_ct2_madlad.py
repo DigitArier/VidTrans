@@ -182,6 +182,12 @@ VOLUME_ADJUSTMENT_VIDEO = 0.045   # Lautstärkefaktor für das Video
 # ==============================
 
 try:
+    spacy.require_gpu()
+    print("✅ GPU für spaCy erfolgreich aktiviert.")
+except:
+    print("⚠️ GPU für spaCy konnte nicht aktiviert werden. Fallback auf CPU.")
+try:
+# Laden Sie das spaCy-Modell, das nun auf der GPU laufen wird
     nlp_de = spacy.load("de_dep_news_trf")
 except OSError:
     print("Fehler: Das Modell 'de_dep_news_trf' ist nicht installiert. Bitte mit 'python -m spacy download de_dep_news_trf' nachinstallieren.")
@@ -271,7 +277,7 @@ def load_whisper_model():
     pipeline = BatchedInferencePipeline(model=fw_model)
     return pipeline
 
-def load_madlad400_translator_optimized(model_path=None, device="cpu", compute_type="auto"):
+def load_madlad400_translator_optimized(model_path=None, device="auto", compute_type="auto"):
     """
     Lädt das quantisierte MADLAD400-Übersetzungsmodell mit CTranslate2 korrekt.
     
@@ -292,7 +298,7 @@ def load_madlad400_translator_optimized(model_path=None, device="cpu", compute_t
     
     # Modellpfad bestimmen oder herunterladen
     if model_path is None:
-        model_path = "madlad400-10b-mt-8bit"
+        model_path = "madlad400-3b-mt-8bit"
         
         if not os.path.exists(model_path):
             logger.info("Quantisiertes Modell wird von HuggingFace heruntergeladen...")
@@ -317,7 +323,7 @@ def load_madlad400_translator_optimized(model_path=None, device="cpu", compute_t
     if compute_type == "auto":
         if device == "cuda":
             # RTX 4050 Mobile unterstützt INT8+FP16 optimal bei 6GB VRAM
-            compute_type = "int8_float16"
+            compute_type = "int8_bfloat16"
         else:
             compute_type = "int8_float32"
     
@@ -328,7 +334,7 @@ def load_madlad400_translator_optimized(model_path=None, device="cpu", compute_t
     translator = ctranslate2.Translator(
         model_path, 
         device=device,  # KORREKTUR: Verwende GPU statt CPU!
-        compute_type="int16",
+        compute_type="int8_float32",
         inter_threads=12,  # P-Core-optimiert für i7-13700H
         intra_threads=1   # Konservativ für RTX 4050 Mobile
     )
@@ -1842,13 +1848,13 @@ def translate_batch_madlad400_corrected(
             # CTranslate2 Batch-Übersetzung (KORREKTE API!)
             results = translator.translate_batch(
                 tokenized_inputs,
-                batch_type="examples",
+                batch_type="tokens",
                 max_batch_size=2048,  # Höherer Wert für RTX 4050
-                beam_size=8,          # Optimiert für Qualität/Geschwindigkeit
-                patience=1.4,         # Leicht erhöht für längere Sätze
-                max_decoding_length=512,
-                repetition_penalty=1.25,
-                no_repeat_ngram_size=2,
+                beam_size=18,          # Optimiert für Qualität/Geschwindigkeit
+                patience=2.5,         # Leicht erhöht für längere Sätze
+                max_decoding_length=1024,
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3, 
                 disable_unk=True,     # Unbekannte Tokens blockieren
             )
 
@@ -2558,12 +2564,12 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
                 use_embeddings = False
         
         # SpaCy-Modell für Namenerkennung laden (offline nutzbar)
-        def protect_names(text):
+        def protect_names_from_doc(doc):
             """
-            Erkennt Personen-Namen im Text mit spaCy NER und schützt sie vor Korrektur durch LanguageTool.
+            Extrahiert Namen aus einem bereits verarbeiteten spaCy-Doc und erstellt Platzhalter.
             """
             protected_names = {}
-            doc = nlp_de(text)
+            text = doc.text
             for ent in doc.ents:
                 if ent.label_ == "PER":  # Personen-Namen
                     placeholder = f"__NAME_{ent.start_char}_{ent.end_char}__"
@@ -2672,8 +2678,18 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
         formatted_segments = []
         total_segments = len(df)
         split_count = 0
-        segments_exceeding_limit = 0  # Zähler für Segmente, die das Limit überschreiten aber nicht geteilt werden
+        segments_exceeding_limit = 0
+
+        # Schritt 1: Alle Texte aus dem DataFrame extrahieren
+        texts_to_process = df['text'].astype(str).str.strip().tolist()
         
+        # Schritt 2: Alle Texte in einem einzigen, GPU-beschleunigten Batch verarbeiten
+        logger.info(f"Verarbeite {len(texts_to_process)} Texte mit spaCy auf der GPU...")
+        # nlp.pipe ist für die Batch-Verarbeitung optimiert und nutzt die GPU effizient
+        processed_docs = list(nlp_de.pipe(texts_to_process, batch_size=50)) # batch_size kann je nach VRAM angepasst werden
+        logger.info("spaCy-Verarbeitung abgeschlossen.")
+
+        # Schritt 3: Die verarbeiteten Dokumente in der Hauptschleife verwenden
         for i, row in tqdm(df.iterrows(), total=total_segments, desc="Formatiere Segmente"):
             # Zeiten parsen
             start_time = parse_time(row['startzeit'])
@@ -2682,15 +2698,16 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
             if pd.isna(start_time) or pd.isna(end_time) or start_time >= end_time:
                 logger.warning(f"Ungültige Zeiten in Segment {i}: {row['startzeit']} - {row['endzeit']}")
                 continue
-                
-            text = row['text'].strip()
             
-            if not text:
+            # Das bereits verarbeitete Dokument aus der Liste holen
+            doc = processed_docs[i]
+            
+            if not doc.text.strip():
                 logger.debug(f"Leeres Segment {i}, wird übersprungen.")
                 continue
                 
-            # 1. Namen schützen
-            protected_text, protected_names = protect_names(text)
+            # 1. Namen schützen (mit der neuen Funktion, die ein Doc entgegennimmt)
+            protected_text, protected_names = protect_names_from_doc(doc)
 
             # 2. Grammatikkorrektur durchführen
             corrected_text = tool.correct(protected_text)
@@ -2698,8 +2715,8 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
             # 3. Namen wiederherstellen
             corrected_text = restore_names(corrected_text, protected_names)
 
-            # 4. Textkonsistenz sicherstellen
-            final_text = ensure_text_consistency_de(corrected_text)
+            # 4. Textkonsistenz sicherstellen (kann ebenfalls das Doc verwenden)
+            final_text = " ".join([sent.text.strip() for sent in nlp_de(corrected_text).sents if sent.text.strip()])
             
             # 4. Text in Abschnitte mit maximal 175 Zeichen aufteilen
             text_chunks = split_text_by_char_limit(final_text, char_limit=175)
