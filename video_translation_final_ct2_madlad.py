@@ -186,13 +186,6 @@ try:
     print("✅ GPU für spaCy erfolgreich aktiviert.")
 except:
     print("⚠️ GPU für spaCy konnte nicht aktiviert werden. Fallback auf CPU.")
-try:
-# Laden Sie das spaCy-Modell, das nun auf der GPU laufen wird
-    nlp_de = spacy.load("de_dep_news_trf")
-except OSError:
-    print("Fehler: Das Modell 'de_dep_news_trf' ist nicht installiert. Bitte mit 'python -m spacy download de_dep_news_trf' nachinstallieren.")
-    nlp_de = spacy.blank("de")
-    nlp_de.add_pipe("sentencizer")
 
 # Gerät bestimmen (GPU bevorzugt, aber CPU als Fallback)
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -781,9 +774,9 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
             
             segments, info = pipeline.transcribe(
                 audio_file,
-                batch_size=4,
+                batch_size=2,
                 beam_size=10,
-                patience=1.0,
+                patience=1.25,
                 vad_filter=True,
                 vad_parameters=vad_params,
                 #chunk_length=25,
@@ -795,7 +788,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
                 word_timestamps=True,               # Zeitstempel für Wörter
                 hallucination_silence_threshold=0.2,  # Schwellenwert für Halluzinationen
                 condition_on_previous_text=True,    # Bedingung an vorherigen Text
-                no_repeat_ngram_size=0,
+                no_repeat_ngram_size=1,
                 repetition_penalty=1.0,
                 #verbose=True,                       # Ausführliche Ausgabe
                 language="en",                       # Englische Sprache
@@ -1458,45 +1451,80 @@ def merge_transcript_chunks(input_file, output_file, min_dur, max_dur, max_gap, 
         traceback.print_exc()
         raise
 
+def safe_punctuate(text, model, logger):
+    """
+    Eine sichere Wrapper-Funktion, um die Interpunktion wiederherzustellen.
+    Fängt Fehler ab, die durch leere oder problematische Texteingaben in der Bibliothek entstehen können.
+    """
+    # Prüfe, ob der Input ein gültiger, nicht-leerer String ist.
+    if not isinstance(text, str) or not text.strip():
+        # Wenn nicht, gib den Originaltext (z.B. leer oder None) zurück.
+        return text
+    try:
+        # Versuche, die Interpunktion mit dem Modell wiederherzustellen.
+        return model.restore_punctuation(text)
+    except IndexError:
+        # Fange den spezifischen IndexError ab, der bei leeren 'batches' auftritt.
+        logger.warning(f"Konnte Interpunktion für das Segment nicht wiederherstellen, da es wahrscheinlich leer oder ungültig ist. Segment: '{text}'")
+        # Gib den ursprünglichen Text zurück, um Datenverlust zu vermeiden.
+        return text
+    except Exception as e:
+        # Fange alle anderen unerwarteten Fehler ab.
+        logger.error(f"Ein unerwarteter Fehler ist bei der Interpunktion des Segments aufgetreten: '{text}'. Fehler: {e}")
+        # Gib auch hier den Originaltext zurück.
+        return text
+
 def restore_punctuation(input_file, output_file):
+    # Überprüft, ob die Ausgabedatei bereits existiert.
     if os.path.exists(output_file):
+        # Fragt den Benutzer, ob die existierende Datei überschrieben werden soll.
         if not ask_overwrite(output_file):
-            logger.info(f"Verwende vorhandene Übersetzungen: {output_file}", exc_info=True)
+            # Wenn nicht, wird die vorhandene Datei verwendet und die Funktion beendet.
+            logger.info(f"Verwende vorhandene Interpunktions-Datei: {output_file}", exc_info=True)
+            # Liest die bereits übersetzte/punktierte CSV-Datei und gibt sie zurück.
             return read_translated_csv(output_file)
 
     """Stellt die Interpunktion mit deepmultilingualpunctuation wieder her."""
+    # Lese die Eingabedatei in einen pandas DataFrame ein, Spaltentrenner ist '|', alle Daten als String behandeln.
     df = pd.read_csv(input_file, sep='|', dtype=str)
     
     # Identifiziere die ursprüngliche Textspalte (ignoriere Groß/Kleinschreibung)
-    text_col_original = None
-    for col in df.columns:
-        if col.strip().lower() == 'text':
-            text_col_original = col
-            break
-    if text_col_original is None:
-        raise ValueError("Keine Spalte 'text' (unabhängig von Groß/Kleinschreibung) in der Eingabedatei gefunden.")
+    text_col_original = None # Initialisiere die Variable für den Spaltennamen 'text'.
+    for col in df.columns: # Durchlaufe alle Spaltennamen im DataFrame.
+        if col.strip().lower() == 'text': # Prüfe, ob der bereinigte Spaltenname (in Kleinbuchstaben) 'text' ist.
+            text_col_original = col # Speichere den originalen Spaltennamen (z.B. 'text', 'Text', ' text ').
+            break # Beende die Schleife, sobald die Spalte gefunden wurde.
+    if text_col_original is None: # Wenn nach der Schleife keine Textspalte gefunden wurde.
+        raise ValueError("Keine Spalte 'text' (unabhängig von Groß/Kleinschreibung) in der Eingabedatei gefunden.") # Wirf einen Fehler.
+    
+    # Nutze den GPU-Kontextmanager für die Modell-Ausführung.
     with gpu_context():
+        # Initialisiere das Interpunktionsmodell.
         model = PunctuationModel()
         
-        # Wende das Modell an und speichere in einer NEUEN Spalte
-        df['punctuated_text'] = df[text_col_original].apply(lambda x: model.restore_punctuation(x) if isinstance(x, str) and x.strip() else x)
+        # Wende das Modell mit unserer neuen, sicheren Funktion auf jede Zeile der Textspalte an und speichere das Ergebnis in einer NEUEN Spalte.
+        df['punctuated_text'] = df[text_col_original].apply(lambda x: safe_punctuate(x, model, logger))
 
-        # Lösche die ursprüngliche Textspalte
+        # Lösche die ursprüngliche Textspalte, da wir nun die punktierte Version haben.
         df = df.drop(columns=[text_col_original])
 
-        # Benenne die neue Spalte in 'text' um (jetzt garantiert kleingeschrieben)
+        # Benenne die neue Spalte in den Standardnamen 'text' um (jetzt garantiert kleingeschrieben).
         df = df.rename(columns={'punctuated_text': 'text'})
 
-        # Stelle sicher, dass die Spaltenreihenfolge sinnvoll ist (optional)
-        # Z.B. ['startzeit', 'endzeit', 'text']
-        cols = df.columns.tolist()
+        # Stelle sicher, dass die Spaltenreihenfolge sinnvoll ist (optional, aber gut für die Lesbarkeit).
+        cols = df.columns.tolist() # Hole eine Liste aller Spaltennamen.
+        # Prüfe, ob die Kernspalten für Zeitstempel und Text vorhanden sind.
         if 'startzeit' in cols and 'endzeit' in cols and 'text' in cols:
-            # Versuche, die Reihenfolge zu erzwingen
+            # Definiere die gewünschte Reihenfolge der Kernspalten.
             core_cols = ['startzeit', 'endzeit', 'text']
+            # Sammle alle anderen Spalten, die nicht zu den Kernspalten gehören.
             other_cols = [c for c in cols if c not in core_cols]
+            # Ordne den DataFrame neu an: Zuerst die Kernspalten, dann der Rest.
             df = df[core_cols + other_cols]
         
+    # Speichere den bearbeiteten DataFrame in der Ausgabedatei, mit '|' als Trennzeichen und ohne den Index.
     df.to_csv(output_file, sep='|', index=False)
+    # Gib den Pfad zur erstellten Datei zurück.
     return output_file
 
 def correct_grammar_transcription(input_file, output_file, lang="en-US"):
@@ -1850,7 +1878,7 @@ def translate_batch_madlad400_corrected(
                 tokenized_inputs,
                 batch_type="tokens",
                 max_batch_size=2048,  # Höherer Wert für RTX 4050
-                beam_size=18,          # Optimiert für Qualität/Geschwindigkeit
+                beam_size=20,          # Optimiert für Qualität/Geschwindigkeit
                 patience=2.5,         # Leicht erhöht für längere Sätze
                 max_decoding_length=1024,
                 repetition_penalty=1.2,
@@ -2482,6 +2510,14 @@ def generate_semantic_embeddings(input_csv_path, output_npz_path, output_csv_pat
             del st_model
         torch.cuda.empty_cache()
         logger.info("Sentence Transformer Ressourcen freigegeben.")
+
+try:
+# Laden Sie das spaCy-Modell, das nun auf der GPU laufen wird
+    nlp_de = spacy.load("de_dep_news_trf")
+except OSError:
+    print("Fehler: Das Modell 'de_dep_news_trf' ist nicht installiert. Bitte mit 'python -m spacy download de_dep_news_trf' nachinstallieren.")
+    nlp_de = spacy.blank("de")
+    nlp_de.add_pipe("sentencizer")
 
 def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embeddings=False, embeddings_file=None, lt_path="D:\\LanguageTool-6.6"):
     """

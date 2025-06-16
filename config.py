@@ -1,6 +1,6 @@
 # Dateipfade
-VIDEO_PATH = "8_EUROPA (06) The Last Battle (Part 3 of 10) (2017) (Documentary) [720p]_(Vocals).wav"
-FINAL_VIDEO_PATH = "EUROPA (06) The Last Battle (Part 3 of 10) (2017) (Documentary) [720p]_deutsch.mp4"
+VIDEO_PATH = "EUROPA (09) The Last Battle (Part 6 of 10) (2017) (Documentary) [720p].mp4"
+FINAL_VIDEO_PATH = "EUROPA (09) The Last Battle (Part 6 of 10) (2017) (Documentary) [720p]_deutsch.mp4"
 ORIGINAL_AUDIO_PATH = "0_original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
