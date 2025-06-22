@@ -27,6 +27,7 @@ import re
 import gc
 from typing import List, Dict, Tuple, Union
 from pathlib import Path
+from config import *
 import subprocess
 import ffmpeg
 from langcodes import Language
@@ -73,7 +74,6 @@ from functools import partial
 import multiprocessing as mp
 from multiprocessing import Pool, cpu_count
 from functools import partial
-from config import *
 from tqdm import tqdm
 from contextlib import contextmanager
 from deepmultilingualpunctuation import PunctuationModel
@@ -104,6 +104,8 @@ import transformers
 import ctranslate2
 from transformers import modeling_utils, modeling_flash_attention_utils
 from torchao.quantization import Int8WeightOnlyConfig
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from TTS.api import TTS
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
@@ -316,9 +318,9 @@ def load_madlad400_translator_optimized(model_path=None, device="auto", compute_
     if compute_type == "auto":
         if device == "cuda":
             # RTX 4050 Mobile unterstützt INT8+FP16 optimal bei 6GB VRAM
-            compute_type = "int8_bfloat16"
-        else:
             compute_type = "int8_float32"
+        else:
+            compute_type = "int8_bfloat16"
     
     logger.info(f"Lade CTranslate2 Translator von {model_path}...")
     logger.info(f"Device: {device}, Compute-Type: {compute_type}")
@@ -327,11 +329,11 @@ def load_madlad400_translator_optimized(model_path=None, device="auto", compute_
     translator = ctranslate2.Translator(
         model_path, 
         device=device,  # KORREKTUR: Verwende GPU statt CPU!
-        compute_type="int8_float32",
+        compute_type=compute_type,
         inter_threads=12,  # P-Core-optimiert für i7-13700H
         intra_threads=1   # Konservativ für RTX 4050 Mobile
     )
-    """
+    
     # SentencePiece Tokenizer laden (KORREKTUR: Nicht T5TokenizerFast!)
     tokenizer_path = os.path.join(model_path, "spiece.model")
     if not os.path.exists(tokenizer_path):
@@ -347,7 +349,7 @@ def load_madlad400_translator_optimized(model_path=None, device="auto", compute_
         raise FileNotFoundError("SentencePiece tokenizer model nicht gefunden")
     """
     tokenizer = T5TokenizerFast.from_pretrained(model_path)
-    
+    """
     return translator, tokenizer
 
 def load_xtts_v2():
@@ -754,18 +756,16 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
         print("|<< Starte Transkription >>|")
         print("----------------------------")
         
-        transcription_start_time = time.time()
-        
+        transcription_start_time = time.time()    
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        torch.backends.cudnn.benchmark = True  # Auto-Tuning für beste Performance
-        torch.backends.cudnn.enabled = True    # cuDNN aktivieren
+
         with gpu_context():
             pipeline = load_whisper_model()   # Laden des vortrainierten Whisper-Modells
             
             # VAD-Parameter für die Sprachsegmentierung definieren
             vad_params = {
-                "threshold": 0,               # Niedriger Schwellwert für empfindlichere Spracherkennung
+                "threshold": 0.5,               # Niedriger Schwellwert für empfindlichere Spracherkennung
                 "min_speech_duration_ms": 0,  # Minimale Sprachdauer in Millisekunden
                 #"max_speech_duration_s": 30,    # Maximale Sprachdauer in Sekunden
                 "min_silence_duration_ms": 0, # Minimale Stille-Dauer zwischen Segmenten
@@ -774,9 +774,9 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
             
             segments, info = pipeline.transcribe(
                 audio_file,
-                batch_size=2,
-                beam_size=10,
-                patience=1.25,
+                batch_size=1,
+                beam_size=15,
+                patience=1.5,
                 vad_filter=True,
                 vad_parameters=vad_params,
                 #chunk_length=25,
@@ -786,9 +786,9 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file):
                 #temperature=(0.05, 0.1, 0.15, 0.2, 0.25, 0.5),      # Temperatur für Sampling
                 temperature=1,                  # Temperatur für Sampling
                 word_timestamps=True,               # Zeitstempel für Wörter
-                hallucination_silence_threshold=0.2,  # Schwellenwert für Halluzinationen
+                hallucination_silence_threshold=0.5,  # Schwellenwert für Halluzinationen
                 condition_on_previous_text=True,    # Bedingung an vorherigen Text
-                no_repeat_ngram_size=1,
+                no_repeat_ngram_size=3,
                 repetition_penalty=1.0,
                 #verbose=True,                       # Ausführliche Ausgabe
                 language="en",                       # Englische Sprache
@@ -1581,6 +1581,7 @@ def correct_grammar_transcription(input_file, output_file, lang="en-US"):
             
         # Korrigierte Segmente in CSV-Datei speichern
         df.to_csv(output_file, sep='|', index=False, encoding='utf-8')
+        tool.close()
         
         logger.info(f"Grammatikkorrektur abgeschlossen: {corrected_count} von {total_segments} Segmenten korrigiert.")
         print(f"Grammatikkorrektur abgeschlossen: {corrected_count} von {total_segments} Segmenten korrigiert.")
@@ -1751,7 +1752,7 @@ def calculate_optimal_batch_size_rtx4050(texts, tokenizer, max_length=512):
     if estimated_memory_per_sample > 0:
         calculated_batch_size = int(usable_memory / estimated_memory_per_sample)
         # RTX 4050 Mobile Limits: Min 1, Max 6 für Translation
-        optimal_batch_size = max(1, min(calculated_batch_size, 4))
+        optimal_batch_size = max(1, min(calculated_batch_size, 1))
     else:
         optimal_batch_size = 2  # Sicherer Standard
     
@@ -1801,11 +1802,37 @@ def estimate_memory_per_sample(
     # Konservative Schätzung mit zusätzlichem Puffer für unvorhersehbare Allokationen
     return estimated_memory * 1.5
 
+def prepend_previous_if_fragile(idx: int, segment_list: list) -> str:
+    """
+    Gibt den aktuellen Text zurück; beginnt er mit einem Gerundium/Partizip,
+    wird automatisch der vorherige Satz vorangestellt (Mini-Kontext).
+
+    Args:
+        idx: Position des Segments im übergebenen segment_list.
+        segment_list: Liste von Segment-Dicts bzw. Strings mit 'text'-Key.
+    """
+    # Rohtext des aktuellen Segments ermitteln
+    curr = (segment_list[idx]["text"]
+            if isinstance(segment_list[idx], dict)
+            else str(segment_list[idx])).strip()
+
+    # Muster: ing- oder ‑ed-Formen zu Satzbeginn (engl. Partizip/Gerundium)
+    if re.match(r"^(?:[A-Za-z]+ing\b|[A-Za-z]+ed\b)", curr, flags=re.I):
+        if idx > 0:
+            prev = (segment_list[idx - 1]["text"]
+                    if isinstance(segment_list[idx - 1], dict)
+                    else str(segment_list[idx - 1])).strip()
+            # max. 300 Zeichen Kontext, um VRAM zu schonen
+            CTX_TOKEN = "[CTX]"            # darf im Quelltext NICHT vorkommen
+            return f"{prev} {CTX_TOKEN} {curr}"[:300].strip()
+    return curr
+
 # Übersetzen
 def translate_batch_madlad400_corrected(
     texts,
     translator,
     tokenizer,
+    source_lang="en",
     target_lang="de",
     batch_size=None
 ):
@@ -1839,22 +1866,33 @@ def translate_batch_madlad400_corrected(
         
         # Texte für MADLAD400 vorbereiten
         source_texts = []
-        for item in batch:
-            text = item.get('text', '').strip() if isinstance(item, dict) else str(item).strip()
+        for idx, item in enumerate(batch):
+            # Rohtext holen
+            raw_text = item.get('text', '').strip() if isinstance(item, dict) else str(item).strip()
+
+            # -------------------- NEU --------------------
+            # Fragiles Segment ggf. mit Vorgänger verknüpfen
+            text = prepend_previous_if_fragile(idx, batch)
+            # Fallback, falls Funktion leer zurückgibt
+            if not text:
+                text = raw_text
             
             if not text:
                 source_texts.append("")
                 continue
                 
             # MADLAD400 Sprachpräfix hinzufügen (KORREKTUR!)
-            text_with_prefix = f"<2{target_lang}> {text}"
+            src_prefix = f"<0{source_lang}>"
+            tgt_prefix = f"<2{target_lang}>"
+
+            text_with_prefix = f"{src_prefix} {tgt_prefix} {text}"
             source_texts.append(text_with_prefix)
 
         # Tokenisierung mit SentencePiece (KORREKTUR: Nicht T5TokenizerFast!)
         tokenized_inputs = []
         for text in source_texts:
             if text:
-                
+                """
                 # SentencePiece encode zu Token-Strings
                 tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(
                     text,
@@ -1870,7 +1908,7 @@ def translate_batch_madlad400_corrected(
                     out_type=str
                 )
                 tokenized_inputs.append(tokens)
-                """
+                
         
         try:
             # CTranslate2 Batch-Übersetzung (KORREKTE API!)
@@ -1878,12 +1916,13 @@ def translate_batch_madlad400_corrected(
                 tokenized_inputs,
                 batch_type="tokens",
                 max_batch_size=2048,  # Höherer Wert für RTX 4050
-                beam_size=20,          # Optimiert für Qualität/Geschwindigkeit
-                patience=2.5,         # Leicht erhöht für längere Sätze
-                max_decoding_length=1024,
+                beam_size=25,          # Optimiert für Qualität/Geschwindigkeit
+                patience=3.0,         # Leicht erhöht für längere Sätze
+                max_decoding_length=2048,
                 repetition_penalty=1.2,
-                no_repeat_ngram_size=3, 
-                disable_unk=True,     # Unbekannte Tokens blockieren
+                no_repeat_ngram_size=1, 
+                disable_unk=False,     # Unbekannte Tokens blockieren
+                
             )
 
             
@@ -1893,11 +1932,18 @@ def translate_batch_madlad400_corrected(
                 if result.hypotheses:
                     # Beste Hypothese dekodieren
                     tokens = result.hypotheses[0]
-                    translation = tokenizer.decode(tokenizer.convert_tokens_to_ids(tokens))
-                    #translation = tokenizer.decode(tokens)
+                    #translation = tokenizer.decode(tokenizer.convert_tokens_to_ids(tokens))
+                    translation = tokenizer.decode(tokens)
                     
                     # MADLAD400 Sprachpräfix entfernen
-                    translation = translation.replace(f"<2{target_lang}>", "").strip()
+                    tag_pattern = rf"<[0-9]?{target_lang}>"     # z. B. <de> oder <2de>
+                    src_tag_pattern = rf"<[0-9]?{source_lang}>" # z. B. <en> oder <0en>
+
+                    translation = re.sub(tag_pattern, "", translation)
+                    translation = re.sub(src_tag_pattern, "", translation)
+                    translation = translation.replace(f"{target_lang}>", "")  # Fangt Reste wie 'de>'
+
+                    translation = translation.split("[CTX]", 1)[-1].strip()
                     batch_translations.append(translation)
                 else:
                     logger.warning(f"Keine Übersetzung für Text {j} in Batch")
@@ -1956,7 +2002,7 @@ def translate_segments_optimized(transcription_file, translation_file, source_la
     logger.info("=" * 50)
     
     translate_start_time = time.time()
-    
+    setup_gpu_memory_optimization_rtx4050()
     # GPU-Kontext für bessere Speicherverwaltung
     with gpu_context():
         logger.info("MADLAD400-Modell wird initialisiert...")
@@ -2212,178 +2258,6 @@ def convert_time_to_seconds(time_str):
         except ValueError:
             return 0
 
-
-    """
-    Optimiert übersetzte Segmente für TTS, indem Grammatik korrigiert und sichergestellt wird, 
-    dass jedes Segment als abgeschlossener Satz endet (mit Satzzeichen).
-    
-    Args:
-        input_file (str): Pfad zur CSV-Datei mit den übersetzten Segmenten
-        output_file (str): Pfad zur Ausgabedatei mit formatierten Segmenten
-        lang (str): Sprachcode für LanguageTool (z.B. "de-DE")
-        use_embeddings (bool): Ob semantische Embeddings für die Analyse verwendet werden sollen
-        embeddings_file (str): Pfad zur NPZ-Datei mit Embeddings
-    
-    Returns:
-        str: Pfad zur Ausgabedatei mit formatierten Segmenten
-    """
-    # Datei-Existenzprüfung
-    if os.path.exists(output_file):
-        if not ask_overwrite(output_file):
-            logger.info(f"Verwende vorhandene Datei: {output_file}")
-            return output_file
-
-    try:
-        # LanguageTool initialisieren
-        tool = language_tool_python.LanguageTool(lang)
-        
-        logger.info(f"Starte TTS-Formatierung für {lang}...")
-        print("----------------------------------")
-        print("|<< Starte TTS-Formatierung >>|")
-        print("----------------------------------")
-        
-        # CSV-Datei einlesen
-        df = pd.read_csv(input_file, sep='|', dtype=str)
-        df.columns = df.columns.str.strip().str.lower()
-        
-        # Prüfen, ob erforderliche Spalten vorhanden sind
-        required_cols = ['text', 'startzeit', 'endzeit']
-        missing_cols = [col for col in required_cols if col not in df.columns]
-        if missing_cols:
-            logger.error(f"Fehlende Spalten in {input_file}: {', '.join(missing_cols)}")
-            return None
-        
-        # Embeddings laden, falls gewünscht (optional für semantische Analyse)
-        embeddings = None
-        if use_embeddings and embeddings_file and os.path.exists(embeddings_file):
-            try:
-                logger.info(f"Lade semantische Embeddings für Satzanalyse...")
-                embeddings_data = np.load(embeddings_file)
-                embeddings = embeddings_data['embeddings']
-            except Exception as e:
-                logger.error(f"Fehler beim Laden der Embeddings: {e}")
-                use_embeddings = False
-        
-        # Hilfsfunktion zum Überprüfen abgeschlossener Sätze
-        def is_complete_sentence(text):
-            """Prüft, ob der Text mit einem Satzendzeichen endet."""
-            if not text:
-                return False
-            # Erkennt auch Satzzeichen innerhalb von Anführungszeichen am Ende
-            return bool(re.search(r'[.!?][\"\'\)]?$', text.strip()))
-        
-        # Liste für formatierte Segmente
-        formatted_segments = []
-        total_segments = len(df)
-        split_count = 0
-        completion_count = 0
-        
-        for i, row in tqdm(df.iterrows(), total=total_segments, desc="Formatiere Segmente"):
-            # Zeiten parsen
-            start_time = parse_time(row['startzeit'])
-            end_time = parse_time(row['endzeit'])
-            
-            if pd.isna(start_time) or pd.isna(end_time) or start_time >= end_time:
-                logger.warning(f"Ungültige Zeiten in Segment {i}: {row['startzeit']} - {row['endzeit']}")
-                continue
-                
-            text = row['text'].strip()
-            
-            if not text:
-                logger.debug(f"Leeres Segment {i}, wird übersprungen.")
-                continue
-                
-            # 1. Grammatikkorrektur durchführen
-            corrected_text = tool.correct(text)
-            
-            # 2. Prüfen, ob es ein vollständiger Satz ist
-            if is_complete_sentence(corrected_text):
-                # Direktes Hinzufügen vollständiger Sätze
-                formatted_segments.append({
-                    'startzeit': row['startzeit'],
-                    'endzeit': row['endzeit'],
-                    'text': sanitize_for_csv_and_tts(corrected_text)
-                })
-            else:
-                # 3. Text in Sätze aufteilen für unvollständige Segmente
-                sentences = split_into_sentences(corrected_text)
-                
-                if not sentences:
-                    # Kein vollständiger Satz erkannt, Punkt hinzufügen
-                    completion_count += 1
-                    corrected_text = corrected_text.rstrip() + "."
-                    formatted_segments.append({
-                        'startzeit': row['startzeit'],
-                        'endzeit': row['endzeit'],
-                        'text': sanitize_for_csv_and_tts(corrected_text)
-                    })
-                elif len(sentences) == 1:
-                    # Ein Satz erkannt, aber möglicherweise nicht vollständig
-                    sentence = sentences[0]
-                    if not is_complete_sentence(sentence):
-                        completion_count += 1
-                        sentence = sentence.rstrip() + "."
-                        
-                    formatted_segments.append({
-                        'startzeit': row['startzeit'],
-                        'endzeit': row['endzeit'],
-                        'text': sanitize_for_csv_and_tts(sentence)
-                    })
-                else:
-                    # Mehrere Sätze erkannt, verteile auf neue Segmente
-                    split_count += 1
-                    
-                    # Zeitdauer proportional zur Textlänge aufteilen
-                    total_chars = sum(len(s) for s in sentences)
-                    segment_duration = end_time - start_time
-                    
-                    current_start = start_time
-                    
-                    for j, sentence in enumerate(sentences):
-                        # Proportionale Zeitaufteilung
-                        char_proportion = len(sentence) / total_chars
-                        this_duration = segment_duration * char_proportion
-                        
-                        # Letztes Segment bekommt exakt die Endzeit
-                        segment_end = end_time if j == len(sentences) - 1 else current_start + this_duration
-                            
-                        # Sicherstellen, dass jeder Satz vollständig ist
-                        if not is_complete_sentence(sentence):
-                            completion_count += 1
-                            sentence = sentence.rstrip() + "."
-                            
-                        formatted_segments.append({
-                            'startzeit': format_time(current_start),
-                            'endzeit': format_time(segment_end),
-                            'text': sanitize_for_csv_and_tts(sentence)
-                        })
-                        
-                        current_start = segment_end
-        
-        # Ergebnisse in DataFrame konvertieren und speichern
-        if formatted_segments:
-            result_df = pd.DataFrame(formatted_segments)
-            result_df.to_csv(output_file, sep='|', index=False, encoding='utf-8')
-            
-            logger.info(f"TTS-Formatierung abgeschlossen: {len(formatted_segments)} Segmente erzeugt.")
-            print(f"Ergebnis: {len(formatted_segments)} formatierte Segmente")
-            print(f"  - {split_count} Segmente wurden in mehrere Sätze aufgeteilt")
-            print(f"  - {completion_count} unvollständigen Sätzen wurde ein Satzzeichen hinzugefügt")
-            print("----------------------------------")
-            
-            return output_file
-        else:
-            logger.warning("Keine formatierten Segmente erstellt.")
-            return input_file
-            
-    except ImportError:
-        logger.error("language_tool_python nicht installiert. Bitte installieren Sie es mit 'pip install language-tool-python'.")
-        return input_file
-    except Exception as e:
-        logger.error(f"Fehler bei der TTS-Formatierung: {e}", exc_info=True)
-        traceback.print_exc()
-        return input_file
-
 def setup_gpu_optimization():
     """Konfiguriert GPU-Optimierungen für maximale Leistung."""
     # Fortgeschrittene CUDA-Optimierungen
@@ -2522,7 +2396,7 @@ except OSError:
 def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embeddings=False, embeddings_file=None, lt_path="D:\\LanguageTool-6.6"):
     """
     Optimiert übersetzte Segmente für TTS, indem Grammatik korrigiert und der Text in Abschnitte
-    mit maximal 175 Zeichen pro Zeitstempel aufgeteilt wird, es sei denn, das neue Segment hätte
+    mit maximal 150 Zeichen pro Zeitstempel aufgeteilt wird, es sei denn, das neue Segment hätte
     weniger als 3 Wörter. Implementiert eine offlinefähige Namenerkennung mit spaCy.
     
     Args:
@@ -2558,14 +2432,16 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
         
         port = 8010  # Standardport für LanguageTool
         lt_process = subprocess.Popen(
-            ["java", "-cp", lt_jar_path, "org.languagetool.server.HTTPServer", "--port", str(port)],
+            ["java", "-Xmx4g", "-cp", lt_jar_path, "org.languagetool.server.HTTPServer", "--port", str(port), "--allow-origin", "*"],
             cwd=lt_path,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            stdin=subprocess.DEVNULL,  # Verhindert Hängen
+            text=True,
+            bufsize=0  # Unbepuffert für sofortige Ausgabe
         )
         logger.info(f"LanguageTool-Server gestartet aus {lt_path} auf Port {port}.")
-        time.sleep(5)  # Warten, bis der Server hochgefahren ist
+        time.sleep(10)  # Warten, bis der Server hochgefahren ist
         
         # Umgebungsvariablen für LanguageTool setzen
         os.environ["LANGUAGE_TOOL_HOST"] = "localhost"
@@ -2629,10 +2505,34 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
             """
             doc = nlp_de(text)
             return " ".join([sent.text.strip() for sent in doc.sents if sent.text.strip()])
+        
+        def split_text_by_char_limit(text: str, char_limit: int = 150,
+                                    hardlimit: int = 300) -> list[str]:
+            """
+            Teilt Text in Abschnitte <= charlimit, aber NIE mitten im Satz.
+            • Liegt keine Satzgrenze (<.!?>) vor    → bis hardlimit UNGETEILT lassen
+            • Wenn Split nötig ist, suche rückwärts ab charlimit max. 40 Zeichen
+            nach einem Satzende; wird keins gefunden, bleibt der Satz komplett.
+            """
+            if len(text) <= char_limit:
+                return [text]
 
+            # Kandidaten–Satzgrenzen (., !, ?) mit Leerzeichen danach
+            border = max(text.rfind(c, 0, char_limit) for c in ".!?")
+            # ggf. 2. Versuch – weitere 40 Zeichen Rücksprung
+            if border == -1:
+                border = max(text.rfind(c, 0, char_limit - 40) for c in ".!?")
+
+            # Keine Satzgrenze gefunden  →  Satz ungeteilt lassen (bis hardlimit)
+            if border == -1 or len(text) <= hardlimit:
+                return [text]
+
+            # Split hinter dem Satzzeichen (+1 wegen Leerzeichen)
+            border += 1
+            return [text[:border].strip(), text[border:].lstrip()]
         
         # Korrigierte Hilfsfunktion zum Aufteilen des Textes mit 3-Wörter-Regel
-        def split_text_by_char_limit(text, char_limit=175):
+        def split_text_with_3word_rule(text, char_limit=150):
             """
             Teilt den Text in Abschnitte mit maximal 'char_limit' Zeichen auf.
             Versucht, an Satzgrenzen zu teilen, falls möglich, sonst an Wortgrenzen.
@@ -2710,6 +2610,56 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
                     
                 return chunks
         
+        def ensure_context_closure(segments: list) -> list:
+            """
+            Durchläuft die fertigen Segmente und sorgt dafür, dass jedes Segment
+            mit einem vollständigen Satz endet. Beginnt ein Segment mit einem
+            Partizip/Gerundium oder fehlt ein Schlusspunkt, wird der vorangehende
+            Satz angehängt; Dubletten werden unmittelbar entfernt.
+            """
+            fixed = []
+            for idx, seg in enumerate(segments):
+                text = seg["text"].strip()
+
+                fragile = (
+                    re.match(r"^(?:[A-Za-zÄÖÜäöüß]+end|[A-Za-z]+nd)\b", text, re.I)  # grobe Partizip-Heuristik
+                    or not text.endswith(('.', '!', '?'))
+                )
+
+                if fragile and idx > 0:
+                    ctx = fixed[-1]["text"].strip()
+                    candidate = f"{ctx} {text}".strip()
+                    # Dublette entfernen, falls das Segment jetzt identisch wäre
+                    if not candidate.startswith(ctx * 2):
+                        text = candidate
+
+                # Doppelten Kontext wieder abschneiden
+                if fixed and text.startswith(fixed[-1]["text"]):
+                    text = text[len(fixed[-1]["text"]):].lstrip(" .")
+
+                # Sicherstellen, dass ein Satzende vorhanden ist
+                if text and text[-1] not in ".!?":
+                    text += "."
+
+                seg["text"] = text
+                fixed.append(seg)
+            return fixed
+        
+        def merge_lowercase_continuations(rows: list[dict]) -> list[dict]:
+            merged = []
+            i = 0
+            while i < len(rows):
+                cur = rows[i].copy()
+                while (i + 1 < len(rows)
+                    and rows[i + 1]['text'][:1].islower()):
+                    nxt = rows[i + 1]
+                    cur['text'] = f"{cur['text']} {nxt['text']}"
+                    cur['endzeit'] = nxt['endzeit']
+                    i += 1
+                merged.append(cur)
+                i += 1
+            return merged
+
         # Liste für formatierte Segmente
         formatted_segments = []
         total_segments = len(df)
@@ -2752,14 +2702,15 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
             corrected_text = restore_names(corrected_text, protected_names)
 
             # 4. Textkonsistenz sicherstellen (kann ebenfalls das Doc verwenden)
-            final_text = " ".join([sent.text.strip() for sent in nlp_de(corrected_text).sents if sent.text.strip()])
+            final_text = ensure_text_consistency_de(corrected_text)
             
-            # 4. Text in Abschnitte mit maximal 175 Zeichen aufteilen
-            text_chunks = split_text_by_char_limit(final_text, char_limit=175)
+            # 5. Text in Abschnitte mit maximal 150 Zeichen aufteilen
+            CHAR_LIMIT = 150
+            text_chunks = split_text_by_char_limit(final_text, char_limit=CHAR_LIMIT, hardlimit=210)
             
             # Prüfe, ob Segmente das Limit überschreiten (für Statistiken)
             for chunk in text_chunks:
-                if len(chunk) > 175:
+                if len(chunk) > CHAR_LIMIT:
                     segments_exceeding_limit += 1
             
             if len(text_chunks) == 1:
@@ -2791,6 +2742,8 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
                     })
                     
                     current_start = segment_end
+        
+        formatted_segments = merge_lowercase_continuations(formatted_segments)
         
         # Ergebnisse in DataFrame konvertieren und speichern
         if formatted_segments:
@@ -2840,7 +2793,7 @@ def text_to_speech_with_voice_cloning(
     #sample_path_4,
     #sample_path_5,
     output_path,
-    batch_size=24
+    batch_size=32
 ):
     """
     Optimiert Text-to-Speech mit Voice Cloning und verschiedenen Beschleunigungen.
@@ -2870,7 +2823,6 @@ def text_to_speech_with_voice_cloning(
 
         # GPU-Optimierungen aktivieren für maximale Leistung
         cuda_stream = setup_gpu_optimization()
-        
         # TTS-Modell laden und auf GPU verschieben
         with gpu_context():
             print(f"TTS-Modell wird initialisiert...")
@@ -2957,11 +2909,11 @@ def text_to_speech_with_voice_cloning(
                                 text=text,
                                 language="de",  # Sprache auf Deutsch setzen, passend zu MarianMT-Übersetzung
                                 speed=1.1,  # Geschwindigkeit der Stimme anpassen
-                                temperature=0.85,  # Temperatur für Zufälligkeit der Ausgabe
+                                temperature=0.8,  # Temperatur für Zufälligkeit der Ausgabe
                                 repetition_penalty=10.0,  # Strafe für Wiederholungen
                                 enable_text_splitting=False,  # Textaufteilung deaktivieren
-                                top_k=70,  # Top-K-Sampling für Qualität
-                                top_p=0.8 # Top-P-Sampling für Qualität
+                                top_k=75,  # Top-K-Sampling für Qualität
+                                top_p=0.75 # Top-P-Sampling für Qualität
                             )
                             batch_results.append(result)
             
@@ -3314,7 +3266,7 @@ def main():
     
     # 6.1) Wiederherstellung der Interpunktion
     restore_punctuation(TRANSCRIPTION_CLEANED, PUNCTED_TRANSCRIPTION_FILE)
-
+    
     # 6.2) Grammatische Korrektur der Transkription
     correct_grammar_transcription(PUNCTED_TRANSCRIPTION_FILE, CORRECTED_TRANSCRIPTION_FILE, lang="en-US")
     
@@ -3329,8 +3281,11 @@ def main():
         iterations=ITERATIONS
     )
     
+    # 6.1) Wiederherstellung der Interpunktion
+    restore_punctuation(MERGED_TRANSCRIPTION_FILE, PUNCTED_TRANSCRIPTION_FILE_2)
+    
     # 7) Übersetzung der Segmente mithilfe von MADLAD400
-    translated = translate_segments_optimized(MERGED_TRANSCRIPTION_FILE, TRANSLATION_FILE)
+    translated = translate_segments_optimized(PUNCTED_TRANSCRIPTION_FILE_2, TRANSLATION_FILE)
     if not translated:
         logger.error("Übersetzung fehlgeschlagen oder keine Segmente vorhanden.")
         return
