@@ -1596,14 +1596,6 @@ def correct_grammar_transcription(input_file, output_file, lang="en-US"):
         logger.error(f"Fehler bei der Grammatikkorrektur: {e}", exc_info=True)
         return input_file
 
-# Lade das englische Transformer-Modell einmal global
-try:
-    nlp_en = spacy.load("en_core_web_trf")
-except OSError:
-    print("Fehler: Das Modell 'en_core_web_trf' ist nicht installiert. Bitte mit 'python -m spacy download en_core_web_trf' nachinstallieren.")
-    nlp_en = spacy.blank("en")
-    nlp_en.add_pipe("sentencizer")
-
 def ensure_transcription_quality_en(input_csv, output_csv):
     """
     Stellt sicher, dass die englische Transkription sauber segmentiert und konsistent ist.
@@ -1752,7 +1744,7 @@ def calculate_optimal_batch_size_rtx4050(texts, tokenizer, max_length=512):
     if estimated_memory_per_sample > 0:
         calculated_batch_size = int(usable_memory / estimated_memory_per_sample)
         # RTX 4050 Mobile Limits: Min 1, Max 6 für Translation
-        optimal_batch_size = max(1, min(calculated_batch_size, 1))
+        optimal_batch_size = max(1, min(calculated_batch_size, 4))
     else:
         optimal_batch_size = 2  # Sicherer Standard
     
@@ -1853,6 +1845,16 @@ def translate_batch_madlad400_corrected(
         logger.warning("Leere Textliste erhalten")
         return []
     
+    def sanitize_translation_text(text: str) -> str:
+        """Entfernt HTML-Tags und normalisiert Leerzeichen."""
+        if not isinstance(text, str):
+            return ""
+        # Entfernt alle HTML-Tags (z.B. <br>, <BR />)
+        clean_text = re.sub(r'<.*?>', ' ', text)
+        # Ersetzt mehrere Leerzeichen/Zeilenumbrüche durch ein einziges Leerzeichen
+        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+        return clean_text
+    
     # Automatische Batch-Größe für RTX 4050 Mobile
     if batch_size is None:
         batch_size = calculate_optimal_batch_size_rtx4050(texts, tokenizer)
@@ -1915,14 +1917,14 @@ def translate_batch_madlad400_corrected(
             results = translator.translate_batch(
                 tokenized_inputs,
                 batch_type="tokens",
-                max_batch_size=2048,  # Höherer Wert für RTX 4050
-                beam_size=25,          # Optimiert für Qualität/Geschwindigkeit
-                patience=3.0,         # Leicht erhöht für längere Sätze
-                max_decoding_length=2048,
+                max_batch_size=4096,  # Höherer Wert für RTX 4050
+                beam_size=7,          # Optimiert für Qualität/Geschwindigkeit
+                patience=2.0,         # Leicht erhöht für längere Sätze
+                length_penalty=0.9,
+                max_decoding_length=4096,
                 repetition_penalty=1.2,
-                no_repeat_ngram_size=1, 
+                no_repeat_ngram_size=3, 
                 disable_unk=False,     # Unbekannte Tokens blockieren
-                
             )
 
             
@@ -1936,14 +1938,8 @@ def translate_batch_madlad400_corrected(
                     translation = tokenizer.decode(tokens)
                     
                     # MADLAD400 Sprachpräfix entfernen
-                    tag_pattern = rf"<[0-9]?{target_lang}>"     # z. B. <de> oder <2de>
-                    src_tag_pattern = rf"<[0-9]?{source_lang}>" # z. B. <en> oder <0en>
-
-                    translation = re.sub(tag_pattern, "", translation)
-                    translation = re.sub(src_tag_pattern, "", translation)
-                    translation = translation.replace(f"{target_lang}>", "")  # Fangt Reste wie 'de>'
-
                     translation = translation.split("[CTX]", 1)[-1].strip()
+                    translation = sanitize_translation_text(translation)
                     batch_translations.append(translation)
                 else:
                     logger.warning(f"Keine Übersetzung für Text {j} in Batch")
@@ -1963,92 +1959,94 @@ def translate_batch_madlad400_corrected(
     logger.info(f"Übersetzung abgeschlossen: {len(all_translations)} Texte verarbeitet")
     return all_translations
 
-def translate_segments_optimized(transcription_file, translation_file, source_lang="en", target_lang="de"):
+def translate_segments_optimized(transcription_file, translation_output_file, cleaned_source_output_file, source_lang="en", target_lang="de"):
     """
-    Optimierte Übersetzung mit dynamischer Batchgrößen-Anpassung.
+    Optimierte Übersetzung mit Validierung, die eine bereinigte Übersetzungsdatei
+    UND eine passende bereinigte Quelldatei für die Qualitätsprüfung erstellt.
     """
-    
-    # Bestehende Übersetzungen laden (wie gehabt)
-    existing_translations = {}
+    if os.path.exists(translation_output_file):
+        if not ask_overwrite(translation_output_file):
+            logger.info(f"Verwende vorhandene Übersetzungen aus {translation_output_file}")
+            # Wenn die Übersetzung vorhanden ist, muss auch die bereinigte Quelldatei vorhanden sein.
+            if os.path.exists(cleaned_source_output_file):
+                return translation_output_file, cleaned_source_output_file
+            else:
+                logger.warning(f"Übersetzungsdatei '{translation_output_file}' existiert, aber die zugehörige bereinigte Quelldatei '{cleaned_source_output_file}' fehlt. Starte Prozess neu.")
+
+    def is_valid_segment(segment: dict, check_text_content=True) -> bool:
+        # (Unveränderte Hilfsfunktion von zuvor)
+        start = segment.get("start", 0)
+        end = segment.get("end", 0)
+        if end <= start: return False
+        if check_text_content:
+            text = segment.get("text", "").strip()
+            if not text or len(text) < 3 or text.lower() in ["de", "en", "fr", "es"]:
+                return False
+        return True
+
+    # Segmente laden und proaktiv filtern
+    all_segments = []
     end_times = {}
-    
-    if os.path.exists(translation_file):
-        if not ask_overwrite(translation_file):
-            logger.info(f"Fortsetzen mit vorhandenen Übersetzungen {translation_file}")
-            # Existing loading code hier...
-            return translation_file
-    
-    # Segmente laden
-    segments = []
     with open(transcription_file, mode="r", encoding="utf-8") as csvfile:
         csvreader = csv.reader(csvfile, delimiter="|")
-        next(csvreader)  # Header überspringen
+        next(csvreader, None)
         for row in csvreader:
             if len(row) >= 3:
-                start = sum(float(x) * (60 ** i) for i, x in enumerate(reversed(row[0].split(":"))))
-                end = sum(float(x) * (60 ** i) for i, x in enumerate(reversed(row[1].split(":"))))
-                end_times[row[0]] = row[1]
-                
-                if row[0] in existing_translations:
-                    continue
-                segments.append({"start": start, "end": end, "text": row[2], "start_str": row[0]})
+                start_str, end_str, text_content = row[0], row[1], row[2]
+                segment_data = {"start": parse_time(start_str), "end": parse_time(end_str), "text": text_content, "start_str": start_str}
+                if is_valid_segment(segment_data):
+                    all_segments.append(segment_data)
+                    end_times[start_str] = end_str
+                else:
+                    logger.warning(f"Überspringe ungültiges Eingabesegment: {row}")
     
-    if not segments:
-        logger.info("Keine neuen Segmente zu übersetzen!")
-        return existing_translations
+    if not all_segments:
+        logger.info("Keine gültigen Segmente zu übersetzen.")
+        return None, None
+
+    logger.info(f"Starte Übersetzung für {len(all_segments)} gültige Segmente.")
     
-    logger.info("=" * 50)
-    logger.info("Starte optimierte Übersetzung mit dynamischen Batches")
-    logger.info("=" * 50)
-    
-    translate_start_time = time.time()
-    setup_gpu_memory_optimization_rtx4050()
-    # GPU-Kontext für bessere Speicherverwaltung
+    # --- Übersetzungsprozess (unverändert) ---
+    final_translations = {} # Speichert {start_str: translated_text}
+    source_map = {seg['start_str']: seg['text'] for seg in all_segments} # Speichert {start_str: source_text}
+
     with gpu_context():
-        logger.info("MADLAD400-Modell wird initialisiert...")
         translator, tokenizer = load_madlad400_translator_optimized()
-        logger.info("MADLAD400-Modell initialisiert. Übersetzung startet...")
-        
-        # Dynamische Batchgröße bestimmen
-        optimal_batch_size = calculate_optimal_batch_size_rtx4050(segments, tokenizer, max_length=512)
-        segment_batches = [segments[i:i + optimal_batch_size] for i in range(0, len(segments), optimal_batch_size)]
+        optimal_batch_size = calculate_optimal_batch_size_rtx4050(all_segments, tokenizer)
+        segment_batches = [all_segments[i:i + optimal_batch_size] for i in range(0, len(all_segments), optimal_batch_size)]
 
-        for batch_idx, batch in enumerate(segment_batches):
-            batch_start_time = time.time()
-            print(f"Verarbeite Batch {batch_idx+1}/{len(segment_batches)} ({len(batch)} Segmente)...")
-
-            translations = translate_batch_madlad400_corrected(batch, translator, tokenizer, target_lang, batch_size=optimal_batch_size)
-
-            # Übersetzungen anzeigen
-            print(f"Übersetzte Texte für Batch {batch_idx+1}:")
+        for batch in segment_batches:
+            translations = translate_batch_madlad400_corrected(batch, translator, tokenizer, source_lang, target_lang, optimal_batch_size)
             for i, seg in enumerate(batch):
-                print(f"Segment {i+1} (Start: {seg['start_str']}): {translations[i]}")
-                
-            # Übersetzungen speichern
-            for i, seg in enumerate(batch):
-                existing_translations[seg["start_str"]] = translations[i]
-            batch_end_time = time.time() - batch_start_time
-            print(f"Batch {batch_idx+1}/{len(segment_batches)} in {batch_end_time:.2f} Sekunden verarbeitet.")
-    
-    # Ergebnisse speichern (bestehender Code)
-    with open(translation_file, mode="w", encoding="utf-8", newline="") as csvfile:
+                translated_text = translations[i]
+                validation_segment = {"start": 1, "end": 2, "text": translated_text}
+                if is_valid_segment(validation_segment):
+                    final_translations[seg["start_str"]] = translated_text
+                else:
+                    logger.warning(f"Übersetzung für Segment (Start: {seg['start_str']}) wurde als Artefakt verworfen.")
+
+    # --- DATEIEN SCHREIBEN ---
+    if not final_translations:
+        logger.error("Nach der Übersetzung wurden keine gültigen Segmente erzeugt.")
+        return None, None
+
+    # 1. Bereinigte Übersetzungsdatei schreiben
+    with open(translation_output_file, mode="w", encoding="utf-8", newline="") as csvfile:
         csvwriter = csv.writer(csvfile, delimiter="|")
         csvwriter.writerow(["Startzeit", "Endzeit", "Text"])
-        
-        for start_str, text in existing_translations.items():
-            if start_str in end_times:
-                end_str = end_times[start_str]
-                sanitized_text = sanitize_for_csv_and_tts(text) if 'sanitize_for_csv_and_tts' in globals() else text
-                csvwriter.writerow([start_str, end_str, sanitized_text])
+        for start_str, text in final_translations.items():
+            csvwriter.writerow([start_str, end_times[start_str], text])
     
-    translate_end_time = time.time() - translate_start_time
+    # 2. Passende, bereinigte Quelldatei schreiben
+    with open(cleaned_source_output_file, mode="w", encoding="utf-8", newline="") as csvfile:
+        csvwriter = csv.writer(csvfile, delimiter="|")
+        csvwriter.writerow(["Startzeit", "Endzeit", "Text"])
+        for start_str in final_translations.keys(): # Iteriere über die Schlüssel der erfolgreichen Übersetzungen
+            csvwriter.writerow([start_str, end_times[start_str], source_map[start_str]])
+
+    logger.info(f"{len(final_translations)} gültige Segmente in '{translation_output_file}' und '{cleaned_source_output_file}' geschrieben.")
     
-    logger.info(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden")
-    print(f"-----------------------------------")
-    print(f"|<< Übersetzung abgeschlossen!! >>|")
-    print(f"-----------------------------------")
-    
-    return existing_translations
+    return translation_output_file, cleaned_source_output_file
 
 def safe_restore_punctuation(text, model_instance):
     """ Robuste Funktion aus vorheriger Antwort, fängt Fehler ab """
@@ -2385,6 +2383,14 @@ def generate_semantic_embeddings(input_csv_path, output_npz_path, output_csv_pat
         torch.cuda.empty_cache()
         logger.info("Sentence Transformer Ressourcen freigegeben.")
 
+# Lade das englische und deutsche Transformer-Modell einmal global
+try:
+    nlp_en = spacy.load("en_core_web_trf")
+except OSError:
+    print("Fehler: Das Modell 'en_core_web_trf' ist nicht installiert. Bitte mit 'python -m spacy download en_core_web_trf' nachinstallieren.")
+    nlp_en = spacy.blank("en")
+    nlp_en.add_pipe("sentencizer")
+
 try:
 # Laden Sie das spaCy-Modell, das nun auf der GPU laufen wird
     nlp_de = spacy.load("de_dep_news_trf")
@@ -2393,7 +2399,7 @@ except OSError:
     nlp_de = spacy.blank("de")
     nlp_de.add_pipe("sentencizer")
 
-def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embeddings=False, embeddings_file=None, lt_path="D:\\LanguageTool-6.6"):
+def format_translation_for_tts(input_file, output_file, nlp, lang="de-DE", use_embeddings=False, embeddings_file=None, CHAR_LIMIT=CHAR_LIMIT, lt_path="D:\\LanguageTool-6.6"):
     """
     Optimiert übersetzte Segmente für TTS, indem Grammatik korrigiert und der Text in Abschnitte
     mit maximal 150 Zeichen pro Zeitstempel aufgeteilt wird, es sei denn, das neue Segment hätte
@@ -2402,6 +2408,7 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
     Args:
         input_file (str): Pfad zur CSV-Datei mit den übersetzten Segmenten.
         output_file (str): Pfad zur Ausgabedatei mit formatierten Segmenten.
+        nlp (spacy.Language): Das geladene spaCy-Sprachmodell (z.B. nlp_de oder nlp_en).
         lang (str): Sprachcode für LanguageTool (z.B. "de-DE").
         use_embeddings (bool): Ob semantische Embeddings für die Analyse verwendet werden sollen.
         embeddings_file (str): Pfad zur NPZ-Datei mit Embeddings.
@@ -2499,116 +2506,80 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
                 text = text.replace(placeholder, name)
             return text
 
-        def ensure_text_consistency_de(text):
+        def ensure_text_consistency_de(nlp_model, text):
             """
             Stellt mit spaCy sicher, dass der deutsche Text sinnvoll segmentiert und konsistent ist.
             """
-            doc = nlp_de(text)
+            doc = nlp_model(text)
             return " ".join([sent.text.strip() for sent in doc.sents if sent.text.strip()])
         
-        def split_text_by_char_limit(text: str, char_limit: int = 150,
-                                    hardlimit: int = 300) -> list[str]:
+        def split_text_robustly(text: str, char_limit: int = 150, min_words_for_new_chunk: int = 3) -> list[str]:
             """
-            Teilt Text in Abschnitte <= charlimit, aber NIE mitten im Satz.
-            • Liegt keine Satzgrenze (<.!?>) vor    → bis hardlimit UNGETEILT lassen
-            • Wenn Split nötig ist, suche rückwärts ab charlimit max. 40 Zeichen
-            nach einem Satzende; wird keins gefunden, bleibt der Satz komplett.
-            """
-            if len(text) <= char_limit:
-                return [text]
+            Teilt Text robust in Abschnitte unter dem 'char_limit' auf.
+            - Teilt primär an Satzgrenzen.
+            - Wenn ein Satz das Limit überschreitet, wird er an Wortgrenzen geteilt.
+            - Ein neuer Chunk wird nur erstellt, wenn die verbleibenden Wörter die Mindestanzahl erreichen.
 
-            # Kandidaten–Satzgrenzen (., !, ?) mit Leerzeichen danach
-            border = max(text.rfind(c, 0, char_limit) for c in ".!?")
-            # ggf. 2. Versuch – weitere 40 Zeichen Rücksprung
-            if border == -1:
-                border = max(text.rfind(c, 0, char_limit - 40) for c in ".!?")
+            Args:
+                text (str): Der zu teilende Text.
+                char_limit (int): Die maximale Zeichenanzahl pro Chunk.
+                min_words_for_new_chunk (int): Mindestanzahl an Wörtern für einen neuen Chunk.
 
-            # Keine Satzgrenze gefunden  →  Satz ungeteilt lassen (bis hardlimit)
-            if border == -1 or len(text) <= hardlimit:
-                return [text]
-
-            # Split hinter dem Satzzeichen (+1 wegen Leerzeichen)
-            border += 1
-            return [text[:border].strip(), text[border:].lstrip()]
-        
-        # Korrigierte Hilfsfunktion zum Aufteilen des Textes mit 3-Wörter-Regel
-        def split_text_with_3word_rule(text, char_limit=150):
+            Returns:
+                list[str]: Eine Liste mit den Text-Chunks.
             """
-            Teilt den Text in Abschnitte mit maximal 'char_limit' Zeichen auf.
-            Versucht, an Satzgrenzen zu teilen, falls möglich, sonst an Wortgrenzen.
-            Ignoriert das Limit, wenn das neue Segment weniger als 3 Wörter hätte.
-            """
-            if len(text) <= char_limit:
-                return [text]
+            chunks = []
+            # Zuerst den Text in Sätze aufteilen (einfacher Regex)
+            sentences = re.split(r'(?<=[.!?])\s+', text.strip())
             
-            sentences = split_into_sentences(text)
-            if len(sentences) == 1 and len(text) > char_limit:
-                # Wenn nur ein Satz, aber zu lang, teile an Wortgrenzen
-                words = text.split()
-                chunks = []
-                current_chunk = ""
-                i = 0
-                
-                while i < len(words):
-                    word = words[i]
-                    # Teste, ob das aktuelle Wort noch in den Chunk passt
-                    test_chunk = current_chunk + (" " + word if current_chunk else word)
+            current_chunk = ""
+            for sentence in sentences:
+                if not sentence:
+                    continue
                     
-                    if len(test_chunk) <= char_limit:
-                        # Wort passt in den aktuellen Chunk
-                        current_chunk = test_chunk
-                        i += 1
-                    else:
-                        # Wort passt nicht mehr, prüfe verbleibende Wörter
-                        remaining_words = words[i:]
-                        
-                        if len(remaining_words) < 3:
-                            # Weniger als 3 Wörter übrig, füge sie zum aktuellen Chunk hinzu (Regel ignorieren)
-                            current_chunk += " " + " ".join(remaining_words) if current_chunk else " ".join(remaining_words)
-                            chunks.append(current_chunk)
-                            break  # Alle Wörter verarbeitet
+                # Wenn der Satz allein schon zu lang ist, muss er intern geteilt werden
+                if len(sentence) > char_limit:
+                    # Aktuellen Chunk erst abschließen, falls vorhanden
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                        current_chunk = ""
+                    
+                    # Teile den langen Satz an Wortgrenzen
+                    words = sentence.split()
+                    sub_chunk = ""
+                    for i, word in enumerate(words):
+                        # Teste, ob das nächste Wort den sub_chunk überlaufen lässt
+                        if len(sub_chunk) + len(word) + 1 > char_limit:
+                            # Prüfe, ob die verbleibenden Wörter die 3-Wörter-Regel erfüllen
+                            remaining_words = words[i:]
+                            if len(remaining_words) < min_words_for_new_chunk:
+                                # Regel verletzt -> hänge den Rest an und beende
+                                sub_chunk += " " + " ".join(remaining_words)
+                                break  # Schleife über Wörter beenden
+                            else:
+                                # Regel erfüllt -> schließe den sub_chunk ab und starte einen neuen
+                                chunks.append(sub_chunk.strip())
+                                sub_chunk = word
                         else:
-                            # Genug Wörter für ein neues Segment, speichere aktuellen Chunk
-                            if current_chunk:
-                                chunks.append(current_chunk)
-                            current_chunk = word
-                            i += 1
-                
-                # Letzten Chunk hinzufügen, falls noch Inhalt vorhanden
-                if current_chunk and current_chunk not in chunks:
-                    chunks.append(current_chunk)
+                            sub_chunk = f"{sub_chunk} {word}" if sub_chunk else word
                     
-                return chunks
-            else:
-                # Teile an Satzgrenzen, wenn möglich, und kombiniere Sätze unter char_limit
-                chunks = []
-                current_chunk = ""
-                
-                for j, sentence in enumerate(sentences):
-                    test_chunk = current_chunk + (" " + sentence if current_chunk else sentence)
-                    
-                    if len(test_chunk) <= char_limit:
-                        # Satz passt in den aktuellen Chunk
-                        current_chunk = test_chunk
-                    else:
-                        # Satz passt nicht mehr, prüfe verbleibende Sätze
-                        remaining_sentences = sentences[j:]
-                        remaining_text = " ".join(remaining_sentences)
+                    # Füge den letzten sub_chunk des langen Satzes hinzu
+                    if sub_chunk:
+                        chunks.append(sub_chunk.strip())
                         
-                        if len(remaining_text.split()) < 3:
-                            # Weniger als 3 Wörter in verbleibenden Sätzen, füge sie hinzu
-                            current_chunk = test_chunk
-                        else:
-                            # Genug Wörter für neue Segmente, speichere aktuellen Chunk
-                            if current_chunk:
-                                chunks.append(current_chunk)
-                            current_chunk = sentence
+                # Wenn der Satz zum aktuellen Chunk passt, füge ihn hinzu
+                elif len(current_chunk) + len(sentence) + 1 <= char_limit:
+                    current_chunk = f"{current_chunk} {sentence}" if current_chunk else sentence
+                # Ansonsten schließe den alten Chunk ab und starte einen neuen mit diesem Satz
+                else:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = sentence
+
+            # Füge den allerletzten Chunk hinzu, falls er nicht leer ist
+            if current_chunk:
+                chunks.append(current_chunk.strip())
                 
-                # Letzten Chunk hinzufügen
-                if current_chunk:
-                    chunks.append(current_chunk)
-                    
-                return chunks
+            return chunks
         
         def ensure_context_closure(segments: list) -> list:
             """
@@ -2672,7 +2643,7 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
         # Schritt 2: Alle Texte in einem einzigen, GPU-beschleunigten Batch verarbeiten
         logger.info(f"Verarbeite {len(texts_to_process)} Texte mit spaCy auf der GPU...")
         # nlp.pipe ist für die Batch-Verarbeitung optimiert und nutzt die GPU effizient
-        processed_docs = list(nlp_de.pipe(texts_to_process, batch_size=50)) # batch_size kann je nach VRAM angepasst werden
+        processed_docs = list(nlp.pipe(texts_to_process, batch_size=50)) # batch_size kann je nach VRAM angepasst werden
         logger.info("spaCy-Verarbeitung abgeschlossen.")
 
         # Schritt 3: Die verarbeiteten Dokumente in der Hauptschleife verwenden
@@ -2702,11 +2673,11 @@ def format_translation_for_tts(input_file, output_file, lang="de-DE", use_embedd
             corrected_text = restore_names(corrected_text, protected_names)
 
             # 4. Textkonsistenz sicherstellen (kann ebenfalls das Doc verwenden)
-            final_text = ensure_text_consistency_de(corrected_text)
+            final_text = ensure_text_consistency_de(nlp, corrected_text)
             
             # 5. Text in Abschnitte mit maximal 150 Zeichen aufteilen
-            CHAR_LIMIT = 150
-            text_chunks = split_text_by_char_limit(final_text, char_limit=CHAR_LIMIT, hardlimit=210)
+            CHAR_LIMIT = CHAR_LIMIT
+            text_chunks = split_text_robustly(final_text, char_limit=CHAR_LIMIT, min_words_for_new_chunk=3)
             
             # Prüfe, ob Segmente das Limit überschreiten (für Statistiken)
             for chunk in text_chunks:
@@ -3262,6 +3233,7 @@ def main():
         logger.error("Transkription fehlgeschlagen oder keine Segmente gefunden.")
         return
     
+    """
     ensure_transcription_quality_en(TRANSCRIPTION_FILE, TRANSCRIPTION_CLEANED)
     
     # 6.1) Wiederherstellung der Interpunktion
@@ -3280,22 +3252,40 @@ def main():
         min_words=MIN_WORDS,
         iterations=ITERATIONS
     )
-    
+    """
     # 6.1) Wiederherstellung der Interpunktion
-    restore_punctuation(MERGED_TRANSCRIPTION_FILE, PUNCTED_TRANSCRIPTION_FILE_2)
+    restore_punctuation(TRANSCRIPTION_FILE, PUNCTED_TRANSCRIPTION_FILE_2)
+    
+    format_translation_for_tts(
+        PUNCTED_TRANSCRIPTION_FILE_2,
+        FORMATTED_TRANSKRIPTION_FILE,
+        nlp_en,
+        lang="en_US",
+        use_embeddings=False,
+        embeddings_file=None,
+        CHAR_LIMIT=CHAR_LIMIT,
+        lt_path="D:\\LanguageTool-6.6"
+    )
     
     # 7) Übersetzung der Segmente mithilfe von MADLAD400
-    translated = translate_segments_optimized(PUNCTED_TRANSCRIPTION_FILE_2, TRANSLATION_FILE)
-    if not translated:
-        logger.error("Übersetzung fehlgeschlagen oder keine Segmente vorhanden.")
+    translation_file_path, cleaned_source_path = translate_segments_optimized(
+        transcription_file=FORMATTED_TRANSKRIPTION_FILE,
+        translation_output_file=TRANSLATION_FILE,
+        cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK, # NEUER PARAMETER
+        source_lang="en",
+        target_lang="de"
+    )
+    
+    if not translation_file_path or not cleaned_source_path:
+        logger.error("Übersetzung fehlgeschlagen oder keine Segmente vorhanden. Breche ab.")
         return
     
     #restore_punctuation_de(TRANSLATION_FILE, PUNCTED_TRANSLATION_FILE)
 
     logger.info("Starte optionalen Schritt: Qualitätsprüfung der Übersetzung.")
     evaluate_translation_quality(
-        source_csv_path=MERGED_TRANSCRIPTION_FILE,
-        translated_csv_path=TRANSLATION_FILE,
+        source_csv_path=cleaned_source_path, # WICHTIG: Der neue Pfad
+        translated_csv_path=translation_file_path, # Der Pfad zur passenden Übersetzung
         report_path=TRANSLATION_QUALITY_REPORT,
         model_name=ST_QUALITY_MODEL,
         threshold=SIMILARITY_THRESHOLD
@@ -3304,7 +3294,7 @@ def main():
 
 #   6.1) Zusammenführen von Transkript-Segmenten
     merge_transcript_chunks(
-        input_file=TRANSLATION_FILE,
+        input_file=translation_file_path,
         output_file=MERGED_TRANSLATION_FILE,
         min_dur=MIN_DUR_TRANSLATION,
         max_dur=MAX_DUR_TRANSLATION,
@@ -3327,6 +3317,7 @@ def main():
     format_translation_for_tts(
         MERGED_TRANSLATION_FILE,
         TTS_FORMATTED_TRANSLATION_FILE,
+        nlp_de,
         lang="de-DE",
         use_embeddings=True,
         embeddings_file=EMBEDDINGS_FILE_NPZ,
