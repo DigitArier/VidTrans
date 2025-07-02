@@ -3099,7 +3099,7 @@ def text_to_speech_with_voice_cloning(
     sample_path_2,
     sample_path_3,
     output_path,
-    batch_size=32 
+    batch_size=16 
 ):
     """
     Finalisierte, robuste TTS-Funktion, die durch eine zweistufige FFmpeg-Verarbeitung 
@@ -3111,7 +3111,7 @@ def text_to_speech_with_voice_cloning(
     
     stretched_chunks_dir = os.path.join(TTS_TEMP_CHUNKS_DIR, "stretched")
     concat_list_path = "ffmpeg_concat_list.txt"
-    MIN_GAP_SEC = 0.5  # Die feste Pause, die bei einer Überlappung eingefügt wird.
+    MIN_GAP_SEC = 0.25  # Die feste Pause, die bei einer Überlappung eingefügt wird.
 
     if os.path.exists(output_path):
         if not ask_overwrite(output_path):
@@ -3280,7 +3280,7 @@ def text_to_speech_with_voice_cloning(
 
             if target_duration > 0.01 and actual_duration > 0.01:
                 speed_factor = actual_duration / target_duration
-                capped_speed_factor = max(0.7, min(speed_factor, 1.3))
+                capped_speed_factor = max(0.8, min(speed_factor, 1.3))
                 
                 if abs(capped_speed_factor - speed_factor) > 0.01:
                     logger.warning(f"Stretch-Faktor ({speed_factor:.2f}) für Segment bei {segment_data[0]} auf {capped_speed_factor:.2f} begrenzt.")
@@ -3291,7 +3291,6 @@ def text_to_speech_with_voice_cloning(
             else:
                 shutil.copy(chunk_path, stretched_chunk_path)
             
-            # NEUE LOGIK ZUR VERHINDERUNG VON ÜBERLAPPUNGEN
             # Berechne die tatsächliche Dauer des bearbeiteten Chunks
             stretched_duration = sf.info(stretched_chunk_path).duration
             
