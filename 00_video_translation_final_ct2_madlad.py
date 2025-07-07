@@ -46,7 +46,7 @@ from tokenizers import Encoding, Tokenizer
 from tokenizers.models import BPE
 import packaging
 import spacy
-from spacy.language import Language
+#from spacy.language import Language
 import ftfy
 from ftfy import fix_encoding
 import torch
@@ -134,20 +134,31 @@ from silero_vad import(
 def optimize_for_video_translation():
     """Optimiert CPU-Konfiguration für Video-Übersetzung"""
     try:
-        if ctypes.windll.shell32.IsUserAnAdmin():
-            # P-Core-Affinität setzen
+        # P-Core-Affinität für Windows
+        if sys.platform == "win32" and ctypes.windll.shell32.IsUserAnAdmin():
             current_process = psutil.Process(os.getpid())
-            current_process.cpu_affinity(list(range(0, 12)))
-            
-            # PyTorch für P-Cores optimieren
-            torch.set_num_threads(6)  # Ihre bestehende Zeile anpassen
-            os.environ["OMP_NUM_THREADS"] = "6"  # Ihre bestehende Zeile anpassen
-            
-            print("✓ Video-Übersetzung für P-Cores optimiert")
-            return True
-    except:
-        pass
-    return False
+            # Annahme: 8 P-Cores für i7-13700H
+            p_cores = [i for i in range(psutil.cpu_count(logical=False))]
+            current_process.cpu_affinity(p_cores)
+            thread_count = len(p_cores)
+            torch.set_num_threads(thread_count)
+            os.environ["OMP_NUM_THREADS"] = str(thread_count)
+            logger.info(f"Prozessaffinität auf {thread_count} P-Cores gesetzt.")
+    except Exception as e:
+        logger.warning(f"CPU-Affinität konnte nicht gesetzt werden: {e}")
+    
+    # PyTorch & CUDA Optimierungen
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+        global device
+        device = "cuda"
+        logger.info("CUDA ist verfügbar und für Performance konfiguriert.")
+    else:
+        device = "cpu"
+        logger.warning("CUDA nicht verfügbar. Fallback auf CPU.")
 
 # Direkte Ausführung
 optimize_for_video_translation()
@@ -155,12 +166,8 @@ optimize_for_video_translation()
 # Multiprocessing-Setup
 mp.set_start_method('spawn', force=True)
 
-torch.backends.cuda.matmul.allow_tf32 = True  # Schnellere Matrix-Multiplikationen
-torch.backends.cudnn.allow_tf32 = True        # TF32 für cuDNN aktivieren
-torch.backends.cudnn.benchmark = True         # Optimale Kernel-Auswahl
 torch.backends.cudnn.deterministic = False    # Nicht-deterministische Optimierungen erlauben
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 os.environ['TORCH_BLAS_PREFER_CUBLASLT'] = '1'
 os.environ["CT2_FLASH_ATTENTION"] = "1"
 os.environ["CT2_VERBOSE"] = "1"
@@ -187,9 +194,11 @@ VOLUME_ADJUSTMENT_VIDEO = 0.04   # Lautstärkefaktor für das Video
 # ==============================
 
 try:
+    # Versucht, die GPU für spaCy zu aktivieren
     spacy.require_gpu()
     print("✅ GPU für spaCy erfolgreich aktiviert.")
 except:
+    # Fallback auf CPU, falls die GPU-Aktivierung fehlschlägt
     print("⚠️ GPU für spaCy konnte nicht aktiviert werden. Fallback auf CPU.")
 
 # Gerät bestimmen (GPU bevorzugt, aber CPU als Fallback)
@@ -197,23 +206,28 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Verwende Gerät: {device}")
 if device == "cpu":
     logger.warning("GPU/CUDA nicht verfügbar. Falle auf CPU zurück. Die Verarbeitung kann langsamer sein.")
+
+# Startzeit für die Gesamtmessung
 start_time = time.time()
 step_times = {}
-device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Sprachkürzel für das gesamte Projekt
 source_lang="en"
 target_lang="de"
+
 # Konfigurationen für die Verwendung von CUDA
 cuda_options = {
     "hwaccel": "cuda",
     "hwaccel_output_format": "cuda"
 }
+
 def run_command(command):
-    
+    """Führt einen Shell-Befehl aus und gibt ihn vorher aus."""
     print(f"Ausführung des Befehls: {command}")
     subprocess.run(command, shell=True, check=True)
 
 def time_function(func, *args, **kwargs):
-        """Misst die Ausführungszeit einer Funktion."""
+        """Misst und protokolliert die Ausführungszeit einer Funktion."""
         start = time.time()
         result = func(*args, **kwargs)
         end = time.time()
@@ -221,54 +235,32 @@ def time_function(func, *args, **kwargs):
         logger.info(f"Execution time for {func.__name__}: {execution_time:.4f} seconds")
         return result, execution_time
 
+# Fortgeschrittene CUDA- und Attention-Optimierungen
 def configure_cusolver_optimizations():
-    """Konfiguriert cuSOLVER für RTX 4050 Mobile"""
-    
-    # cuSOLVER als bevorzugte Bibliothek setzen
+    """Konfiguriert cuSOLVER als bevorzugte lineare Algebra-Bibliothek."""
     torch.backends.cuda.preferred_linalg_library("cusolver")
-    
-    # TensorFloat-32 für Ampere+ GPUs aktivieren
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    
     torch.backends.cuda.preferred_blas_library = "cublas"
-    
     logger.info("cuSOLVER-Optimierungen aktiviert für RTX 4050")
 
 def configure_attention_backends():
-    """Optimiert Attention-Mechanismen für maximale Geschwindigkeit"""
-    
-    # Flash Attention aktivieren (falls verfügbar)
+    """Aktiviert die schnellsten verfügbaren Attention-Backends."""
     torch.backends.cuda.enable_flash_sdp(True)
-    
-    # Memory-efficient Attention als Fallback
     torch.backends.cuda.enable_mem_efficient_sdp(True)
-    
-    # Math-based Attention deaktivieren (langsamste Option)
     torch.backends.cuda.enable_math_sdp(False)
-    
     logger.info("Optimierte Attention-Backends aktiviert")
 
 def advanced_cuda_configuration():
-    """Fortgeschrittene CUDA-Optimierungen für RTX 4050"""
-    
-    # cuFFT Cache für Transformer-FFN-Layers optimieren
+    """Setzt weitere spezifische CUDA-Optimierungen für die Zielhardware."""
     torch.backends.cuda.cufft_plan_cache.max_size = 32
-    
-    # Optimierte Reduced Precision für FP16
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-    
-    # Memory Pool für konstante Allokationen
-    #torch.cuda.memory._set_allocator_settings("expandable_segments:True")
-    
-    # Multi-Head Attention Fast Path aktivieren
     torch.backends.mha.set_fastpath_enabled(True)
+    logger.info("Fortgeschrittene CUDA-Konfigurationen geladen.")
 
+# Modell-Ladefunktionen
 def load_whisper_model():
-    """
-    Lädt das Whisper-Modell in INT8-Quantisierung für schnellere GPU-Inferenz
-    und richtet die gebatchte Pipeline ein.
-    """
+    """Lädt das Faster-Whisper-Modell (large-v3) für die Transkription."""
     model_size = "large-v3"
     # compute_type="int8_float16" nutzt INT8-Gewichte + FP16-Aktivierungen für Speed & geringen Speicher
     fw_model = WhisperModel(model_size, device="auto", compute_type="bfloat16", cpu_threads=6, local_files_only=True)
@@ -384,14 +376,92 @@ def load_xtts_v2():
     xtts_model.eval()
 
     return xtts_model
+
 # Context Manager für GPU-Operationen
 @contextmanager
 def gpu_context():
+    """Stellt sicher, dass der GPU-Speicher nach einer Operation freigegeben wird."""
     try:
         yield
     finally:
-        torch.cuda.empty_cache()
-        logger.info("GPU-Speicher bereinigt")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info("GPU-Speicher bereinigt")
+
+def ask_overwrite(file_path):
+    """
+    Fragt den Benutzer, ob eine vorhandene Datei überschrieben werden soll
+
+    Args:
+        file_path (str): Pfad zur Datei
+        
+    Returns:
+        bool: True wenn überschrieben werden soll, sonst False
+    """
+    while True:
+        answer = input(f"Datei '{os.path.basename(file_path)}' existiert bereits. Überschreiben? (j/n, Enter für Nein): ").lower().strip()
+        if answer in ['j', 'ja']:
+            return True
+        elif answer == "" or answer in ['n', 'nein']:
+            return False
+        print("Ungültige Eingabe. Bitte 'j' oder 'n' antworten.")
+
+def extract_audio_ffmpeg(video_path, audio_output):
+    """Extrahiert die Audiospur aus dem Video (Mono, 44.100 Hz)."""
+    if os.path.exists(audio_output):
+        if not ask_overwrite(audio_output):
+            logger.info(f"Verwende vorhandene Datei: {audio_output}")
+            return
+    try:
+        ffmpeg.input(video_path, hwaccel="cuda", hwaccel_output_format="cuda").output(
+            audio_output,
+            threads=0,      # Verwendet alle verfügbaren Threads
+            f="wav",
+            acodec="pcm_s16le",
+            ac=1,  # Mono-Audio
+            ar="16000"  # 44.100 Hz
+            ).run()
+        logger.info(f"Audio extrahiert: {audio_output}")
+    except ffmpeg.Error as e:
+        logger.error(f"Fehler bei der Audioextraktion: {e}")
+
+def create_voice_sample(audio_path, sample_path_1, sample_path_2, sample_path_3):
+    """Erstellt ein Voice-Sample aus dem verarbeiteten Audio für Stimmenklonung."""
+    sample_paths = [sample_path_1, sample_path_2, sample_path_3]
+    for i, sample_path in enumerate(sample_paths, 1):
+        if os.path.exists(sample_path):
+            if not ask_overwrite(sample_path):
+                logger.info(f"Verwende vorhandenes Sample #{i}: {sample_path}")
+                continue
+
+    while True:
+        start_time_str = input(f"Startzeit für Sample #{i} (in Sekunden, Enter zum Überspringen): ")
+        if not start_time_str:
+            logger.info(f"Erstellung von Sample #{i} übersprungen.")
+            break
+        
+        end_time_str = input(f"Endzeit für Sample #{i} (in Sekunden): ")
+        try:
+            start_seconds = float(start_time_str)
+            end_seconds = float(end_time_str)
+            duration = end_seconds - start_seconds
+            
+            if duration <= 0:
+                logger.warning("Endzeit muss nach der Startzeit liegen.")
+                continue
+            
+            (
+                ffmpeg.input(audio_path, ss=start_seconds, t=duration).output(
+                    sample_path,
+                    acodec='pcm_s16le',
+                    ac=1,
+                    ar=22050
+                ).run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
+            )
+            logger.info(f"Voice-Sample #{i} erfolgreich erstellt: {sample_path}")
+            break
+        except (ValueError, ffmpeg.Error) as e:
+            logger.error(f"Fehler beim Erstellen von Sample #{i}: {e}")
 
 def check_completion_status(output_file, expected_count=None, reference_file=None):
     """
@@ -585,25 +655,6 @@ def handle_key_based_continuation(output_file, reference_file=None, key_column_i
     else:
         logger.info(f"Setze unvollständige Verarbeitung fort: {len(processed_keys)} Segmente bereits verarbeitet.")
         return True, processed_keys
-
-def extract_audio_ffmpeg(video_path, audio_output):
-    """Extrahiert die Audiospur aus dem Video (Mono, 44.100 Hz)."""
-    if os.path.exists(audio_output):
-        if not ask_overwrite(audio_output):
-            logger.info(f"Verwende vorhandene Datei: {audio_output}")
-            return
-    try:
-        ffmpeg.input(video_path, hwaccel="cuda", hwaccel_output_format="cuda").output(
-            audio_output,
-            threads=0,      # Verwendet alle verfügbaren Threads
-            f="wav",
-            acodec="pcm_s16le",
-            ac=1,  # Mono-Audio
-            ar="16000"  # 44.100 Hz
-            ).run()
-        logger.info(f"Audio extrahiert: {audio_output}")
-    except ffmpeg.Error as e:
-        logger.error(f"Fehler bei der Audioextraktion: {e}")
 
 def process_audio(input_file, output_file):
     if os.path.exists(output_file):
@@ -838,113 +889,26 @@ def detect_speech(audio_path, only_speech_path):
         logger.error(f"Fehler bei der Sprachaktivitätserkennung: {e}", exc_info=True)
         return []
 
-def create_voice_sample(audio_path, sample_path_1, sample_path_2, sample_path_3):
-
-    """Erstellt ein Voice-Sample aus dem verarbeiteten Audio für Stimmenklonung."""
-    if os.path.exists(sample_path_1):
-        choice = input("Ein Sample #1 existiert bereits. Möchten Sie ein neues erstellen? (j/n, ENTER zum Überspringen): ").strip().lower()
-        if choice == "" or choice in ["n", "nein"]:
-            logger.info("Verwende vorhandene sample.wav.", exc_info=True)
-            return
-
-    while True:
-        start_time = input("Startzeit für das Sample #1 (in Sekunden): ")
-        end_time = input("Endzeit für das Sample #1 (in Sekunden): ")
+def clear_gpu_memory_before_tts():
+    """Bereinigt GPU-Speicher vor TTS-Initialisierung"""
+    try:
+        # Explizite Garbage Collection
+        gc.collect()
         
-        if start_time == "" or end_time == "":
-            logger.info("Erstellung der sample.wav übersprungen.", exc_info=True)
-            continue
+        # CUDA Memory Cache leeren
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            
+        # Kurze Pause für GPU-Driver
+        time.sleep(2)
         
-        try:
-            start_seconds = float(start_time)
-            end_seconds = float(end_time)
-            duration = end_seconds - start_seconds
-            
-            if duration <= 0:
-                logger.warning("Endzeit muss nach der Startzeit liegen.")
-                continue
-            
-            ffmpeg.input(audio_path, ss=start_seconds, t=duration).output(
-                sample_path_1,
-                acodec='pcm_s16le',
-                ac=1,
-                ar=22050
-            ).overwrite_output().run(capture_stdout=True, capture_stderr=True)
+        logger.info("GPU-Speicher vor TTS bereinigt")
+        return True
+    except Exception as e:
+        logger.error(f"Fehler bei GPU-Bereinigung: {e}")
+        return False
 
-        except ValueError:
-            logger.error("Ungültige Eingabe. Bitte gültige Zahlen eintragen.")
-            continue
-        
-        if os.path.exists(sample_path_2):
-            choice = input("Ein Sample #2 existiert bereits. Möchten Sie ein neues erstellen? (j/n, ENTER zum Überspringen): ").strip().lower()
-            if choice == "" or choice in ["n", "nein"]:
-                logger.info("Verwende vorhandene sample.wav.", exc_info=True)
-                continue
-
-        while True:
-            start_time = input("Startzeit für das Sample #2 (in Sekunden): ")
-            end_time = input("Endzeit für das Sample #2 (in Sekunden): ")
-            
-            if start_time == "" or end_time == "":
-                logger.info("Erstellung der sample.wav übersprungen.", exc_info=True)
-                continue
-            
-            try:
-                start_seconds = float(start_time)
-                end_seconds = float(end_time)
-                duration = end_seconds - start_seconds
-                
-                if duration <= 0:
-                    logger.warning("Endzeit muss nach der Startzeit liegen.")
-                    continue
-
-                ffmpeg.input(audio_path, ss=start_seconds, t=duration).output(
-                    sample_path_2,
-                    acodec='pcm_s16le',
-                    ac=1,
-                    ar=22050
-                ).overwrite_output().run(capture_stdout=True, capture_stderr=True)
-
-            except ValueError:
-                logger.error("Ungültige Eingabe. Bitte gültige Zahlen eintragen.")
-                continue
-
-            if os.path.exists(sample_path_3):
-                choice = input("Ein Sample #3 existiert bereits. Möchten Sie ein neues erstellen? (j/n, ENTER zum Überspringen): ").strip().lower()
-                if choice == "" or choice in ["n", "nein"]:
-                    logger.info("Verwende vorhandene sample.wav.", exc_info=True)
-                    continue
-                
-            while True:
-                start_time = input("Startzeit für das Sample #3 (in Sekunden): ")
-                end_time = input("Endzeit für das Sample #3 (in Sekunden): ")
-                
-                if start_time == "" or end_time == "":
-                    logger.info("Erstellung der sample.wav übersprungen.", exc_info=True)
-                    continue
-                
-                try:
-                    start_seconds = float(start_time)
-                    end_seconds = float(end_time)
-                    duration = end_seconds - start_seconds
-                    
-                    if duration <= 0:
-                        logger.warning("Endzeit muss nach der Startzeit liegen.")
-                        continue
-                    
-                    ffmpeg.input(audio_path, ss=start_seconds, t=duration).output(
-                        sample_path_3,
-                        acodec='pcm_s16le',
-                        ac=1,
-                        ar=22050
-                    ).overwrite_output().run(capture_stdout=True, capture_stderr=True)
-
-                    logger.info(f"Voice sample erstellt: {sample_path_1, sample_path_2, sample_path_3}", exc_info=True)
-                    return
-                except ValueError:
-                    logger.error("Ungültige Eingabe. Bitte gültige Zahlen eintragen.")
-                except ffmpeg.Error as e:
-                    logger.error(f"Fehler beim Erstellen des Voice Samples: {e}")
 # Transkriberen
 def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_interval=10):
     """
@@ -975,11 +939,11 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
             
             # VAD-Parameter für die Sprachsegmentierung definieren
             vad_params = {
-                "threshold": 0.5,               # Niedriger Schwellwert für empfindlichere Spracherkennung
+                "threshold": 0.05,               # Niedriger Schwellwert für empfindlichere Spracherkennung
                 "min_speech_duration_ms": 0,  # Minimale Sprachdauer in Millisekunden
                 #"max_speech_duration_s": 30,    # Maximale Sprachdauer in Sekunden
                 "min_silence_duration_ms": 0, # Minimale Stille-Dauer zwischen Segmenten
-                #"speech_pad_ms": 400            # Polsterzeit vor und nach Sprachsegmenten
+                "speech_pad_ms": 400            # Polsterzeit vor und nach Sprachsegmenten
             }
             
             segments_generator, info = pipeline.transcribe(
@@ -996,7 +960,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
                 #temperature=(0.05, 0.1, 0.15, 0.2, 0.25, 0.5),      # Temperatur für Sampling
                 temperature=1,                  # Temperatur für Sampling
                 word_timestamps=True,               # Zeitstempel für Wörter
-                hallucination_silence_threshold=0.5,  # Schwellenwert für Halluzinationen
+                hallucination_silence_threshold=0.3,  # Schwellenwert für Halluzinationen
                 condition_on_previous_text=True,    # Bedingung an vorherigen Text
                 no_repeat_ngram_size=3,
                 repetition_penalty=1.05,
@@ -1161,24 +1125,6 @@ def split_into_sentences(text):
         return [text]
     
     return sentences
-
-def ask_overwrite(file_path):
-    """
-    Fragt den Benutzer, ob eine vorhandene Datei überschrieben werden soll
-
-    Args:
-        file_path (str): Pfad zur Datei
-        
-    Returns:
-        bool: True wenn überschrieben werden soll, sonst False
-    """
-    while True:
-        answer = input(f"Datei '{file_path}' existiert bereits. Überschreiben? (j/n): ").lower()
-        if answer in ['j', 'ja']:
-            return True
-        elif answer == "" or answer in ['n', 'nein']:
-            return False
-        print("Bitte mit 'j' oder 'n' antworten.")
 
 def read_translated_csv(file_path):
     """
@@ -2086,7 +2032,7 @@ def translate_batch_madlad400(
             if not text_content.strip():
                 text_content = ""
             
-            # KORREKTUR: Entferne ALLE bestehenden Sprachpräfixe
+            # Entferne ALLE bestehenden Sprachpräfixe
             text_content = re.sub(r'^<2[a-z]{2}>\s*', '', text_content).strip()
             
             # KRITISCH: Erstelle korrekten MADLAD400-Input mit Zielsprache im Source
@@ -2116,9 +2062,9 @@ def translate_batch_madlad400(
             # Das Ziel ist bereits im Source-Text kodiert
             results = translator.translate_batch(
                 source_tokens,
-                beam_size=10,
-                patience=5.0,
-                length_penalty=1.0,
+                beam_size=7,
+                patience=7.0,
+                length_penalty=1.1,
                 repetition_penalty=1.05,
                 no_repeat_ngram_size=2,
                 max_decoding_length=256
@@ -2727,20 +2673,18 @@ def generate_semantic_embeddings(input_csv_path, output_npz_path, output_csv_pat
         logger.info("Sentence Transformer Ressourcen freigegeben.")
 
 # Lade das englische und deutsche Transformer-Modell einmal global
-try:
-    nlp_en = spacy.load("en_core_web_trf")
-except OSError:
-    print("Fehler: Das Modell 'en_core_web_trf' ist nicht installiert. Bitte mit 'python -m spacy download en_core_web_trf' nachinstallieren.")
-    nlp_en = spacy.blank("en")
-    nlp_en.add_pipe("sentencizer")
+def load_spacy_model(model_name):
+    """Lädt ein spaCy-Modell sicher."""
+    try:
+        return spacy.load(model_name)
+    except OSError:
+        logger.critical(f"spaCy-Modell '{model_name}' nicht gefunden. Bitte mit 'python -m spacy download {model_name}' installieren.")
+        sys.exit(1)
 
-try:
-# Laden Sie das spaCy-Modell, das nun auf der GPU laufen wird
-    nlp_de = spacy.load("de_dep_news_trf")
-except OSError:
-    print("Fehler: Das Modell 'de_dep_news_trf' ist nicht installiert. Bitte mit 'python -m spacy download de_dep_news_trf' nachinstallieren.")
-    nlp_de = spacy.blank("de")
-    nlp_de.add_pipe("sentencizer")
+logger.info("Lade globale spaCy-Modelle...")
+nlp_en = load_spacy_model("en_core_web_trf")
+nlp_de = load_spacy_model("de_dep_news_trf")
+logger.info("spaCy-Modelle erfolgreich geladen.")
 
 def format_translation_for_tts(input_file, output_file, nlp, lang="de-DE", use_embeddings=False, embeddings_file=None, CHAR_LIMIT=None, lt_path="D:\\LanguageTool-6.6"):
     """
@@ -3175,7 +3119,6 @@ def text_to_speech_with_voice_cloning(
             logger.info("Überschreibe Zieldatei. Alte temporäre Dateien werden entfernt.")
             if os.path.exists(TTS_TEMP_CHUNKS_DIR): shutil.rmtree(TTS_TEMP_CHUNKS_DIR)
             if os.path.exists(TTS_PROGRESS_MANIFEST): os.remove(TTS_PROGRESS_MANIFEST)
-            os.makedirs(TTS_TEMP_CHUNKS_DIR)
 
     # Flag zur Nachverfolgung des Erfolgs für eine sichere Bereinigung am Ende
     process_successful = False
@@ -3257,6 +3200,7 @@ def text_to_speech_with_voice_cloning(
 
             # Basismodell freigeben, um Speicher zu sparen
             del xtts_model
+            clear_gpu_memory_before_tts()
 
             # Synthese-Schleife
             for segment_info in tqdm(segments_to_process, desc="Synthetisiere Audio-Chunks"):
@@ -3274,7 +3218,7 @@ def text_to_speech_with_voice_cloning(
                         top_p=0.9
                     )
                 
-                print(f"\nSegment {segment_info['id']} verarbeitet: {segment_info['text']}...\n")
+                print(f"\nSegment {segment_info['id']} verarbeitet:\n{segment_info['text']}...\n\n")
                 
                 audio_clip = result.get("wav", np.zeros(1, dtype=np.float32))
                 chunk_filename = f"chunk_{segment_info['id']}.wav"
@@ -3381,10 +3325,9 @@ def resample_to_44100_stereo(input_path, output_path, speed_factor):
     """
     Resample das Audio auf 44.100 Hz (Stereo), passe die Wiedergabegeschwindigkeit sowie die Lautstärke an.
     """
-    if os.path.exists(output_path):
-        if not ask_overwrite(output_path):
-            logger.info(f"Verwende vorhandene Datei: {output_path}", exc_info=True)
-            return
+    if os.path.exists(output_path) and not ask_overwrite(output_path):
+        logger.info(f"Verwende vorhandene resampelte Datei: {output_path}")
+        return
 
     try:
         print("-------------------------")
