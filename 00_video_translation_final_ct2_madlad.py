@@ -1179,7 +1179,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
         # Wir überspringen manuell die bereits verarbeiteten Segmente.
         
         # Initialisiere tqdm ohne die Gesamtanzahl
-        progress_bar = tqdm(desc="\nTranskribiere Segmente", unit=" seg")
+        progress_bar = tqdm(desc="\nTranskribiere Segmente", unit=" seg\n")
         
         for i, segment in enumerate(segments_generator):
             progress_bar.update(1) # Zähler des Fortschrittsbalkens manuell erhöhen
@@ -1193,7 +1193,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
             text = re.sub(r'\.\.\.$', '', segment.text.strip()).strip()
             
             # Die Live-Ausgabe bleibt erhalten und sollte nun sofort erscheinen
-            print(f"[{start} --> {end}] {text}")
+            print(f"[{start} --> {end}]:\n{text}")
             
             adjusted_segment = {"startzeit": start, "endzeit": end, "text": text}
             new_segments_batch.append(adjusted_segment)
@@ -2432,7 +2432,7 @@ def translate_segments_optimized_safe(transcription_file, translation_output_fil
     Sichere Übersetzung mit Fortschrittsspeicherung, die robust gegen Wiederaufnahme ist,
     indem sie die korrekte schlüsselbasierte Logik verwendet.
     """
-    # KORREKTUR: Ruft die neue, spezialisierte Funktion für die schlüsselbasierte Wiederaufnahme auf.
+    # Ruft eine spezialisierte Funktion für die schlüsselbasierte Wiederaufnahme auf.
     should_continue_translation, processed_translation_keys = handle_key_based_continuation(
         translation_output_file, transcription_file, key_column_index=0
     )
@@ -2509,7 +2509,7 @@ def translate_segments_optimized_safe(transcription_file, translation_output_fil
                 for j, seg in enumerate(batch):
                     translated_text = translations[j] if j < len(translations) else ""
                     
-                    print(f"Segment [{seg['start_str']} -> {seg['end_str']}] = {translated_text}")
+                    print(f"[{seg['start_str']} --> {seg['end_str']}]:\n{translated_text}")
                     
                     validation_segment = {"start": seg['start'], "end": seg['end'], "text": translated_text}
                     if is_valid_segment(validation_segment, check_text_content=True):
@@ -3802,37 +3802,26 @@ def text_to_speech_with_voice_cloning(
                                 gpt_cond_latent=gpt_cond_latent,
                                 speaker_embedding=speaker_embedding,
                                 speed=1.1,
-                                temperature=0.75,
+                                temperature=0.85,
                                 repetition_penalty=5.0,
                                 top_k=65,
                                 top_p=0.9,
                                 enable_text_splitting=False
                             )
-                            print(f"\nSegment {segment_info['id']} verarbeitet:\n{segment_info['start']} -> {segment_info['end']}\n{segment_info['text']}...\n")
+                            print(f"[{segment_info['start']} --> {segment_info['end']}]:\n{segment_info['text']}...\n")
                         audio_clip = result.get("wav")
-                        if audio_clip is None or audio_clip.numel() == 0:
+                        if audio_clip is None or audio_clip.size == 0:
                             logger.warning(f"Leeres Audio für Segment {segment_info['id']} erhalten.")
                             continue
                     
-                        
-                    
-                        # Asynchroner Transfer zur CPU
-                        audio_cpu = audio_clip.to('cpu', non_blocking=True)
-                        
-                        # Warten, bis der Transfer abgeschlossen ist, bevor gespeichert wird.
-                        # Der StreamManager.synchronize() am Ende des Blocks stellt dies sicher.
-                        
                         # Audio speichern (nachdem der Stream synchronisiert wurde)
                         chunk_filename = f"chunk_{segment_info['id']}.wav"
                         chunk_path = os.path.join(TTS_TEMP_CHUNKS_DIR, chunk_filename)
                         
                         # Um sicherzugehen, dass die CPU-Daten bereit sind, wird hier synchronisiert.
                         # Der StreamManager synchronisiert am Ende des with-Blocks nochmals global.
-                
-                        if stream:
-                            stream.synchronize()
-                            
-                        sf.write(chunk_path, audio_cpu.numpy(), 24000)
+
+                        sf.write(chunk_path, audio_clip, 24000)
                         log_progress(segment_info, chunk_path)
 
                     except Exception as e:
