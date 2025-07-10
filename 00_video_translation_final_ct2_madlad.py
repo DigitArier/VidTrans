@@ -1,6 +1,5 @@
 import os
 import logging
-
 from sympy import true
 
 # ==============================
@@ -27,7 +26,7 @@ import sys
 import ctypes
 import re
 import gc
-from typing import List, Dict, Tuple, Union, Set
+from typing import Callable, Optional, Any, List, Dict, Tuple, Union, Set
 from dataclasses import dataclass
 from pathlib import Path
 from config import *
@@ -53,6 +52,7 @@ import ftfy
 from ftfy import fix_encoding
 import torch
 from torch import autocast
+from torch.cuda import Stream
 torch.set_num_threads(6)
 import tensor_parallel
 import deepspeed
@@ -132,14 +132,15 @@ from silero_vad import(
     collect_chunks
     )
 
-# Sofortige P-Core-Optimierung
-def optimize_for_video_translation():
-    """Optimiert CPU-Konfiguration für Video-Übersetzung"""
+def setup_global_torch_optimizations():
+    """
+    NEUE VERSION: Konzentriert sich auf globale, statische Optimierungen für PyTorch und CUDA.
+    Die dynamische Stream-Erstellung wird in den StreamManager ausgelagert.
+    """
+    # P-Core-Affinität bleibt unverändert
     try:
-        # P-Core-Affinität für Windows
         if sys.platform == "win32" and ctypes.windll.shell32.IsUserAnAdmin():
             current_process = psutil.Process(os.getpid())
-            # Annahme: 8 P-Cores für i7-13700H
             p_cores = [i for i in range(psutil.cpu_count(logical=False))]
             current_process.cpu_affinity(p_cores)
             thread_count = len(p_cores)
@@ -148,8 +149,8 @@ def optimize_for_video_translation():
             logger.info(f"Prozessaffinität auf {thread_count} P-Cores gesetzt.")
     except Exception as e:
         logger.warning(f"CPU-Affinität konnte nicht gesetzt werden: {e}")
-    
-    # PyTorch & CUDA Optimierungen
+
+    # Globale PyTorch & CUDA Optimierungen
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -162,8 +163,8 @@ def optimize_for_video_translation():
         device = "cpu"
         logger.warning("CUDA nicht verfügbar. Fallback auf CPU.")
 
-# Direkte Ausführung
-optimize_for_video_translation()
+# Direkte Ausführung der neuen Setup-Funktion
+setup_global_torch_optimizations()
 
 # Multiprocessing-Setup
 mp.set_start_method('spawn', force=True)
@@ -192,6 +193,38 @@ VOLUME_ADJUSTMENT_VIDEO = 0.04   # Lautstärkefaktor für das Video
 # Hilfsfunktionen
 # ==============================
 
+@contextmanager
+def StreamManager():
+    """
+    NEUER, ZENTRALER CONTEXT MANAGER: Kapselt die Erstellung, Verwendung und
+    Synchronisation eines hochprioren CUDA-Streams.
+    Ersetzt alle bisherigen Stream-Funktionen.
+    """
+    if not torch.cuda.is_available():
+        # Fallback für CPU-Umgebungen, gibt einen Null-Kontext zurück.
+        yield None
+        return
+
+    # Prioritäts-Range ermitteln, um Fehler zu vermeiden.
+    # -1 ist typischerweise eine hohe, 0 eine normale Priorität.
+    try:
+        _, high_priority = torch.cuda.stream_priority_range()
+    except Exception:
+        high_priority = -1 # Sicherer Fallback-Wert
+        
+    stream = torch.cuda.Stream(priority=high_priority)
+    
+    try:
+        # Führt den Code-Block innerhalb des 'with'-Statements auf diesem Stream aus.
+        with torch.cuda.stream(stream):
+            logger.debug(f"Betrete CUDA Stream-Kontext (Priorität: {high_priority})")
+            yield stream
+    finally:
+        # WICHTIG: Stellt sicher, dass alle Operationen auf dem Stream abgeschlossen sind,
+        # bevor der Code fortfährt. Verhindert Race Conditions.
+        stream.synchronize()
+        logger.debug("CUDA Stream-Kontext verlassen und synchronisiert.")
+        
 @dataclass
 class EntityInfo:
     """Erweiterte Entity-Information für bessere Verwaltung"""
@@ -395,8 +428,10 @@ def gpu_context():
         yield
     finally:
         if torch.cuda.is_available():
+            gc.collect()
             torch.cuda.empty_cache()
-            logger.info("GPU-Speicher bereinigt")
+            torch.cuda.reset_peak_memory_stats()
+            logger.info("GPU-Speicher durch gpu_context bereinigt.")
 
 def ask_overwrite(file_path):
     """
@@ -3295,6 +3330,336 @@ def create_atempo_filter_string(speed_factor):
 
     return ",".join(atempo_chain)
 
+def load_existing_progress():
+    """
+    HILFSFUNKTION: Lädt bereits verarbeitete Segmente.
+    """
+    processed = {}
+    if os.path.exists(TTS_PROGRESS_MANIFEST):
+        try:
+            with open(TTS_PROGRESS_MANIFEST, "r", encoding="utf-8") as csvf:
+                reader = csv.reader(csvf, delimiter="|")
+                next(reader, None)  # Header überspringen
+                for row in reader:
+                    if len(row) >= 5:
+                        processed[int(row[4])] = row[3]
+        except Exception as e:
+            logger.warning(f"Fehler beim Laden des Fortschritts: {e}")
+    return processed
+
+def load_segments_from_file(translation_file):
+    """
+    HILFSFUNKTION: Lädt Segmente aus CSV-Datei.
+    """
+    segments = []
+    try:
+        with open(translation_file, "r", encoding="utf-8", errors="replace") as f:
+            reader = csv.reader(f, delimiter="|")
+            next(reader)  # Header überspringen
+            for i, row in enumerate(reader):
+                if len(row) >= 3:
+                    segments.append({
+                        "id": i,
+                        "start": row[0],
+                        "end": row[1],
+                        "text": row[2].strip()
+                    })
+    except Exception as e:
+        logger.error(f"Fehler beim Laden der Segmente: {e}")
+    return segments
+
+def filter_new_segments(segments, processed):
+    """
+    HILFSFUNKTION: Filtert neue, nicht verarbeitete Segmente.
+    """
+    todo = []
+    for seg in segments:
+        is_valid, reason = validate_text_for_tts_robust(seg["text"])
+        if not is_valid:
+            logger.warning(f"Segment {seg['id']} übersprungen: {reason}")
+        elif seg["id"] not in processed:
+            todo.append(seg)
+    return todo
+
+def log_progress(segment_info, chunk_path):
+    """
+    HILFSFUNKTION: Protokolliert Fortschritt in Manifest-Datei.
+    """
+    try:
+        with open(TTS_PROGRESS_MANIFEST, mode='a', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f, delimiter='|')
+            
+            # Header schreiben falls Datei neu ist
+            if os.path.getsize(TTS_PROGRESS_MANIFEST) == 0:
+                writer.writerow(['startzeit', 'endzeit', 'text', 'chunk_path', 'original_id'])
+            
+            writer.writerow([
+                segment_info['start'], 
+                segment_info['end'], 
+                segment_info['text'], 
+                chunk_path, 
+                segment_info['id']
+            ])
+    except Exception as e:
+        logger.error(f"Fehler beim Protokollieren des Fortschritts: {e}")
+
+def assemble_final_audio_optimized(output_path: str):
+    """
+    OPTIMIERTE VERSION: Verbesserte Audio-Assemblierung mit Qualitätsprüfungen.
+    
+    Änderungen:
+    - Bessere Crossfade-Übergänge
+    - Konsistente Lautstärke-Normalisierung  
+    - Erweiterte Fehlerbehandlung
+    """
+    # Manifest einlesen
+    manifest = []
+    with open(TTS_PROGRESS_MANIFEST, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f, delimiter='|')
+        next(reader)  # Header überspringen
+        for row in reader:
+            if len(row) >= 4 and os.path.exists(row[3]):
+                manifest.append(row)
+    
+    if not manifest:
+        raise RuntimeError("Keine Audio-Chunks zum Assemblieren gefunden")
+    
+    # Nach Startzeit sortieren
+    manifest.sort(key=lambda x: parse_time(x[0]))
+    
+    # Audio-Parameter
+    sampling_rate = 24000
+    last_segment = manifest[-1]
+    max_length_seconds = parse_time(last_segment[1])
+    
+    # Buffer für finales Audio mit Puffer
+    max_audio_length = int(max_length_seconds * sampling_rate) + (2 * sampling_rate)
+    final_audio = np.zeros(max_audio_length, dtype=np.float32)
+    
+    # OPTIMIERUNG: Crossfade-Parameter für weichere Übergänge
+    crossfade_samples = int(0.05 * sampling_rate)  # 50ms Crossfade
+    
+    current_position = 0
+    previous_audio_end = 0
+    
+    for i, segment_data in enumerate(tqdm(manifest, desc="Assembliere Audio-Chunks")):
+        start_sec = parse_time(segment_data[0])
+        chunk_path = segment_data[3]
+        
+        # Audio-Chunk laden
+        try:
+            audio_clip, loaded_sr = sf.read(chunk_path, dtype='float32')
+            if loaded_sr != sampling_rate:
+                logger.warning(f"Sample-Rate-Mismatch: {loaded_sr} vs {sampling_rate}")
+                # Resampling falls nötig (einfache Implementierung)
+                audio_clip = audio_clip[::int(loaded_sr/sampling_rate)]
+        except Exception as e:
+            logger.error(f"Fehler beim Laden von {chunk_path}: {e}")
+            continue
+        
+        start_pos = int(start_sec * sampling_rate)
+        
+        # OPTIMIERUNG: Überlappungsbehandlung mit Crossfade
+        if start_pos < previous_audio_end and i > 0:
+            # Überlappung erkannt - verwende Crossfade
+            overlap_start = max(start_pos, previous_audio_end - crossfade_samples)
+            overlap_end = min(previous_audio_end, start_pos + len(audio_clip))
+            
+            if overlap_end > overlap_start:
+                # Crossfade zwischen vorherigem und aktuellem Audio
+                fade_length = overlap_end - overlap_start
+                fade_out = np.linspace(1.0, 0.0, fade_length)
+                fade_in = np.linspace(0.0, 1.0, fade_length)
+                
+                # Anwenden des Crossfades
+                old_segment = final_audio[overlap_start:overlap_end]
+                new_segment_start = overlap_start - start_pos
+                new_segment_end = new_segment_start + fade_length
+                
+                if new_segment_end <= len(audio_clip):
+                    mixed_segment = (old_segment * fade_out + 
+                                   audio_clip[new_segment_start:new_segment_end] * fade_in)
+                    final_audio[overlap_start:overlap_end] = mixed_segment
+                    
+                    # Rest des neuen Audio-Clips hinzufügen
+                    remaining_start = overlap_end
+                    remaining_clip_start = new_segment_end
+                    remaining_length = len(audio_clip) - remaining_clip_start
+                    
+                    if remaining_length > 0:
+                        end_pos = remaining_start + remaining_length
+                        if end_pos > len(final_audio):
+                            final_audio = np.pad(final_audio, (0, end_pos - len(final_audio)))
+                        final_audio[remaining_start:end_pos] = audio_clip[remaining_clip_start:]
+                        current_position = end_pos
+                else:
+                    # Fallback: Einfaches Überschreiben
+                    start_pos = previous_audio_end
+            else:
+                start_pos = previous_audio_end
+        
+        # Standard-Fall: Kein Overlap
+        if start_pos >= previous_audio_end:
+            end_pos = start_pos + len(audio_clip)
+            
+            # Buffer erweitern falls nötig
+            if end_pos > len(final_audio):
+                final_audio = np.pad(final_audio, (0, end_pos - len(final_audio)))
+            
+            # Audio einfügen
+            final_audio[start_pos:end_pos] = audio_clip
+            current_position = end_pos
+        
+        previous_audio_end = current_position
+    
+    # OPTIMIERUNG: Finale Audio-Verarbeitung
+    final_audio = final_audio[:current_position]
+    
+    if final_audio.size > 0:
+        # RMS-basierte Normalisierung für konsistente Lautstärke
+        rms = np.sqrt(np.mean(final_audio**2))
+        if rms > 0:
+            target_rms = 0.15  # Ziel-RMS für angemessene Lautstärke
+            final_audio = final_audio * (target_rms / rms)
+        
+        # Peak-Limiting zur Vermeidung von Clipping
+        peak = np.max(np.abs(final_audio))
+        if peak > 0.95:
+            final_audio = final_audio * (0.95 / peak)
+        
+        # OPTIMIERUNG: Sanfte Ein-/Ausblendung
+        fade_samples = int(0.1 * sampling_rate)  # 100ms Fade
+        if len(final_audio) > 2 * fade_samples:
+            # Einblendung
+            final_audio[:fade_samples] *= np.linspace(0, 1, fade_samples)
+            # Ausblendung
+            final_audio[-fade_samples:] *= np.linspace(1, 0, fade_samples)
+    else:
+        logger.warning("Kein Audio generiert, erstelle Stille.")
+        final_audio = np.zeros((int(0.1 * sampling_rate),), dtype=np.float32)
+    
+    # Speichern mit optimaler Qualität
+    sf.write(output_path, final_audio.astype(np.float32), sampling_rate)
+    logger.info(f"Optimiertes Audio assembliert: {len(final_audio)/sampling_rate:.2f}s")
+
+def transfer_conditioning_to_device(gpt_cond_latent, speaker_embedding, target_device):
+    """
+    SPEZIALISIERTE FUNKTION: Sichere Übertragung von Conditioning-Tensoren.
+    """
+    print(f"🔄 Übertrage Conditioning-Tensoren auf {target_device}")
+    
+    # GPT Conditioning übertragen
+    if gpt_cond_latent is not None:
+        original_device = gpt_cond_latent.device
+        gpt_cond_latent = gpt_cond_latent.to(target_device)
+        print(f"✅ GPT Conditioning: {original_device} → {gpt_cond_latent.device}")
+    
+    # Speaker Embedding übertragen
+    if speaker_embedding is not None:
+        original_device = speaker_embedding.device
+        speaker_embedding = speaker_embedding.to(target_device)
+        print(f"✅ Speaker Embedding: {original_device} → {speaker_embedding.device}")
+    
+    return gpt_cond_latent, speaker_embedding
+
+def validate_inference_devices(model, gpt_cond_latent, speaker_embedding):
+    """
+    VALIDIERUNGS-FUNKTION: Prüft Device-Konsistenz vor Inferenz.
+    """
+    model_device = next(model.parameters()).device
+    
+    issues = []
+    
+    if gpt_cond_latent is not None and gpt_cond_latent.device != model_device:
+        issues.append(f"GPT Conditioning auf {gpt_cond_latent.device}, Modell auf {model_device}")
+    
+    if speaker_embedding is not None and speaker_embedding.device != model_device:
+        issues.append(f"Speaker Embedding auf {speaker_embedding.device}, Modell auf {model_device}")
+    
+    if issues:
+        raise RuntimeError(f"Device-Mismatch vor Inferenz: {'; '.join(issues)}")
+    
+    return True
+
+@contextmanager
+def synchronized_cuda_stream(stream, wait_for_streams=None):
+    """
+    ERWEITERTE VERSION: Context Manager mit automatischer Synchronisation.
+    
+    Args:
+        stream: Zu verwendender Stream
+        wait_for_streams: Liste von Streams auf die gewartet werden soll
+    """
+    if not torch.cuda.is_available():
+        yield
+        return
+    
+    # Vor Stream-Wechsel: Synchronisation mit anderen Streams
+    if wait_for_streams:
+        for wait_stream in wait_for_streams:
+            if wait_stream != stream:
+                stream.wait_stream(wait_stream)
+    
+    # Stream-Context ausführen
+    with torch.cuda.stream(stream):
+        yield
+
+def safe_tts_inference_with_device_handling(
+    model, 
+    text, 
+    gpt_cond_latent, 
+    speaker_embedding, 
+    **kwargs
+):
+    """
+    SICHERE TTS-INFERENZ: Mit umfassender Device-Behandlung.
+    """
+    try:
+        # Device-Validierung
+        validate_inference_devices(model, gpt_cond_latent, speaker_embedding)
+        
+        # Inferenz mit Device-Monitoring
+        with torch.inference_mode():
+            result = model.inference(
+                text=text,
+                language="de",
+                gpt_cond_latent=gpt_cond_latent,
+                speaker_embedding=speaker_embedding,
+                **kwargs
+            )
+        
+        return result
+        
+    except RuntimeError as e:
+        if "same device" in str(e).lower():
+            logger.error(f"Device-Mismatch während Inferenz: {e}")
+            
+            # Automatische Korrektur versuchen
+            model_device = next(model.parameters()).device
+            logger.info(f"Versuche automatische Korrektur auf {model_device}")
+            
+            corrected_gpt = gpt_cond_latent.to(model_device) if gpt_cond_latent is not None else None
+            corrected_speaker = speaker_embedding.to(model_device) if speaker_embedding is not None else None
+            
+            # Retry mit korrigierten Tensoren
+            with torch.inference_mode():
+                result = model.inference(
+                    text=text,
+                    language="de",
+                    gpt_cond_latent=corrected_gpt,
+                    speaker_embedding=corrected_speaker,
+                    **kwargs
+                )
+            
+            logger.info("✅ Automatische Device-Korrektur erfolgreich")
+            return result
+        else:
+            raise
+    
+    except Exception as e:
+        logger.error(f"Unerwarteter Fehler bei TTS-Inferenz: {e}")
+        raise
+
 # Synthetisieren
 def text_to_speech_with_voice_cloning(
     translation_file,
@@ -3315,14 +3680,18 @@ def text_to_speech_with_voice_cloning(
         output_path: Ausgabepfad für die generierte Audiodatei.
         batch_size: Größe des Batches für parallele Verarbeitung.
     """
-    # Vorarbeit: bereits vorhandene Chunks laden
-    processed = {}
-    if os.path.exists(TTS_PROGRESS_MANIFEST):
-        with open(TTS_PROGRESS_MANIFEST, "r", encoding="utf-8") as csvf:
-            next(csvf, None)
-            for row in csv.reader(csvf, delimiter="|"):
-                if len(row) >= 5:
-                    processed[int(row[4])] = row[3]
+
+    # Segmente laden
+    processed = load_existing_progress()
+    all_segments = load_segments_from_file(translation_file)
+    segments_to_process  = filter_new_segments(all_segments, processed)
+    
+    if not segments_to_process:
+        logger.info("Alle TTS-Segmente bereits verarbeitet. Überspringe.")
+        # Optional: Audio-Assemblierung trotzdem durchführen, falls sie zuvor fehlschlug
+        if not os.path.exists(output_path):
+            assemble_final_audio_optimized(output_path)
+        return
     
     # Eingabe-Segmente einlesen
     with open(translation_file, "r", encoding="utf-8", errors="replace") as f:
@@ -3346,200 +3715,482 @@ def text_to_speech_with_voice_cloning(
     else:
         logger.info(f"{len(todo)} Segmente werden neu synthetisiert …")
     
-    # Pfade für temporäre Dateien definieren
-    if not os.path.exists(TTS_TEMP_CHUNKS_DIR):
-        os.makedirs(TTS_TEMP_CHUNKS_DIR)
-    
-    # Überprüfen, ob die Zieldatei existiert
     if os.path.exists(output_path):
         if not ask_overwrite(output_path):
             logger.info(f"TTS-Audio bereits vorhanden: {output_path}")
             return
         else:
-            logger.info("Überschreibe Zieldatei. Alte temporäre Dateien werden entfernt.")
-            if os.path.exists(TTS_TEMP_CHUNKS_DIR): 
-                shutil.rmtree(TTS_TEMP_CHUNKS_DIR)
-                os.makedirs(TTS_TEMP_CHUNKS_DIR)
-            if os.path.exists(TTS_PROGRESS_MANIFEST): 
-                os.remove(TTS_PROGRESS_MANIFEST)
+            # Bereinige alte Artefakte für einen sauberen Neustart
+            if os.path.exists(TTS_TEMP_CHUNKS_DIR): shutil.rmtree(TTS_TEMP_CHUNKS_DIR)
+            if os.path.exists(TTS_PROGRESS_MANIFEST): os.remove(TTS_PROGRESS_MANIFEST)
     
-    process_successful = False
+    os.makedirs(TTS_TEMP_CHUNKS_DIR, exist_ok=True)
     
-    try:
-        print(f"------------------")
-        print(f"|<< Starte TTS >>|")
-        print(f"------------------")
-        tts_start_time = time.time()
-        cuda_stream = setup_gpu_optimization()
-        # GPU-Optimierungen aktivieren
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        
-        with gpu_context():
-            print(f"TTS-Modell wird initialisiert...")
+    with gpu_context():
+        try:
+            print("------------------")
+            print("|<< Starte TTS >>|")
+            print("------------------")
+            tts_start_time = time.time()
+            
+            target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            logger.info(f"TTS wird auf Gerät ausgeführt: {target_device}")
+
+            # Modell laden und auf das Zielgerät verschieben
             xtts_model = load_xtts_v2()
+            xtts_model.to(target_device)
+            xtts_model.eval()
+        
+            print(f"✅ Modell auf {next(xtts_model.parameters()).device} geladen")
+        
+            # Conditioning-Latents direkt auf dem Zielgerät erstellen
+            sample_paths = [sample_path_1, sample_path_2, sample_path_3]
+            gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(
+                audio_path=sample_paths, load_sr=22050
+            )
+            gpt_cond_latent = gpt_cond_latent.to(target_device)
+            speaker_embedding = speaker_embedding.to(target_device)
             
-            # Bedingungen für die Stimme generieren
-            with torch.inference_mode():
-                sample_paths = [sample_path_1, sample_path_2, sample_path_3]
-                gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(
-                    sound_norm_refs=True,
-                    audio_path=sample_paths,
-                    load_sr=22050
-                )
-            
-            # DeepSpeed Inference für TTS initialisieren
-            print(f"Initialisiere DeepSpeed Inference für TTS...")
-            ds_config = {
-                "enable_cuda_graph": False,
-                "dtype": torch.float16,
-                "replace_with_kernel_inject": True
-            }
-            
+            logger.info("TTS-Modell und Conditioning-Latents erfolgreich geladen.")
+
+            print("🚀 DeepSpeed-Initialisierung...")
             ds_engine = deepspeed.init_inference(
                 model=xtts_model,
                 tensor_parallel={"tp_size": 1},
                 dtype=torch.float32,
-                replace_with_kernel_inject=True
+                replace_with_kernel_inject=False
             )
-            
             optimized_tts_model = ds_engine.module
-            logger.info("DeepSpeed Inference für TTS initialisiert.")
+            logger.info("✅ DeepSpeed erfolgreich initialisiert")
+
+            # PHASE 5: TTS-Synthese mit Device-Validation
+            for segment_info in tqdm(todo, desc="TTS-Synthese mit Device-Validation"):
+            # KRITISCH: Vor jeder Inferenz Device-Zustand validieren
+                model_device = next(optimized_tts_model.parameters()).device
             
-            del xtts_model
-            clear_gpu_memory_before_tts()
+            # Conditioning-Tensoren auf korrektes Device sicherstellen
+            gpt_cond_latent = ensure_tensor_on_device(gpt_cond_latent, model_device)
+            speaker_embedding = ensure_tensor_on_device(speaker_embedding, model_device)
             
-            # Synthese-Schleife mit Validierung
-            for segment_info in tqdm(todo, desc="Synthetisiere Audio-Chunks"):
-                try:
-                    with torch.cuda.stream(cuda_stream), torch.inference_mode():
-                        result = optimized_tts_model.inference(
-                            text=segment_info['text'],
-                            language="de",
-                            gpt_cond_latent=gpt_cond_latent,
-                            speaker_embedding=speaker_embedding,
-                            speed=1.2,
-                            temperature=0.85,
-                            repetition_penalty=10.0,
-                            enable_text_splitting=False,
-                            top_k=70,
-                            top_p=0.9
-                        )
-                        
-                        audio_clip = result.get("wav", np.zeros(1, dtype=np.float32))
-                        
-                        # Validiere Ausgabe
-                        if len(audio_clip) == 0:
-                            logger.warning(f"TTS erzeugte leeres Audio für Segment {segment_info['id']}")
+            validate_inference_devices(optimized_tts_model, gpt_cond_latent, speaker_embedding)
+            
+            # TTS-Inferenz mit expliziter Device-Prüfung
+            with torch.inference_mode():
+                # Letzter Device-Check vor Inferenz
+                if (gpt_cond_latent.device != model_device or 
+                    speaker_embedding.device != model_device):
+                    raise RuntimeError(f"Device-Mismatch vor Inferenz: "
+                                    f"Modell={model_device}, "
+                                    f"GPT={gpt_cond_latent.device}, "
+                                    f"Speaker={speaker_embedding.device}")
+
+            # Der innere `StreamManager` kümmert sich um die Inferenz-Operationen.
+            with StreamManager() as stream:
+                # 'stream' ist der hochpriore Stream; kann für Logging/Debugging verwendet werden.
+                # PyTorch-Operationen innerhalb dieses Blocks werden automatisch auf diesem Stream ausgeführt.
+                
+                for segment_info in tqdm(segments_to_process, desc="Synthetisiere Audio-Chunks"):
+                    try:
+                        # Die validate_text_for_tts_robust Prüfung ist bereits in filter_new_segments,
+                        # eine doppelte Prüfung ist nicht notwendig.
+
+                        with torch.inference_mode():
+                            # Die Inferenz wird nun auf dem vom StreamManager verwalteten Stream ausgeführt.
+                            result = xtts_model.inference(
+                                text=segment_info['text'],
+                                language="de",
+                                gpt_cond_latent=gpt_cond_latent,
+                                speaker_embedding=speaker_embedding,
+                                speed=1.1,
+                                temperature=0.75,
+                                repetition_penalty=5.0,
+                                top_k=65,
+                                top_p=0.9,
+                                enable_text_splitting=False
+                            )
+                            print(f"\nSegment {segment_info['id']} verarbeitet:\n{segment_info['start']} -> {segment_info['end']}\n{segment_info['text']}...\n")
+                        audio_clip = result.get("wav")
+                        if audio_clip is None or audio_clip.numel() == 0:
+                            logger.warning(f"Leeres Audio für Segment {segment_info['id']} erhalten.")
                             continue
+                    
                         
-                        print(f"\nSegment {segment_info['id']} verarbeitet:\n{segment_info['text']}...\n")
+                    
+                        # Asynchroner Transfer zur CPU
+                        audio_cpu = audio_clip.to('cpu', non_blocking=True)
                         
+                        # Warten, bis der Transfer abgeschlossen ist, bevor gespeichert wird.
+                        # Der StreamManager.synchronize() am Ende des Blocks stellt dies sicher.
+                        
+                        # Audio speichern (nachdem der Stream synchronisiert wurde)
                         chunk_filename = f"chunk_{segment_info['id']}.wav"
                         chunk_path = os.path.join(TTS_TEMP_CHUNKS_DIR, chunk_filename)
-                        sf.write(chunk_path, np.array(audio_clip), 24000)
                         
-                        # Schreibe Fortschritt in die Manifest-Datei
-                        with open(TTS_PROGRESS_MANIFEST, mode='a', encoding='utf-8', newline='') as f:
-                            writer = csv.writer(f, delimiter='|')
-                            if os.path.getsize(TTS_PROGRESS_MANIFEST) == 0:
-                                writer.writerow(['startzeit', 'endzeit', 'text', 'chunk_path', 'original_id'])
-                            writer.writerow([segment_info['start'], segment_info['end'], 
-                                        segment_info['text'], chunk_path, segment_info['id']])
+                        # Um sicherzugehen, dass die CPU-Daten bereit sind, wird hier synchronisiert.
+                        # Der StreamManager synchronisiert am Ende des with-Blocks nochmals global.
                 
-                except Exception as e:
-                    logger.error(f"TTS-Fehler bei Segment {segment_info['id']}: {e}")
-                    continue
-                finally:
-                    torch.cuda.empty_cache()
+                        if stream:
+                            stream.synchronize()
+                            
+                        sf.write(chunk_path, audio_cpu.numpy(), 24000)
+                        log_progress(segment_info, chunk_path)
+
+                    except Exception as e:
+                        logger.error(f"Fehler bei der TTS-Synthese für Segment {segment_info['id']}: {e}", exc_info=True)
+                        continue # Zum nächsten Segment springen
+        
+            # PHASE 6: Audio-Assembly
+            print("🔄 Finalisiere Audio-Assembly...")
+            assemble_final_audio_optimized(output_path)
             
-            del optimized_tts_model, ds_engine, gpt_cond_latent, speaker_embedding
-        
-        # PHASE 2: Zeitgenaue Audio-Assemblierung
-        print("\n|<< Starte finale Audio-Assemblierung >>|")
-        
-        final_manifest = []
-        with open(TTS_PROGRESS_MANIFEST, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f, delimiter='|')
-            next(reader)
-            for row in reader:
-                if len(row) >= 4 and row[3].strip() and os.path.exists(row[3]):
-                    final_manifest.append(row)
-        
-        if not final_manifest:
-            raise RuntimeError("Keine gültigen Audio-Chunks zum Zusammenfügen gefunden.")
-        
-        # Sortiere nach Startzeit
-        final_manifest.sort(key=lambda x: parse_time(x[0]))
-        
-        # Berechne die Gesamtlänge
-        sampling_rate = 24000
-        last_segment = final_manifest[-1]
-        max_length_seconds = parse_time(last_segment[1])
-        
-        # Lade den letzten Audio-Clip
-        last_clip_data, _ = sf.read(last_segment[3])
-        max_audio_length = int(max_length_seconds * sampling_rate) + len(last_clip_data) + sampling_rate
-        
-        final_audio = np.zeros(max_audio_length, dtype=np.float32)
-        
-        # Füge jeden Chunk an der korrekten Position ein
-        current_position_samples = 0
-        for segment_data in tqdm(final_manifest, desc="Assembliere Audio-Chunks"):
-            start_sec = parse_time(segment_data[0])
-            chunk_path = segment_data[3]
+            print(f"---------------------------")
+            print(f"|<< TTS abgeschlossen!! >>|")
+            print(f"---------------------------")
             
-            audio_clip, _ = sf.read(chunk_path, dtype='float32')
-            start_pos_samples = int(start_sec * sampling_rate)
+            tts_end_time = time.time() - tts_start_time
+            logger.info(f"TTS abgeschlossen in {tts_end_time:.2f} Sekunden")
+            print(f"{(tts_end_time):.2f} Sekunden")
+            print(f"{(tts_end_time / 60):.2f} Minuten")
+            print(f"{(tts_end_time / 3600):.2f} Stunden")
+            logger.info(f"TTS-Audio mit geklonter Stimme erstellt: {output_path}")
+            logger.info("🎉 Stream-optimierte TTS-Synthese abgeschlossen")
             
-            # Verhindere Überlappung
-            if start_pos_samples < current_position_samples:
-                start_pos_samples = current_position_samples
+        except Exception as e:
+            logger.critical(f"Ein schwerwiegender Fehler ist im TTS-Prozess aufgetreten: {e}", exc_info=True)
+        # Am Ende des `with gpu_context()`-Blocks wird der Speicher automatisch geleert.
+
+    # 4. Finale Audio-Assemblierung (außerhalb des GPU-Kontexts)
+    logger.info("Starte finale Audio-Assemblierung.")
+    assemble_final_audio_optimized(output_path)
+    
+    logger.info(f"TTS-Prozess abgeschlossen. Finale Audiodatei: {output_path}")
+
+def create_conditioning_tensors_on_device(
+    xtts_model, 
+    sample_paths, 
+    target_device=None, 
+    load_sr=22050
+):
+    """
+    KORRIGIERTE VERSION: Erstellt Conditioning-Tensoren direkt auf dem Ziel-Device.
+    """
+    if target_device is None:
+        target_device = next(xtts_model.parameters()).device
+    
+    print(f"🔄 Erstelle Conditioning-Tensoren auf Device: {target_device}")
+    
+    try:
+        # WICHTIG: Modell muss sich im eval-Modus befinden
+        xtts_model.eval()
+        
+        with torch.inference_mode():
+            # Conditioning-Tensoren erstellen
+            gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(
+                audio_path=sample_paths,
+                load_sr=load_sr
+            )
             
-            end_pos_samples = start_pos_samples + len(audio_clip)
+            # KRITISCH: Explizite Device-Übertragung
+            if gpt_cond_latent is not None:
+                gpt_cond_latent = gpt_cond_latent.to(target_device)
+                print(f"✅ GPT Conditioning auf {gpt_cond_latent.device} übertragen")
             
-            if end_pos_samples > len(final_audio):
-                final_audio = np.pad(final_audio, (0, end_pos_samples - len(final_audio)), 'constant')
+            if speaker_embedding is not None:
+                speaker_embedding = speaker_embedding.to(target_device)
+                print(f"✅ Speaker Embedding auf {speaker_embedding.device} übertragen")
             
-            final_audio[start_pos_samples:end_pos_samples] = audio_clip
-            current_position_samples = end_pos_samples
-        
-        # Trimme das finale Audio
-        final_audio = final_audio[:current_position_samples]
-        
-        # Normalisieren und Speichern
-        if final_audio.size > 0:
-            final_audio /= np.max(np.abs(final_audio)) + 1e-8
-        else:
-            logger.warning("Kein Audio generiert, erstelle leere Datei.")
-            final_audio = np.zeros((1,), dtype=np.float32)
-        
-        sf.write(output_path, final_audio.astype(np.float32), sampling_rate)
-        process_successful = True
-        
-        print(f"---------------------------")
-        print(f"|<< TTS abgeschlossen!! >>|")
-        print(f"---------------------------")
-        
-        tts_end_time = time.time() - tts_start_time
-        logger.info(f"TTS abgeschlossen in {tts_end_time:.2f} Sekunden")
-        print(f"{(tts_end_time):.2f} Sekunden")
-        print(f"{(tts_end_time / 60):.2f} Minuten")
-        print(f"{(tts_end_time / 3600):.2f} Stunden")
-        logger.info(f"TTS-Audio mit geklonter Stimme erstellt: {output_path}")
+            # Validierung
+            if gpt_cond_latent is not None and speaker_embedding is not None:
+                model_device = next(xtts_model.parameters()).device
+                
+                if (gpt_cond_latent.device == model_device and 
+                    speaker_embedding.device == model_device):
+                    print("✅ Alle Conditioning-Tensoren korrekt auf Modell-Device")
+                else:
+                    print(f"❌ Device-Mismatch: Modell={model_device}, "
+                        f"GPT={gpt_cond_latent.device}, Speaker={speaker_embedding.device}")
+            
+            return gpt_cond_latent, speaker_embedding
     
     except Exception as e:
-        logger.error(f"Fehler bei der TTS-Synthese: {str(e)}")
-    finally:
-        # Sichere Bereinigung
-        if process_successful:
-            logger.info("Prozess erfolgreich, räume temporäre Dateien auf.")
-            if os.path.exists(TTS_TEMP_CHUNKS_DIR): 
-                shutil.rmtree(TTS_TEMP_CHUNKS_DIR)
-            if os.path.exists(TTS_PROGRESS_MANIFEST): 
-                os.remove(TTS_PROGRESS_MANIFEST)
+        print(f"❌ Fehler bei Conditioning-Erstellung: {e}")
+        return None, None
+
+def ensure_tensor_on_device(tensor, target_device):
+    """
+    HILFSFUNKTION: Stellt sicher, dass Tensor auf dem richtigen Device ist.
+    """
+    if tensor is None:
+        return None
+    
+    if hasattr(tensor, 'device') and tensor.device != target_device:
+        print(f"🔄 Übertrage Tensor von {tensor.device} auf {target_device}")
+        return tensor.to(target_device)
+    
+    return tensor
+
+def diagnose_tts_device_issues(model, gpt_cond_latent, speaker_embedding, text_input=None):
+    """
+    DIAGNOSE-FUNKTION: Identifiziert Device-Probleme bei TTS-Inferenz.
+    """
+    print("=== TTS Device Diagnose ===")
+    
+    # Modell-Device prüfen
+    model_device = next(model.parameters()).device
+    print(f"Modell Device: {model_device}")
+    
+    # Conditioning-Tensoren prüfen
+    if gpt_cond_latent is not None:
+        print(f"GPT Conditioning Device: {gpt_cond_latent.device}")
+        print(f"GPT Conditioning Shape: {gpt_cond_latent.shape}")
+        print(f"GPT Conditioning Dtype: {gpt_cond_latent.dtype}")
+    else:
+        print("❌ GPT Conditioning ist None!")
+    
+    if speaker_embedding is not None:
+        print(f"Speaker Embedding Device: {speaker_embedding.device}")
+        print(f"Speaker Embedding Shape: {speaker_embedding.shape}")
+        print(f"Speaker Embedding Dtype: {speaker_embedding.dtype}")
+    else:
+        print("❌ Speaker Embedding ist None!")
+    
+    # Text-Input prüfen (falls vorhanden)
+    if text_input is not None and hasattr(text_input, 'device'):
+        print(f"Text Input Device: {text_input.device}")
+    
+    # CUDA-Verfügbarkeit
+    print(f"CUDA verfügbar: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"Aktuelle CUDA Device: {torch.cuda.current_device()}")
+        print(f"GPU Memory: {torch.cuda.memory_allocated()/1e9:.2f}GB allocated, {torch.cuda.memory_reserved()/1e9:.2f}GB reserved")
+    
+    # Device-Mismatch-Warnung
+    devices = []
+    if gpt_cond_latent is not None:
+        devices.append(gpt_cond_latent.device)
+    if speaker_embedding is not None:
+        devices.append(speaker_embedding.device)
+    devices.append(model_device)
+    
+    unique_devices = list(set(devices))
+    if len(unique_devices) > 1:
+        print(f"❌ DEVICE-MISMATCH ERKANNT: {unique_devices}")
+        return False
+    else:
+        print(f"✅ Alle Tensoren auf gleichem Device: {unique_devices[0]}")
+        return True
+# Verwendung:
+# device_ok = diagnose_tts_device_issues(optimized_tts_model, gpt_cond_latent, speaker_embedding)
+
+def ensure_memory_safety_with_streams(tensor, target_stream):
+    """
+    KRITISCHE FUNKTION: Verhindert Memory-Corruption bei Multi-Stream-Usage.
+    
+    Args:
+        tensor: PyTorch Tensor
+        target_stream: Stream auf dem Tensor verwendet wird
+    """
+    if not torch.cuda.is_available() or tensor is None:
+        return
+    
+    if hasattr(tensor, 'record_stream'):
+        # Markiert Tensor als "verwendet" auf diesem Stream
+        # Verhindert vorzeitige Speicher-Freigabe
+        tensor.record_stream(target_stream)
+        
+        logger.debug(f"Memory-Safety: Tensor auf Stream {target_stream} registriert")
+    else:
+        logger.warning("Tensor unterstützt record_stream nicht - Memory-Corruption möglich")
+
+def tts_tensor_postprocessing(tensor):
+    """
+    ECHTE OPERATION: TTS-spezifische Tensor-Nachbearbeitung.
+    """
+    if tensor is None:
+        return None
+    
+    # Audio-Tensor-Normalisierung
+    if tensor.dtype == torch.float32:
+        # RMS-Normalisierung
+        rms = torch.sqrt(torch.mean(tensor**2))
+        if rms > 0:
+            target_rms = 0.15
+            tensor = tensor * (target_rms / rms)
+        
+        # Peak-Limiting
+        peak = torch.max(torch.abs(tensor))
+        if peak > 0.95:
+            tensor = tensor * (0.95 / peak)
+    
+    return tensor
+
+def tts_conditioning_transfer(conditioning_tensor):
+    """
+    ECHTE OPERATION: TTS-Conditioning-Tensor-Transfer.
+    """
+    if conditioning_tensor is None:
+        return None
+    
+    # Sicherstellen dass Conditioning-Tensor korrekt formatiert ist
+    if conditioning_tensor.dim() == 2:
+        # Batch-Dimension hinzufügen falls nötig
+        if conditioning_tensor.shape[0] != 1:
+            conditioning_tensor = conditioning_tensor.unsqueeze(0)
+    
+    return conditioning_tensor.contiguous()
+
+def transfer_to_stream(tensor, target_stream):
+    """
+    HILFSFUNKTION: Tensor sicher auf anderen Stream transferieren.
+    """
+    if tensor is None or not torch.cuda.is_available():
+        return tensor
+    
+    with torch.cuda.stream(target_stream):
+        # Kopiere Tensor auf aktuellen Stream
+        transferred = tensor.detach().clone()
+        
+        # WICHTIG: record_stream für Memory-Safety
+        if hasattr(tensor, 'record_stream'):
+            tensor.record_stream(target_stream)
+        
+        return transferred
+
+def transfer_audio_to_cpu_async(audio_tensor, stream):
+    """
+    HILFSFUNKTION: Asynchroner Transfer von GPU zu CPU.
+    """
+    with torch.cuda.stream(stream):
+        # non_blocking=True für asynchronen Transfer
+        cpu_tensor = audio_tensor.to('cpu', non_blocking=True)
+        
+        # record_stream für Memory-Safety
+        if hasattr(audio_tensor, 'record_stream'):
+            audio_tensor.record_stream(stream)
+        
+        return cpu_tensor
+
+def cleanup_cuda_streams(streams):
+    """
+    HILFSFUNKTION: Sichere Stream-Bereinigung.
+    """
+    for stream in streams:
+        if stream is not None:
+            try:
+                stream.synchronize()
+            except Exception as e:
+                logger.warning(f"Stream-Cleanup-Fehler: {e}")
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+def validate_cuda_stream_priorities():
+    """
+    VALIDIERUNG: Prüft verfügbare CUDA Stream-Prioritäten auf dem System.
+    """
+    if not torch.cuda.is_available():
+        logger.warning("CUDA nicht verfügbar für Prioritäts-Validierung")
+        return {'lowest': 0, 'highest': 0}
+    
+    try:
+        # Test verschiedener Prioritätswerte
+        test_priorities = [-2, -1, 0, 1, 2]
+        valid_priorities = []
+        
+        for priority in test_priorities:
+            try:
+                # Versuche Stream mit dieser Priorität zu erstellen
+                test_stream = torch.cuda.Stream(priority=priority)
+                valid_priorities.append(priority)
+                logger.debug(f"✅ Priorität {priority} ist gültig")
+            except RuntimeError as e:
+                logger.debug(f"❌ Priorität {priority} ungültig: {e}")
+            except Exception as e:
+                logger.debug(f"⚠️  Priorität {priority} Fehler: {e}")
+        
+        if valid_priorities:
+            result = {
+                'lowest': max(valid_priorities),    # Höchste Zahl = niedrigste Priorität
+                'highest': min(valid_priorities),   # Niedrigste Zahl = höchste Priorität
+                'all_valid': valid_priorities
+            }
+            logger.info(f"Gültige Prioritäten: {result}")
+            return result
         else:
-            logger.warning("Prozess nicht erfolgreich. Temporäre Dateien werden für Wiederaufnahme beibehalten.")
+            logger.warning("Keine gültigen Prioritäten gefunden - verwende Standard")
+            return {'lowest': 0, 'highest': 0, 'all_valid': [0]}
+            
+    except Exception as e:
+        logger.error(f"Fehler bei Prioritäts-Validierung: {e}")
+        return {'lowest': 0, 'highest': 0, 'all_valid': [0]}
+
+def get_optimal_stream_priorities():
+    """
+    OPTIMIERUNG: Ermittelt optimale Prioritätswerte für das System.
+    """
+    priorities = validate_cuda_stream_priorities()
+    
+    if not priorities['all_valid']:
+        return {'compute': 0, 'memory': 0, 'preprocessing': 0}
+    
+    # Wähle optimale Prioritäten basierend auf verfügbaren Werten
+    available = sorted(priorities['all_valid'])  # Sortiert: niedrigste (höchste Priorität) zuerst
+    
+    if len(available) == 1:
+        # Nur eine Priorität verfügbar
+        return {
+            'compute': available[0],
+            'memory': available[0], 
+            'preprocessing': available[0]
+        }
+    elif len(available) == 2:
+        # Zwei Prioritäten verfügbar
+        return {
+            'compute': available[0],        # Höchste Priorität für TTS
+            'memory': available[1],         # Niedrigere für Memory
+            'preprocessing': available[1]   # Niedrigste für Preprocessing
+        }
+    else:
+        # Drei oder mehr Prioritäten verfügbar
+        return {
+            'compute': available[0],                    # Höchste Priorität
+            'memory': available[len(available)//2],     # Mittlere Priorität
+            'preprocessing': available[-1]              # Niedrigste Priorität
+        }
+
+def validate_all_functions_defined():
+    """
+    VALIDIERUNG: Prüft ob alle erforderlichen Funktionen definiert sind.
+    """
+    required_functions = [
+        'safe_stream_transfer_pattern',
+        'tts_tensor_preprocessing', 
+        'tts_tensor_postprocessing',
+        'tts_conditioning_transfer',
+        'load_existing_progress',
+        'load_segments_from_file',
+        'filter_new_segments',
+        'log_progress',
+        'ensure_memory_safety_with_streams',
+        'synchronized_cuda_stream',
+        'cleanup_cuda_streams'
+    ]
+    
+    missing_functions = []
+    for func_name in required_functions:
+        if func_name not in globals():
+            missing_functions.append(func_name)
+    
+    if missing_functions:
+        logger.error(f"❌ Fehlende Funktionen: {missing_functions}")
+        return False
+    else:
+        logger.info("✅ Alle erforderlichen Funktionen sind definiert")
+        return True
+
+# Führe Validierung aus
+validate_all_functions_defined()
 
 class nullcontext:
     def __enter__(self):
