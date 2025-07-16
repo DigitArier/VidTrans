@@ -1,0 +1,4170 @@
+import os
+import logging
+from sympy import true
+
+# ==============================
+# Globale Konfigurationen und Logging
+# ==============================
+# Logging so früh wie möglich konfigurieren
+logging.basicConfig(
+    filename='video_translation_final.log',
+    format="%(asctime)s - %(levelname)s - %(name)s - %(funcName)s:%(lineno)d - %(message)s", # Detaillierteres Format
+    level=logging.INFO,
+    filemode='a',  # 'w' zum Überschreiben bei jedem Start, 'a' zum Anhängen (Standard)
+    force=True     # Wichtig für Python 3.8+: Stellt sicher, dass diese Konfiguration greift
+)
+logger = logging.getLogger(__name__) # Logger für dieses Modul holen
+
+# Test-Log-Nachricht direkt nach der Initialisierung
+logger.info("Logging wurde erfolgreich initialisiert.")
+"""
+import coverage
+cov = coverage.Coverage(branch=True)
+cov.start()
+"""
+import sys
+import ctypes
+import socket
+import re
+import gc
+from typing import Callable, Optional, Any, List, Dict, Tuple, Union, Set
+from dataclasses import dataclass
+from pathlib import Path
+from config import *
+import subprocess
+import ffmpeg
+from langcodes import Language
+import librosa
+import matplotlib.pyplot as plt
+import soundfile as sf
+import numpy as np
+import pandas as pd
+import json
+import scipy.signal as signal
+from scipy.signal import resample_poly
+from pydub import AudioSegment
+from tokenizers import Encoding, Tokenizer
+from tokenizers.models import BPE
+import packaging
+import spacy
+from spacy.tokens import Span
+#from spacy.language import Language
+import ftfy
+from ftfy import fix_encoding
+import torch
+from torch import autocast
+from torch.cuda import Stream
+torch.set_num_threads(6)
+import tensor_parallel
+import deepspeed
+from deepspeed import init_inference, DeepSpeedConfig
+from accelerate import init_empty_weights, infer_auto_device_map
+from accelerate import Accelerator
+import shape as sh
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.attention import SDPBackend
+import ctypes
+import torchaudio
+from audiostretchy.stretch import stretch_audio
+import pyrubberband
+import time
+from datetime import datetime, timedelta
+import csv
+import traceback
+import psutil
+import shutil
+import language_tool_python
+from language_tool_python import LanguageTool
+from functools import partial
+import multiprocessing as mp
+from multiprocessing import Pool, cpu_count
+from functools import partial
+from tqdm import tqdm
+from contextlib import contextmanager
+from deepmultilingualpunctuation import PunctuationModel
+from datasets import Dataset
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.util import cos_sim
+import sentencepiece as spm
+from transformers import (
+    AutoConfig,
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    MarianConfig,
+    MarianPreTrainedModel,
+    MarianMTModel,
+    MarianTokenizer,
+    PreTrainedTokenizerFast,
+    PreTrainedModel,
+    AutoModelForCausalLM,
+    GenerationMixin,
+    QuantoConfig,
+    T5Tokenizer,
+    T5TokenizerFast,
+    T5ForConditionalGeneration,
+    TorchAoConfig
+    )
+import transformers
+import ctranslate2
+from transformers import modeling_utils, modeling_flash_attention_utils
+from torchao.quantization import Int8WeightOnlyConfig
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from TTS.api import TTS
+from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.tts.models.xtts import Xtts
+from TTS.tts.utils.text.phonemizers.gruut_wrapper import Gruut
+#import whisper
+from faster_whisper import WhisperModel, BatchedInferencePipeline
+from optimum.onnxruntime import ORTModelForSeq2SeqLM
+from pydub import AudioSegment
+from pydub.effects import(
+    high_pass_filter,
+    low_pass_filter,
+    normalize
+    )
+from silero_vad import(
+    load_silero_vad,
+    read_audio,
+    get_speech_timestamps,
+    save_audio,
+    collect_chunks
+    )
+
+def setup_global_torch_optimizations():
+    """
+    NEUE VERSION: Konzentriert sich auf globale, statische Optimierungen für PyTorch und CUDA.
+    Die dynamische Stream-Erstellung wird in den StreamManager ausgelagert.
+    """
+    # P-Core-Affinität bleibt unverändert
+    try:
+        if sys.platform == "win32" and ctypes.windll.shell32.IsUserAnAdmin():
+            current_process = psutil.Process(os.getpid())
+            p_cores = [i for i in range(psutil.cpu_count(logical=False))]
+            current_process.cpu_affinity(p_cores)
+            thread_count = len(p_cores)
+            torch.set_num_threads(thread_count)
+            os.environ["OMP_NUM_THREADS"] = str(thread_count)
+            logger.info(f"Prozessaffinität auf {thread_count} P-Cores gesetzt.")
+    except Exception as e:
+        logger.warning(f"CPU-Affinität konnte nicht gesetzt werden: {e}")
+
+    # Globale PyTorch & CUDA Optimierungen
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+        global device
+        device = "cuda"
+        logger.info("CUDA ist verfügbar und für Performance konfiguriert.")
+    else:
+        device = "cpu"
+        logger.warning("CUDA nicht verfügbar. Fallback auf CPU.")
+
+# Direkte Ausführung der neuen Setup-Funktion
+setup_global_torch_optimizations()
+
+# Multiprocessing-Setup
+mp.set_start_method('spawn', force=True)
+torch.backends.cudnn.deterministic = False    # Nicht-deterministische Optimierungen erlauben
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ['TORCH_BLAS_PREFER_CUBLASLT'] = '1'
+os.environ["CT2_FLASH_ATTENTION"] = "1"
+os.environ["CT2_VERBOSE"] = "1"
+os.environ["CT2_USE_EXPERIMENTAL_PACKED_GEMM"] = "1"
+os.environ["OMP_NUM_THREADS"] = "12"  # Nur P-Cores für CTranslate2
+os.environ["MKL_NUM_THREADS"] = "12"  # MKL auf P-Cores beschränken
+os.environ["CT2_CUDA_ALLOCATOR"] = "cuda_malloc_async"
+os.environ["KMP_BLOCKTIME"] = "1"            # Optimale Thread-Wartezeit
+os.environ["KMP_AFFINITY"] = "granularity=fine,compact,1,0" 
+os.environ["CT2_CPU_ENABLE_MMAP"] = "1"  # Memory-Mapping für große Modelle
+os.environ["CT2_CPU_PREFETCH"] = "32"    # Cache-Prefetching optimieren
+
+# Geschwindigkeits- und Lautstärkeeinstellungen
+SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
+SPEED_FACTOR_RESAMPLE_44100 = 1.0   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
+SPEED_FACTOR_PLAYBACK = 1.0     # Geschwindigkeitsfaktor für die Wiedergabe des Videos
+VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
+VOLUME_ADJUSTMENT_VIDEO = 0.04   # Lautstärkefaktor für das Video
+
+# ============================== 
+# Hilfsfunktionen
+# ==============================
+
+def initialize_performance_optimizations():
+    """
+    Zentrale Funktion zur Initialisierung aller globalen Performance-Optimierungen.
+    Diese Funktion bündelt die Logik der zuvor ungenutzten Setup-Funktionen.
+    Sie sollte als allererstes in der main() aufgerufen werden.
+    """
+    logger.info("Starte globale Performance-Optimierungen für PyTorch und CUDA...")
+
+    # WICHTIG: Umgebungsvariablen müssen VOR dem ersten CUDA-Kontext gesetzt werden.
+    # Logik aus `setup_gpu_memory_optimization_rtx4050()`
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:256,expandable_segments:True'
+    os.environ['CT2_CUDA_CACHING_ALLOCATOR_CONFIG'] = '4,3,10,104857600'
+    os.environ['CT2_CUDA_ALLOW_FP16'] = '1'
+    os.environ['CT2_USE_EXPERIMENTAL_PACKED_GEMM'] = '1'
+    logger.info("Umgebungsvariablen für GPU-Speicheroptimierung gesetzt.")
+
+    if torch.cuda.is_available():
+        # Logik aus `configure_attention_backends()`
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(False)
+        logger.info("Optimierte Attention-Backends (Flash Attention) aktiviert.")
+
+        # Logik aus `configure_cusolver_optimizations()` und `setup_gpu_optimization()`
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cuda.preferred_linalg_library("cusolver")
+        logger.info("TF32 und cuSOLVER-Optimierungen für Ampere-GPU (RTX 4050) aktiviert.")
+
+        # Logik aus `advanced_cuda_configuration()`
+        torch.backends.cuda.cufft_plan_cache.max_size = 32
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+        if hasattr(torch.backends, 'mha') and hasattr(torch.backends.mha, 'set_fastpath_enabled'):
+            torch.backends.mha.set_fastpath_enabled(True)
+        logger.info("Fortgeschrittene CUDA-Konfigurationen (cuFFT, MHA) geladen.")
+
+        # Initialer GPU-Speicher-Cleanup
+        torch.cuda.empty_cache()
+        logger.info("Initialer GPU-Speicher-Cache geleert.")
+    else:
+        logger.warning("CUDA nicht verfügbar. GPU-spezifische Optimierungen werden übersprungen.")
+
+def wait_for_server_ready(port: int, timeout: int = 60) -> bool:
+    """
+    Wartet, bis ein TCP-Port auf localhost erreichbar ist.
+
+    Args:
+        port (int): Der zu prüfende Port.
+        timeout (int): Maximale Wartezeit in Sekunden.
+
+    Returns:
+        bool: True, wenn der Server rechtzeitig bereit ist, sonst False.
+    """
+    logger.info(f"Warte auf LanguageTool-Server auf Port {port} (max. {timeout}s)...")
+    start_time = time.monotonic()
+    
+    while time.monotonic() - start_time < timeout:
+        try:
+            # Erstelle einen Socket und versuche, eine Verbindung herzustellen.
+            with socket.create_connection(("localhost", port), timeout=1):
+                logger.info(f"✅ LanguageTool-Server auf Port {port} ist erreichbar.")
+                return True
+        except (ConnectionRefusedError, socket.timeout):
+            # Server noch nicht bereit, warte eine Sekunde und versuche es erneut.
+            time.sleep(1)
+            print(".", end="", flush=True) # Visuelles Feedback für den Benutzer
+            
+    logger.error(f"❌ Zeitüberschreitung: LanguageTool-Server auf Port {port} nach {timeout}s nicht bereit.")
+    return False
+
+@contextmanager
+def StreamManager():
+    """
+    NEUER, ZENTRALER CONTEXT MANAGER: Kapselt die Erstellung, Verwendung und
+    Synchronisation eines hochprioren CUDA-Streams.
+    Ersetzt alle bisherigen Stream-Funktionen.
+    """
+    if not torch.cuda.is_available():
+        # Fallback für CPU-Umgebungen, gibt einen Null-Kontext zurück.
+        yield None
+        return
+
+    # Prioritäts-Range ermitteln, um Fehler zu vermeiden.
+    # -1 ist typischerweise eine hohe, 0 eine normale Priorität.
+    try:
+        _, high_priority = torch.cuda.stream_priority_range()
+    except Exception:
+        high_priority = -1 # Sicherer Fallback-Wert
+        
+    stream = torch.cuda.Stream(priority=high_priority)
+    
+    try:
+        # Führt den Code-Block innerhalb des 'with'-Statements auf diesem Stream aus.
+        with torch.cuda.stream(stream):
+            logger.debug(f"Betrete CUDA Stream-Kontext (Priorität: {high_priority})")
+            yield stream
+    finally:
+        # WICHTIG: Stellt sicher, dass alle Operationen auf dem Stream abgeschlossen sind,
+        # bevor der Code fortfährt. Verhindert Race Conditions.
+        stream.synchronize()
+        logger.debug("CUDA Stream-Kontext verlassen und synchronisiert.")
+
+@dataclass
+class EntityInfo:
+    """Erweiterte Entity-Information für bessere Verwaltung"""
+    text: str
+    label: str
+    start: int
+    end: int
+    language: str
+
+try:
+    # Versucht, die GPU für spaCy zu aktivieren
+    spacy.require_gpu()
+    print("✅ GPU für spaCy erfolgreich aktiviert.")
+except:
+    # Fallback auf CPU, falls die GPU-Aktivierung fehlschlägt
+    print("⚠️ GPU für spaCy konnte nicht aktiviert werden. Fallback auf CPU.")
+
+# Gerät bestimmen (GPU bevorzugt, aber CPU als Fallback)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Verwende Gerät: {device}")
+if device == "cpu":
+    logger.warning("GPU/CUDA nicht verfügbar. Falle auf CPU zurück. Die Verarbeitung kann langsamer sein.")
+
+# Startzeit für die Gesamtmessung
+start_time = time.time()
+step_times = {}
+
+# Sprachkürzel für das gesamte Projekt
+source_lang="en"
+target_lang="de"
+
+# Benötigte Installationen werden im Skript bereits importiert.
+
+def start_language_tool_server(lt_path: str = "D:\\LanguageTool-6.6", port: int = 8010) -> Optional[subprocess.Popen]:
+    """
+    Startet den LanguageTool-Server als Subprozess und wartet, bis er bereit ist.
+
+    Args:
+        lt_path (str): Pfad zum LanguageTool-Verzeichnis.
+        port (int): Port, auf dem der Server lauschen soll.
+
+    Returns:
+        Optional[subprocess.Popen]: Das Prozessobjekt des laufenden Servers oder None bei einem Fehler.
+    """
+    lt_jar_path = os.path.join(lt_path, "languagetool-server.jar")
+    if not os.path.exists(lt_jar_path):
+        logger.error(f"LanguageTool JAR-Datei nicht gefunden: {lt_jar_path}")
+        return None
+
+    command = [
+        "java", "-Xmx4g", "-cp", lt_jar_path,
+        "org.languagetool.server.HTTPServer", "--port", str(port), "--allow-origin", "*"
+    ]
+    
+    logger.info(f"Starte LanguageTool-Server mit Befehl: {' '.join(command)}")
+    
+    # Leite Ausgaben in eine Log-Datei um für späteres Debugging
+    with open("languagetool_server.log", "w") as lt_log:
+        process = subprocess.Popen(
+            command,
+            stdout=lt_log,
+            stderr=subprocess.STDOUT
+        )
+
+    logger.info(f"LanguageTool-Server-Prozess gestartet (PID: {process.pid}). Warte auf Bereitschaft...")
+
+    # Robuster Health-Check
+    if wait_for_server_ready(port=port, timeout=60):
+        logger.info("✅ LanguageTool-Server ist bereit.")
+        # WICHTIG: Die globale Variable LT_PORT muss für die refine_text_pipeline gesetzt werden.
+        global LT_PORT
+        LT_PORT = port
+        return process
+    else:
+        logger.error("LanguageTool-Server konnte nicht gestartet werden. Überprüfen Sie 'languagetool_server.log'.")
+        process.terminate()
+        process.wait()
+        return None
+
+def stop_language_tool_server(process: subprocess.Popen):
+    """
+    Beendet den LanguageTool-Server-Prozess sicher.
+
+    Args:
+        process (subprocess.Popen): Das Prozessobjekt des Servers.
+    """
+    if process:
+        logger.info(f"Beende LanguageTool-Server (PID: {process.pid})...")
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+            logger.info("✅ LanguageTool-Server erfolgreich beendet.")
+        except subprocess.TimeoutExpired:
+            logger.warning("LanguageTool-Server reagiert nicht auf terminate, erzwinge Beendigung (kill)...")
+            process.kill()
+            process.wait()
+            logger.info("✅ LanguageTool-Server wurde beendet (kill).")
+
+# Konfigurationen für die Verwendung von CUDA
+cuda_options = {
+    "hwaccel": "cuda",
+    "hwaccel_output_format": "cuda"
+}
+
+def run_command(command):
+    """Führt einen Shell-Befehl aus und gibt ihn vorher aus."""
+    print(f"Ausführung des Befehls: {command}")
+    subprocess.run(command, shell=True, check=True)
+
+def time_function(func, *args, **kwargs):
+        """Misst und protokolliert die Ausführungszeit einer Funktion."""
+        start = time.time()
+        result = func(*args, **kwargs)
+        end = time.time()
+        execution_time = end - start
+        logger.info(f"Execution time for {func.__name__}: {execution_time:.4f} seconds")
+        return result, execution_time
+
+# Modell-Ladefunktionen
+def load_whisper_model():
+    """Lädt das Faster-Whisper-Modell (large-v3) für die Transkription."""
+    model_size = "large-v3"
+    # compute_type="int8_float16" nutzt INT8-Gewichte + FP16-Aktivierungen für Speed & geringen Speicher
+    fw_model = WhisperModel(model_size, device="auto", compute_type="bfloat16", cpu_threads=6, local_files_only=True)
+    pipeline = BatchedInferencePipeline(model=fw_model)
+    return pipeline
+
+def load_madlad400_translator_optimized(model_path=None, device="auto", compute_type="auto"):
+    """
+    Lädt das quantisierte MADLAD400-Übersetzungsmodell mit CTranslate2 korrekt.
+    
+    Args:
+        model_path: Pfad zum quantisierten Modell
+        device: "cuda", "cpu" oder "auto" für automatische Erkennung
+        compute_type: "auto", "float32", "int8_float16" für RTX 4050 Mobile
+    
+    Returns:
+        Tuple: (translator, tokenizer) - CTranslate2 Translator und SentencePiece Tokenizer
+    """
+    from huggingface_hub import snapshot_download
+    
+    # GPU-Speicher vor Modell-Laden bereinigen
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    
+    # Modellpfad bestimmen oder herunterladen
+    if model_path is None:
+        model_path = "madlad400-3b-mt-8bit"
+        
+        if not os.path.exists(model_path):
+            logger.info("Quantisiertes Modell wird von HuggingFace heruntergeladen...")
+            try:
+                # Verwende bereits quantisierte Version für bessere Performance
+                model_path = snapshot_download("avans06/madlad400-7b-mt-bt-ct2-int8_float16")
+                logger.info(f"Modell heruntergeladen nach: {model_path}")
+            except Exception as e:
+                logger.error(f"Fehler beim Herunterladen: {e}")
+                raise
+    
+    # Automatische Device-Erkennung mit Fallback
+    if device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+            logger.info("GPU erkannt - verwende CUDA")
+        else:
+            device = "cpu"
+            logger.warning("Keine GPU verfügbar - falle auf CPU zurück")
+    
+    # Automatische Compute-Type-Optimierung für RTX 4050 Mobile
+    if compute_type == "auto":
+        if device == "cuda":
+            # RTX 4050 Mobile unterstützt INT8+FP16 optimal bei 6GB VRAM
+            compute_type = "int8_float32"
+        else:
+            compute_type = "int8_bfloat16"
+    
+    logger.info(f"Lade CTranslate2 Translator von {model_path}...")
+    logger.info(f"Device: {device}, Compute-Type: {compute_type}")
+    
+    # CTranslate2 Translator mit optimierten Einstellungen laden
+    translator = ctranslate2.Translator(
+        model_path, 
+        device=device,  # KORREKTUR: Verwende GPU statt CPU!
+        compute_type=compute_type,
+        inter_threads=12,  # P-Core-optimiert für i7-13700H
+        intra_threads=1   # Konservativ für RTX 4050 Mobile
+    )
+    """
+    # SentencePiece Tokenizer laden (KORREKTUR: Nicht T5TokenizerFast!)
+    tokenizer_path = os.path.join(model_path, "spiece.model")
+    if not os.path.exists(tokenizer_path):
+        # Fallback: Versuche spiece.model
+        tokenizer_path = os.path.join(model_path, "sentencepiece.model")
+    
+    if os.path.exists(tokenizer_path):
+        tokenizer = spm.SentencePieceProcessor()
+        tokenizer.load(tokenizer_path)
+        logger.info("SentencePiece Tokenizer geladen")
+    else:
+        logger.error(f"SentencePiece Model nicht gefunden in {model_path}")
+        raise FileNotFoundError("SentencePiece tokenizer model nicht gefunden")
+    """
+    tokenizer = T5TokenizerFast.from_pretrained(
+        model_path,
+        local_files_only=True,
+        use_fast=True,
+        legacy=False,
+        padding_side='left',  # Explizite Padding-Konfiguration
+        truncation_side='right' # Explizite Truncation-Konfiguration
+    )
+    
+    return translator, tokenizer
+
+def load_xtts_v2():
+    """
+    Lädt Xtts v2 und konfiguriert DeepSpeed-Inferenz.
+    """
+    # 1) Konfiguration lesen
+    config = XttsConfig()
+    config.load_json("D:\\Modelle\\v203_\\config.json")
+    # 2) Modell initialisieren
+    xtts_model = Xtts.init_from_config(
+        config,
+        vocoder_path=vocoder_pth,
+        vocoder_config_path=vocoder_cfg
+    )
+    xtts_model.load_checkpoint(
+        config,
+        checkpoint_dir="D:\\Modelle\\v203_",  # Pfad anpassen
+        use_deepspeed=False
+    )
+    xtts_model.to(torch.device(0))
+    xtts_model.eval()
+
+    return xtts_model
+
+# Context Manager für GPU-Operationen
+@contextmanager
+def gpu_context():
+    """Stellt sicher, dass der GPU-Speicher nach einer Operation freigegeben wird."""
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            logger.info("GPU-Speicher durch gpu_context bereinigt.")
+
+def ask_overwrite(file_path):
+    """
+    Fragt den Benutzer, ob eine vorhandene Datei überschrieben werden soll
+
+    Args:
+        file_path (str): Pfad zur Datei
+        
+    Returns:
+        bool: True wenn überschrieben werden soll, sonst False
+    """
+    while True:
+        answer = input(f"Datei '{os.path.basename(file_path)}' existiert bereits. Überschreiben? (j/n, Enter für Nein): ").lower().strip()
+        if answer in ['j', 'ja']:
+            return True
+        elif answer == "" or answer in ['n', 'nein']:
+            return False
+        print("Ungültige Eingabe. Bitte 'j' oder 'n' antworten.")
+
+def extract_audio_ffmpeg(video_path, audio_output):
+    """Extrahiert die Audiospur aus dem Video (Mono, 44.100 Hz)."""
+    if os.path.exists(audio_output):
+        if not ask_overwrite(audio_output):
+            logger.info(f"Verwende vorhandene Datei: {audio_output}")
+            return
+    try:
+        ffmpeg.input(video_path, hwaccel="cuda", hwaccel_output_format="cuda").output(
+            audio_output,
+            threads=0,      # Verwendet alle verfügbaren Threads
+            f="wav",
+            acodec="pcm_s16le",
+            ac=1,  # Mono-Audio
+            ar="16000"  # 44.100 Hz
+            ).run()
+        logger.info(f"Audio extrahiert: {audio_output}")
+    except ffmpeg.Error as e:
+        logger.error(f"Fehler bei der Audioextraktion: {e}")
+
+def create_voice_sample(audio_path, sample_path_1, sample_path_2, sample_path_3):
+    """Erstellt ein Voice-Sample aus dem verarbeiteten Audio für Stimmenklonung."""
+    sample_paths = [sample_path_1, sample_path_2, sample_path_3]
+    for i, sample_path in enumerate(sample_paths, 1):
+        if os.path.exists(sample_path):
+            if not ask_overwrite(sample_path):
+                logger.info(f"Verwende vorhandenes Sample #{i}: {sample_path}")
+                continue
+
+    while True:
+        start_time_str = input(f"Startzeit für Sample #{i} (in Sekunden, Enter zum Überspringen): ")
+        if not start_time_str:
+            logger.info(f"Erstellung von Sample #{i} übersprungen.")
+            break
+        
+        end_time_str = input(f"Endzeit für Sample #{i} (in Sekunden): ")
+        try:
+            start_seconds = float(start_time_str)
+            end_seconds = float(end_time_str)
+            duration = end_seconds - start_seconds
+            
+            if duration <= 0:
+                logger.warning("Endzeit muss nach der Startzeit liegen.")
+                continue
+            
+            (
+                ffmpeg.input(audio_path, ss=start_seconds, t=duration).output(
+                    sample_path,
+                    acodec='pcm_s16le',
+                    ac=1,
+                    ar=22050
+                ).run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
+            )
+            logger.info(f"Voice-Sample #{i} erfolgreich erstellt: {sample_path}")
+            break
+        except (ValueError, ffmpeg.Error) as e:
+            logger.error(f"Fehler beim Erstellen von Sample #{i}: {e}")
+
+def check_completion_status(output_file, expected_count=None, reference_file=None):
+    """
+    Überprüft, ob eine Ausgabedatei vollständig verarbeitet wurde.
+    
+    Args:
+        output_file (str): Pfad zur zu prüfenden Ausgabedatei
+        expected_count (int, optional): Erwartete Anzahl von Segmenten
+        reference_file (str, optional): Referenzdatei zum Vergleich der Zeilenzahl
+        
+    Returns:
+        tuple: (is_complete: bool, current_count: int, expected_count: int)
+    """
+    if not os.path.exists(output_file):
+        return False, 0, expected_count or 0
+    
+    try:
+        df = pd.read_csv(output_file, sep='|', dtype=str)
+        current_count = len(df)
+        
+        if reference_file and os.path.exists(reference_file):
+            ref_df = pd.read_csv(reference_file, sep='|', dtype=str)
+            expected_count = len(ref_df)
+        
+        if expected_count is None:
+            # Wenn keine erwartete Anzahl bekannt, als vollständig betrachten wenn Datei existiert
+            return True, current_count, current_count
+            
+        is_complete = current_count >= expected_count
+        return is_complete, current_count, expected_count
+        
+    except Exception as e:
+        logger.error(f"Fehler beim Prüfen der Vollständigkeit von {output_file}: {e}")
+        return False, 0, expected_count or 0
+
+def save_progress_csv(segments_list, output_file, headers=['startzeit', 'endzeit', 'text']):
+    """
+    Speichert Fortschritt in CSV-Datei mit atomarer Schreiboperation.
+    
+    Args:
+        segments_list (list): Liste der zu speichernden Segmente
+        output_file (str): Ausgabedatei
+        headers (list): CSV-Header
+    """
+    if not segments_list:
+        return
+        
+    try:
+        # Temporäre Datei für atomare Schreiboperation
+        temp_file = output_file + '.tmp'
+        
+        with open(temp_file, mode='w', encoding='utf-8', newline='') as csvfile:
+            csv_writer = csv.writer(csvfile, delimiter='|')
+            csv_writer.writerow(headers)
+            
+            for segment in segments_list:
+                if isinstance(segment, dict):
+                    if 'startzeit' in segment:
+                        csv_writer.writerow([
+                            segment['startzeit'], 
+                            segment['endzeit'], 
+                            segment['text']
+                        ])
+                    else:
+                        start = str(timedelta(seconds=segment["start"])).split('.')[0]
+                        end = str(timedelta(seconds=segment["end"])).split('.')[0]
+                        csv_writer.writerow([start, end, segment["text"]])
+                else:
+                    csv_writer.writerow(segment)
+        
+        # Atomare Ersetzung der Originaldatei
+        shutil.move(temp_file, output_file)
+        logger.info(f"Fortschritt gespeichert: {len(segments_list)} Segmente in {output_file}")
+        
+    except Exception as e:
+        logger.error(f"Fehler beim Speichern des Fortschritts: {e}")
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+def handle_continuation_logic(output_file, reference_file=None, expected_count=None):
+    """
+    Behandelt die Logik für Fortsetzung vs. Überschreibung, indem eine Liste von
+    bereits verarbeiteten Segmenten zurückgegeben wird.
+    
+    Returns:
+        tuple: (should_continue: bool, existing_segments: list)
+    """
+    is_complete, current_count, total_expected = check_completion_status(
+        output_file, expected_count, reference_file
+    )
+    
+    if not os.path.exists(output_file):
+        logger.info(f"Neue Verarbeitung: {output_file} existiert nicht")
+        return True, []
+    
+    if is_complete:
+        # Datei ist vollständig - Benutzer fragen
+        if not ask_overwrite(output_file):
+            logger.info(f"Verwende vollständige Datei: {output_file} ({current_count} Segmente)")
+            return False, []
+        else:
+            logger.info(f"Überschreibe vollständige Datei: {output_file}")
+            return True, []
+    else:
+        # Datei ist unvollständig - automatisch fortsetzen
+        logger.info(f"Setze unvollständige Verarbeitung fort: {current_count}/{total_expected} Segmente")
+        try:
+            existing_segments = []
+            df = pd.read_csv(output_file, sep='|', dtype=str)
+            # Konvertiere DataFrame in die erwartete Diktionär-Struktur
+            for _, row in df.iterrows():
+                existing_segments.append(row.to_dict())
+            return True, existing_segments
+        except Exception as e:
+            logger.error(f"Fehler beim Laden vorhandener Segmente aus {output_file}: {e}")
+            return True, []
+
+    # Logik zur Bestimmung, ob der Prozess abgeschlossen ist
+    is_complete = False
+    if reference_file and os.path.exists(reference_file):
+        try:
+            with open(reference_file, 'r', encoding='utf-8') as ref_file:
+                # Zähle Zeilen in der Referenzdatei (ohne Header)
+                total_expected = sum(1 for line in ref_file) - 1
+                if len(processed_keys) >= total_expected:
+                    is_complete = True
+        except Exception as e:
+            logger.warning(f"Konnte Referenzdatei {reference_file} nicht vollständig prüfen: {e}")
+
+    if is_complete:
+        # Datei scheint vollständig - Benutzer fragen
+        if not ask_overwrite(output_file):
+            logger.info(f"Verwende anscheinend vollständige Datei: {output_file} ({len(processed_keys)} Segmente)")
+            return False, processed_keys # Nicht fortsetzen
+        else:
+            logger.info(f"Überschreibe vollständige Datei: {output_file}")
+            return True, set() # Fortsetzen mit leerem Schlüsselset
+    else:
+        # Datei ist unvollständig - automatisch fortsetzen
+        logger.info(f"Setze unvollständige Verarbeitung fort: {len(processed_keys)} Segmente bereits verarbeitet.")
+        return True, processed_keys
+
+def handle_key_based_continuation(output_file, reference_file=None, key_column_index=0):
+    """
+    Behandelt die Logik für Fortsetzung vs. Überschreibung auf Basis von eindeutigen Schlüsseln
+    und gibt ein Set der verarbeiteten Schlüssel zurück. Speziell für die Übersetzung.
+    
+    Returns:
+        tuple: (should_continue: bool, processed_keys: set)
+    """
+    processed_keys = set()
+    
+    if not os.path.exists(output_file):
+        logger.info(f"Neue Verarbeitung: {output_file} existiert nicht.")
+        return True, processed_keys
+
+    # Lese vorhandene Schlüssel aus der Ausgabedatei
+    try:
+        with open(output_file, mode='r', encoding='utf-8') as csvfile:
+            reader = csv.reader(csvfile, delimiter='|')
+            header = next(reader, None)
+            if header is None: return True, processed_keys
+            for row in reader:
+                if len(row) > key_column_index:
+                    processed_keys.add(row[key_column_index])
+    except Exception as e:
+        logger.error(f"Fehler beim Lesen der vorhandenen Ausgabedatei {output_file}: {e}")
+        if ask_overwrite(output_file):
+            return True, set()
+        else:
+            raise IOError(f"Konnte {output_file} nicht verarbeiten und Überschreiben wurde abgelehnt.") from e
+
+    # Logik zur Bestimmung, ob der Prozess abgeschlossen ist
+    is_complete = False
+    if reference_file and os.path.exists(reference_file):
+        try:
+            with open(reference_file, 'r', encoding='utf-8') as ref_file:
+                total_expected = sum(1 for line in ref_file) - 1
+                if len(processed_keys) >= total_expected:
+                    is_complete = True
+        except Exception as e:
+            logger.warning(f"Konnte Referenzdatei {reference_file} nicht vollständig prüfen: {e}")
+
+    if is_complete:
+        if not ask_overwrite(output_file):
+            logger.info(f"Verwende anscheinend vollständige Datei: {output_file} ({len(processed_keys)} Segmente)")
+            return False, processed_keys
+        else:
+            logger.info(f"Überschreibe vollständige Datei: {output_file}")
+            return True, set()
+    else:
+        logger.info(f"Setze unvollständige Verarbeitung fort: {len(processed_keys)} Segmente bereits verarbeitet.")
+        return True, processed_keys
+
+def process_audio(input_file, output_file):
+    if os.path.exists(output_file):
+        if not ask_overwrite(output_file):
+            logger.info(f"Verwende vorhandene Datei: {output_file}", exc_info=True)
+            return
+        
+    print("--------------------------------")
+    print("<< Starte Audio-Verarbeitung >>|")
+    print("--------------------------------")
+        
+    # Helper function to save and log intermediate steps
+    def save_step(audio_segment, filename):
+        audio_segment.export(filename, format="wav")
+        logger.info(f"Zwischenschritt gespeichert: {filename} - Größe: {os.path.getsize(filename)} Bytes", exc_info=True)
+    
+    # 1. Load the audio file
+    audio = AudioSegment.from_wav(input_file)
+    #save_step(audio, "process_original.wav")
+    
+    # 2. High-Pass Filter für klare Stimme (z.B. 80-100 Hz)
+    #    Filtert tieffrequentes Dröhnen/Brummen heraus [1][2].
+    audio_hp = high_pass_filter(audio, cutoff=150)
+    save_step(audio_hp, "process_high_pass.wav")
+    
+    # 3. Noise Gate, um Atem und Hintergrundrauschen zu unterdrücken
+    #    Threshold je nach Sprechpegel, z.B. -48 dB [2][7].
+    def noise_gate(audio_segment, threshold_db=-40):
+        samples = np.array(audio_segment.get_array_of_samples(), dtype=np.float32)
+        max_amplitude = np.max(np.abs(samples))
+        
+        # ermittelter Schwellenwert in linearer Amplitude
+        gate_threshold = max_amplitude * (10 ** (threshold_db / 20))
+        gated_samples = np.where(np.abs(samples) > gate_threshold, samples, 0)
+        return audio_segment._spawn(gated_samples.astype(np.int16).tobytes())
+    
+    audio_ng = noise_gate(audio_hp, threshold_db=-48)
+    save_step(audio_ng, "process_noise_gate.wav")
+
+    # 4. Multiband-Kompressor (Soft-Knee), um Pegelschwankungen auszugleichen [2].
+    def apply_multiband_compression(audio_segment):
+        samples = np.array(audio_segment.get_array_of_samples(), dtype=np.float32)
+        rate = audio_segment.frame_rate
+        
+        # Butterworth-Filter
+        b_low, a_low = signal.butter(4, 300 / (rate / 2), btype='low')
+        b_mid, a_mid = signal.butter(4, [300 / (rate / 2), 3000 / (rate / 2)], btype='bandpass')
+        b_high, a_high = signal.butter(4, 3000 / (rate / 2), btype='high')
+        
+        low_band = signal.lfilter(b_low, a_low, samples)
+        mid_band = signal.lfilter(b_mid, a_mid, samples)
+        high_band = signal.lfilter(b_high, a_high, samples)
+        
+        def compress(signal_band, threshold=0.1, ratio=5.0):
+            # Soft-Knee-ähnliche Funktion
+            compressed = np.where(
+                np.abs(signal_band) > threshold,
+                threshold + (signal_band - threshold) / ratio,
+                signal_band
+            )
+            return compressed
+        
+        low_band_comp = compress(low_band, threshold=0.1, ratio=3.5)
+        mid_band_comp = compress(mid_band, threshold=0.1, ratio=4.5)
+        high_band_comp = compress(high_band, threshold=0.1, ratio=4.5)
+        
+        # Bänder normalisieren:
+        def normalize_band(band):
+            peak = np.max(np.abs(band)) + 1e-8
+            return band / peak
+        
+        low_band_comp = normalize_band(low_band_comp)
+        mid_band_comp = normalize_band(mid_band_comp)
+        high_band_comp = normalize_band(high_band_comp)
+        
+        # Zusammenmischen mit Gewichten
+        combined = (
+            0.5 * low_band_comp + 
+            1.0 * mid_band_comp + 
+            0.8 * high_band_comp
+        )
+        
+        # Gesamtnormalisierung
+        combined /= (np.max(np.abs(combined)) + 1e-8)
+        combined *= np.max(np.abs(samples))
+        
+        return audio_segment._spawn(combined.astype(np.int16).tobytes())
+    
+    audio_comp = apply_multiband_compression(audio_ng)
+    save_step(audio_comp, "process_compressed.wav")
+    
+    # 5. Equalizer (z.B. zusätzlicher High-Pass + leichte Absenkung um 400-500 Hz),
+    #    sowie Anheben der Präsenz bei ~5 kHz für mehr Klarheit [1][2][7].
+    #    Hier sehr simpel mit high_pass_filter() & low_pass_filter() kombiniert:
+    audio_eq = high_pass_filter(audio_comp, cutoff=150)   # tiefe Frequenzen raus
+    audio_eq = low_pass_filter(audio_eq, cutoff=8000)     # Ultra-Höhen kappen
+    save_step(audio_eq, "process_equalized.wav")
+    
+    # 6. De-Esser, um harte S-/Zischlaute abzuschwächen [2].
+    #    Hier sehr rudimentär mit einem Low-Pass-Filter bei ca. 7000 Hz.
+    def apply_deesser(audio_segment, cutoff=7000):
+        return low_pass_filter(audio_segment, cutoff=cutoff)
+    
+    audio_deessed = apply_deesser(audio_eq, cutoff=7000)
+    save_step(audio_deessed, "process_deessed.wav")
+    
+    # 7. Finales Normalisieren (bzw. Limiter).
+    #    Hebt das Gesamtsignal an, ohne zu übersteuern [1][2].
+    audio_normalized = normalize(audio_deessed)
+    save_step(audio_normalized, output_file)
+    
+    print("----------------------------------------")
+    print("|<< Audio-Verbesserung abgeschlossen >>|")
+    print("----------------------------------------")
+    
+    logger.info("Verarbeitung abgeschlossen.", exc_info=True)
+    logger.info(f"Endgültige Datei: {output_file}", exc_info=True)
+        # Lautheitsnormalisierung nach EBU R128
+        #meter = Meter(44100)  # Annahme: 44.1 kHz Samplerate
+        #loudness = meter.integrated_loudness(samples)
+        #normalized_audio = normalize.loudness(samples, loudness, -23.0)
+
+def resample_to_16000_mono(input_path, output_path, speed_factor):
+    """Resample the audio to 24 kHz (Mono)."""
+    if os.path.exists(output_path):
+        if not ask_overwrite(output_path):
+            logger.info(f"Verwende vorhandene Datei: {output_path}", exc_info=True)
+            return
+
+    try:
+        # Load the audio file
+        audio, sr = librosa.load(input_path, sr=16000, mono=True, res_type="kaiser_best")  # Load with original sampling rate
+        logger.info(f"Original sampling rate: {sr} Hz", exc_info=True)
+
+#        # Adjust playback speed if necessary
+        if speed_factor != 1.0:
+#            audio = librosa.effects.time_stretch(audio, rate=speed_factor)
+            audio = pyrubberband.pyrb.time_stretch(audio, sr, speed_factor)
+        # Resample to 16.000 Hz if needed
+        target_sr = 16000
+        if sr != target_sr:
+            audio_resampled = librosa.resample(audio, orig_sr=sr, target_sr=target_sr, res_type="kaiser_best", fix=True, scale=True)
+        else:
+            audio_resampled = audio
+
+        # Save the resampled audio
+        sf.write(output_path, audio_resampled, samplerate=target_sr)
+        logger.info(f"Audio successfully resampled to {target_sr} Hz (Mono): {output_path}", exc_info=True)
+
+    except Exception as e:
+        logger.error(f"Error during resampling to 16 kHz: {e}")
+
+def validate_text_for_tts_robust(
+    text: str, 
+    min_chars: int = 3, 
+    min_words: int = MIN_WORDS_GLOBAL
+    ) -> tuple[bool, str]:
+    """
+    Prüft Textsegmente vor der TTS-Verarbeitung.
+    
+    Returns:
+        (is_valid, reason) - True, wenn alle Prüfungen bestanden.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False, "Leerer oder ungültiger String"
+    
+    cleaned = text.strip()
+    if len(cleaned) < min_chars:
+        return False, f"Weniger als {min_chars} Zeichen"
+    
+    if not any(c.isalnum() for c in cleaned):
+        return False, "Nur Sonderzeichen"
+    
+    words = cleaned.split()
+    if len(words) < min_words:
+        return False, f"Weniger als {min_words} Wörter"
+    
+    # Spezielle Behandlung extrem langer deutscher Komposita
+    if len(words) == 1 and len(words[0]) > 30:
+        return False, "Einzelnes sehr langes Kompositum"
+    
+    return True, "OK"
+
+def _protect_placeholders(text: str, items: set[str], placeholder_tag: str) -> tuple[str, dict]:
+    """Ersetzt alle items durch Platzhalter, damit Regex-Splits nicht fehlschlagen."""
+    mapping: dict[str, str] = {}
+    for i, item in enumerate(items):
+        if item in text:
+            ph = f"__{placeholder_tag}_{i}__"
+            mapping[ph] = item
+            text = text.replace(item, ph)
+    return text, mapping
+
+def _restore_placeholders(text: str, mapping: dict) -> str:
+    for ph, original in mapping.items():
+        text = text.replace(ph, original)
+    return text
+
+def split_sentences_german(text: str) -> list[str]:
+    """Abkürzungs-sichere Satzaufteilung für Deutsch."""
+    protected, map_abbr = _protect_placeholders(text, GERMAN_ABBREVIATIONS, "ABBR")
+    
+    # Zahlen mit Dezimalpunkt schützen
+    protected, map_num = _protect_placeholders(
+        protected,
+        set(re.findall(r"\b\d+\.\d+\b", protected)),
+        "NUM"
+    )
+    
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-ZÄÖÜ])", protected.strip())
+    
+    # Platzhalter zurückwandeln
+    return [_restore_placeholders(s.strip(), {**map_abbr, **map_num})
+            for s in sentences if s.strip()]
+
+def split_words_with_validation(text: str,
+                                char_limit: int,
+                                min_words: int = MIN_WORDS_GLOBAL) -> list[str]:
+    """Wort-basiertes Splitting mit Mindestwortregeln."""
+    words = text.split()
+    if len(words) <= min_words:
+        return [text]
+    
+    chunks, current = [], ""
+    i = 0
+    while i < len(words):
+        nxt = f"{current} {words[i]}".strip()
+        if len(nxt) <= char_limit:
+            current = nxt
+            i += 1
+        else:
+            remaining = len(words) - i
+            if remaining < min_words:  # 2-Wort-Regel greift
+                current += " " + " ".join(words[i:])
+                break
+            chunks.append(current)
+            current = ""
+    if current:
+        chunks.append(current)
+    return chunks
+
+def split_text_robust_improved(
+    text: str,
+    char_limit: int = 150,
+    min_words: int = MIN_WORDS_GLOBAL
+    ) -> list[str]:
+    """
+    Drei-stufiges Chunking:
+        1) Satz-Splits (Abkürzungs-sicher)
+        2) Wort-Splits für überlange Sätze
+        3) Post-Merge, falls Chunk < min_words
+    """
+    if not text or len(text) <= char_limit:
+        return [text.strip()]
+    
+    sentences = split_sentences_german(text)
+    chunks, current = [], ""
+    
+    for sent in sentences:
+        candidate = f"{current} {sent}".strip() if current else sent
+        if len(candidate) <= char_limit:
+            current = candidate
+        else:
+            # Satz zu lang → Wort-Splitting
+            if current:
+                chunks.append(current)
+            chunks.extend(split_words_with_validation(sent, char_limit, min_words))
+            current = ""
+    if current:
+        chunks.append(current)
+    
+    # Post-Merge falls Chunk < min_words
+    merged: list[str] = []
+    for ch in chunks:
+        if len(ch.split()) < min_words and merged:
+            merged[-1] = f"{merged[-1]} {ch}".strip()
+        else:
+            merged.append(ch.strip())
+    
+    return [c for c in merged if c]
+
+# Transkriberen
+def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_interval=10):
+    """
+    Sichere Transkription mit Fortschrittsspeicherung, Wiederaufnahme, Live-Ausgabe und Prozessbalken.
+    Korrigierte Version, die direkt über den Generator iteriert, um Hänger zu vermeiden.
+    """
+    should_continue, existing_segments = handle_continuation_logic(transcription_file)
+    
+    if not should_continue:
+        return read_transcripted_csv(transcription_file)
+    
+    try:
+        logger.info("Lade Whisper-Modell (large-v3)...", exc_info=True)
+        logger.info("Starte Transkription...", exc_info=True)
+        print("----------------------------")
+        print("|<< Starte Transkription >>|")
+        print("----------------------------")
+        
+        transcription_start_time = time.time()    
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        processed_count = len(existing_segments)
+        logger.info(f"Setze Transkription fort ab Segment {processed_count}")
+
+        with gpu_context():
+            pipeline = load_whisper_model()   # Laden des vortrainierten Whisper-Modells
+            
+            # VAD-Parameter für die Sprachsegmentierung definieren
+            vad_params = {
+                "threshold": 0.05,               # Niedriger Schwellwert für empfindlichere Spracherkennung
+                "min_speech_duration_ms": 0,  # Minimale Sprachdauer in Millisekunden
+                #"max_speech_duration_s": 30,    # Maximale Sprachdauer in Sekunden
+                "min_silence_duration_ms": 0, # Minimale Stille-Dauer zwischen Segmenten
+                "speech_pad_ms": 400            # Polsterzeit vor und nach Sprachsegmenten
+            }
+            
+            segments_generator, info = pipeline.transcribe(
+                audio_file,
+                batch_size=1,
+                beam_size=15,
+                patience=1.5,
+                vad_filter=True,
+                vad_parameters=vad_params,
+                #chunk_length=25,
+                #compression_ratio_threshold=2.8,    # Schwellenwert für Kompressionsrate
+                #log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
+                #no_speech_threshold=1.0,            # Schwellenwert für Stille
+                #temperature=(0.05, 0.1, 0.15, 0.2, 0.25, 0.5),      # Temperatur für Sampling
+                temperature=1,                  # Temperatur für Sampling
+                word_timestamps=True,               # Zeitstempel für Wörter
+                hallucination_silence_threshold=0.3,  # Schwellenwert für Halluzinationen
+                condition_on_previous_text=True,    # Bedingung an vorherigen Text
+                no_repeat_ngram_size=3,
+                repetition_penalty=1.05,
+                language="en",   
+            )
+
+        all_segments = existing_segments.copy()
+        new_segments_batch = []
+        
+        print("\n--- [ Transkription Live-Ausgabe ] ---\n")
+        
+        # `tqdm` wird keine Gesamtanzahl anzeigen, aber den Fortschritt live darstellen.
+        # Wir überspringen manuell die bereits verarbeiteten Segmente.
+        
+        # Initialisiere tqdm ohne die Gesamtanzahl
+        progress_bar = tqdm(desc="\nTranskribiere Segmente", unit=" seg")
+        
+        for i, segment in enumerate(segments_generator):
+            progress_bar.update(1) # Zähler des Fortschrittsbalkens manuell erhöhen
+            
+            # Logik zum Überspringen, falls wir den Prozess fortsetzen
+            if i < processed_count:
+                continue
+                
+            start = str(timedelta(seconds=segment.start)).split('.')[0]
+            end = str(timedelta(seconds=segment.end)).split('.')[0]
+            text = re.sub(r'\.\.\.$', '', segment.text.strip()).strip()
+            
+            # Die Live-Ausgabe bleibt erhalten und sollte nun sofort erscheinen
+            print(f"\n[{start} --> {end}]:\n{text}")
+            
+            adjusted_segment = {"startzeit": start, "endzeit": end, "text": text}
+            new_segments_batch.append(adjusted_segment)
+            all_segments.append(adjusted_segment)
+            
+            if len(new_segments_batch) >= batch_save_interval:
+                save_progress_csv(all_segments, transcription_file)
+                new_segments_batch = []
+                logger.info(f"Zwischenspeicherung: {len(all_segments)} Segmente verarbeitet")
+
+        progress_bar.close() # Schließe den Fortschrittsbalken am Ende
+
+        if new_segments_batch or not existing_segments:
+            save_progress_csv(all_segments, transcription_file)
+        
+        print("\n------------------------------------")
+        print("|<< Transkription abgeschlossen! >>|")
+        print("------------------------------------")
+        logger.info("Transkription abgeschlossen!", exc_info=True)
+
+        transcript_end_time = time.time() - transcription_start_time
+        
+        logger.info(f"Transkription abgeschlossen in {transcript_end_time:.2f} Sekunden")
+        print(f"{(transcript_end_time):.2f} Sekunden")
+        print(f"{(transcript_end_time / 60 ):.2f} Minuten")
+        print(f"{(transcript_end_time / 3600):.2f} Stunden")
+        
+        return all_segments
+
+    except Exception as e:
+        logger.error(f"Fehler bei der Transkription: {e}", exc_info=True)
+        if 'all_segments' in locals() and all_segments:
+            save_progress_csv(all_segments, transcription_file)
+            logger.info(f"Notfall-Speicherung: {len(all_segments)} Segmente gesichert")
+        return []
+
+def parse_time(time_str):
+    """Strikte Zeitanalyse ohne Millisekunden"""
+    if pd.isna(time_str) or not isinstance(time_str, str):
+        return None
+    
+    # Normalisierung: Entferne Leerzeichen und überflüssige Zeichen
+    clean_str = re.sub(r"[^\d:.,]", "", time_str.strip())
+    
+    # Fall 1: HH:MM:SS
+    if match := re.match(r"^(\d+):(\d{1,2}):(\d{1,2})$", clean_str):
+        h, m, s = map(int, match.groups())
+        if m >= 60 or s >= 60:
+            raise ValueError(f"Ungültige Zeit: {time_str}")
+        return h * 3600 + m * 60 + s
+    
+    # Fall 2: MM:SS
+    if match := re.match(r"^(\d+):(\d{1,2})$", clean_str):
+        m, s = map(int, match.groups())
+        if m >= 60 or s >= 60:
+            raise ValueError(f"Ungültige Zeit: {time_str}")
+        return m * 60 + s
+    
+    # Fall 3: SS
+    if clean_str.isdigit():
+        return int(clean_str)
+    
+    return None
+
+def format_time(seconds):
+    """Konvertiert Sekunden in HH:MM:SS mit Validierung"""
+    if seconds is None or seconds < 0:
+        logger.warning("Ungültige Sekundenangabe, setze auf 0")
+        return "00:00:00"
+    
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = int(seconds % 60)
+    
+    # Overflow-Handling
+    if minutes >= 60:
+        hours += minutes // 60
+        minutes %= 60
+    
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+def split_into_sentences(text):
+    """
+    Teilt einen Text in Sätze auf unter Berücksichtigung gängiger Satzenden
+    
+    Args:
+        text (str): Zu teilender Text
+        
+    Returns:
+        list: Liste der einzelnen Sätze
+    """
+    # Erweiterte Regex für bessere Satzerkennung
+    # Berücksichtigt gängige Satzenden (., !, ?) aber ignoriert Abkürzungen
+    pattern = r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!)\s+'
+    
+    sentences = re.split(pattern, text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    
+    # Fallback für Texte ohne erkennbare Satzgrenzen
+    if not sentences:
+        return [text]
+    
+    return sentences
+
+def read_translated_csv(file_path):
+    """
+    Liest eine bereits übersetzte CSV-Datei ein
+    
+    Args:
+        file_path (str): Pfad zur CSV-Datei
+        
+    Returns:
+        DataFrame: Die eingelesenen Daten
+    """
+    return pd.read_csv(file_path, sep='|', dtype=str)
+
+def merge_transcript_chunks(input_file, output_file, min_dur, max_dur, max_gap, max_chars, min_words, iterations):
+    """
+    Führt Transkript-Segmente zusammen, ohne Text zu verwerfen.
+    Implementiert die 3-Wörter-Regel für Zeichenbegrenzungen.
+
+    Args:
+        input_file (str): Eingabedatei mit | als Trennzeichen.
+        output_file (str): Zieldatei für Ergebnisse.
+        min_dur (float): Ziel-Mindestdauer. Segmente darunter werden nach Möglichkeit zusammengeführt.
+        max_dur (float): Maximale Segmentdauer in Sekunden (wird beim initialen Mergen beachtet).
+        max_gap (float): Maximaler akzeptierter Zeitabstand für initiales Mergen.
+        max_chars (int): Maximale Anzahl von Zeichen (3-Wörter-Regel wird angewendet).
+        min_words (int): Ziel-Mindestwortzahl. Segmente darunter werden nach Möglichkeit zusammengeführt.
+        iterations (int): Anzahl der Optimierungsdurchläufe.
+    """
+    if os.path.exists(output_file):
+        if not ask_overwrite(output_file):
+            logger.info(f"Verwende vorhandene Übersetzungen: {output_file}")
+            return read_translated_csv(output_file)
+
+    def force_merge_short_segments(data_list, min_dur, min_words):
+        """
+        Führt Segmente, die min_dur oder min_words nicht erfüllen, mit Nachbarn zusammen.
+        Priorität: Kein Textverlust. Modifiziert die Liste direkt.
+        Gibt True zurück, wenn Änderungen vorgenommen wurden, sonst False.
+        """
+        if not data_list: 
+            return False
+
+        merged_something = False
+        i = 0
+        while i < len(data_list):
+            item = data_list[i]
+            start_sec = parse_time(item['startzeit'])
+            end_sec = parse_time(item['endzeit'])
+
+            if start_sec is None or end_sec is None or start_sec > end_sec:
+                logger.warning(f"Segment {i} hat ungültige Zeiten ({item['startzeit']} / {item['endzeit']}) - wird in force_merge übersprungen.")
+                i += 1
+                continue
+
+            duration = round(end_sec - start_sec, 3)
+            word_count = len(item['text'].split()) if item.get('text') else 0
+
+            needs_merge = (duration < min_dur or word_count < min_words) and len(data_list) > 1
+
+            if needs_merge:
+                merged_this_iteration = False
+                # Option 1: Mit Vorgänger zusammenführen (bevorzugt)
+                if i > 0:
+                    prev_item = data_list[i-1]
+                    separator = " " if prev_item.get('text', '').strip() and item.get('text', '').strip() else ""
+                    merged_text = (prev_item.get('text', '') + separator + item.get('text', '')).strip()
+
+                    prev_item['endzeit'] = item['endzeit']
+                    prev_item['text'] = merged_text
+                    del data_list[i]
+                    merged_something = True
+                    merged_this_iteration = True
+                    logger.debug(f"Segment {i+1} mit Vorgänger {i} zusammengeführt.")
+
+                # Option 2: Mit Nachfolger zusammenführen
+                elif i < len(data_list) - 1:
+                    next_item = data_list[i+1]
+                    separator = " " if item.get('text', '').strip() and next_item.get('text', '').strip() else ""
+                    merged_text = (item.get('text', '') + separator + next_item.get('text', '')).strip()
+
+                    item['endzeit'] = next_item['endzeit']
+                    item['text'] = merged_text
+                    del data_list[i+1]
+                    merged_something = True
+                    merged_this_iteration = True
+                    logger.debug(f"Segment {i} mit Nachfolger {i+1} zusammengeführt.")
+
+                if not merged_this_iteration:
+                    i += 1
+            else:
+                i += 1
+
+        return merged_something
+
+    def split_text_with_3_word_rule(text, max_chars):
+        """
+        Teilt Text an Satz- oder Wortgrenzen auf, wendet aber die 3-Wörter-Regel an.
+        Ignoriert max_chars, wenn das neue Segment weniger als 3 Wörter hätte.
+        """
+        if len(text) <= max_chars:
+            return [text]
+
+        # Versuche zuerst Aufteilung an Satzgrenzen
+        sentences = split_into_sentences(text)
+        
+        if len(sentences) == 1:
+            # Nur ein Satz - teile an Wortgrenzen mit 3-Wörter-Regel
+            return split_words_with_3_word_rule(text, max_chars)
+        else:
+            # Mehrere Sätze - kombiniere unter Beachtung der Regeln
+            return split_sentences_with_3_word_rule(sentences, max_chars)
+
+    def split_words_with_3_word_rule(text, max_chars):
+        """
+        Teilt einen einzelnen Satz an Wortgrenzen mit 3-Wörter-Regel auf.
+        """
+        words = text.split()
+        if len(words) <= 3:
+            # Weniger als oder gleich 3 Wörter - nicht aufteilen
+            return [text]
+
+        chunks = []
+        current_chunk = ""
+        i = 0
+
+        while i < len(words):
+            word = words[i]
+            test_chunk = current_chunk + (" " + word if current_chunk else word)
+
+            if len(test_chunk) <= max_chars:
+                current_chunk = test_chunk
+                i += 1
+            else:
+                # Wort passt nicht mehr - prüfe 3-Wörter-Regel
+                remaining_words = words[i:]
+                
+                if len(remaining_words) < 3:
+                    # 3-Wörter-Regel: Füge verbleibende Wörter zum aktuellen Chunk hinzu
+                    current_chunk += " " + " ".join(remaining_words) if current_chunk else " ".join(remaining_words)
+                    chunks.append(current_chunk)
+                    break
+                else:
+                    # Genug Wörter übrig - speichere aktuellen Chunk und starte neuen
+                    if current_chunk:
+                        chunks.append(current_chunk)
+                    current_chunk = word
+                    i += 1
+
+        # Letzten Chunk hinzufügen, falls noch vorhanden
+        if current_chunk and current_chunk not in chunks:
+            chunks.append(current_chunk)
+
+        return chunks
+
+    def split_sentences_with_3_word_rule(sentences, max_chars):
+        """
+        Kombiniert Sätze unter Beachtung der 3-Wörter-Regel.
+        """
+        chunks = []
+        current_chunk = ""
+
+        for j, sentence in enumerate(sentences):
+            test_chunk = current_chunk + (" " + sentence if current_chunk else sentence)
+
+            if len(test_chunk) <= max_chars:
+                current_chunk = test_chunk
+            else:
+                # Satz passt nicht mehr - prüfe 3-Wörter-Regel
+                remaining_sentences = sentences[j:]
+                remaining_text = " ".join(remaining_sentences)
+
+                if len(remaining_text.split()) < 3:
+                    # 3-Wörter-Regel: Füge verbleibende Sätze hinzu
+                    current_chunk = test_chunk
+                else:
+                    # Genug Wörter übrig - speichere aktuellen Chunk
+                    if current_chunk:
+                        chunks.append(current_chunk)
+                    current_chunk = sentence
+
+        # Letzten Chunk hinzufügen
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        return chunks
+
+    try:
+        print(f"Starte Verarbeitung von: {input_file}")
+        print(f"Parameter: min_dur={min_dur}s, max_dur={max_dur}s, max_gap={max_gap}s")
+        print(f"max_chars={max_chars} (mit 3-Wörter-Regel), min_words={min_words}, iterations={iterations}")
+
+        # Daten laden und validieren
+        df = pd.read_csv(input_file, sep='|', dtype=str)
+        original_segment_count = len(df)
+        print(f"Eingelesen: {original_segment_count} Segmente aus {input_file}")
+
+        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '')
+        required_columns = {'startzeit', 'endzeit', 'text'}
+        if not required_columns.issubset(df.columns):
+            missing = required_columns - set(df.columns)
+            raise ValueError(f"Fehlende Spalten: {', '.join(missing)}")
+
+        df['start_sec'] = df['startzeit'].apply(parse_time)
+        df['end_sec'] = df['endzeit'].apply(parse_time)
+        df['text'] = df['text'].astype(str).fillna('')
+
+        # Ungültige Zeiten entfernen
+        invalid_mask = df['start_sec'].isna() | df['end_sec'].isna() | (df['start_sec'] > df['end_sec'])
+        if invalid_mask.any():
+            invalid_count = invalid_mask.sum()
+            print(f"Warnung: {invalid_count} Zeilen mit ungültigen Zeitangaben werden übersprungen.")
+            df = df[~invalid_mask].copy()
+
+        if df.empty:
+            print("Keine gültigen Segmente nach initialer Zeitprüfung.")
+            pd.DataFrame(columns=['startzeit', 'endzeit', 'text']).to_csv(output_file, sep='|', index=False)
+            return pd.DataFrame(columns=['startzeit', 'endzeit', 'text'])
+
+        df['duration'] = df['end_sec'] - df['start_sec']
+        df = df.sort_values('start_sec').reset_index(drop=True)
+        print(f"Nach Zeitvalidierung und Sortierung: {len(df)} gültige Segmente")
+
+        current_df = df.copy()
+        current_data_list = []
+
+        # Iterative Optimierung
+        for iteration in range(iterations):
+            print(f"\n--- Optimierungsdurchlauf {iteration+1}/{iterations} ---")
+
+            if iteration > 0:
+                if not current_data_list:
+                    print("Keine Segmente mehr für weiteren Durchlauf vorhanden.")
+                    break
+                
+                # DataFrame aus aktueller Liste erstellen
+                temp_df = pd.DataFrame(current_data_list)
+                temp_df['start_sec'] = temp_df['startzeit'].apply(parse_time)
+                temp_df['end_sec'] = temp_df['endzeit'].apply(parse_time)
+                temp_df['text'] = temp_df['text'].astype(str).fillna('')
+
+                invalid_mask = temp_df['start_sec'].isna() | temp_df['end_sec'].isna() | (temp_df['start_sec'] > temp_df['end_sec'])
+                if invalid_mask.any():
+                    print(f"Warnung (Durchlauf {iteration+1}): {invalid_mask.sum()} ungültige Zeiten entfernt.")
+                    temp_df = temp_df[~invalid_mask].copy()
+
+                if temp_df.empty:
+                    print("Keine gültigen Segmente mehr im Durchlauf.")
+                    current_data_list = []
+                    break
+
+                temp_df['duration'] = temp_df['end_sec'] - temp_df['start_sec']
+                current_df = temp_df.sort_values('start_sec').reset_index(drop=True)
+                print(f"Für Durchlauf {iteration+1}: {len(current_df)} Segmente")
+
+            merged_data = []
+            current_chunk = None
+
+            # Phase 1: Zeitbasiertes Zusammenführen
+            for _, row in current_df.iterrows():
+                row_text = str(row['text']) if pd.notna(row['text']) else ''
+
+                if current_chunk is None:
+                    current_chunk = {
+                        'start': row['start_sec'], 
+                        'end': row['end_sec'],
+                        'text': [row_text],
+                        'original_start': row['startzeit'], 
+                        'original_end': row['endzeit']
+                    }
+                else:
+                    gap = row['start_sec'] - current_chunk['end']
+                    potential_new_end = row['end_sec']
+                    potential_duration = potential_new_end - current_chunk['start']
+                    
+                    # Berechne potenziellen Gesamttext
+                    temp_texts = current_chunk['text'] + [row_text] if row_text else current_chunk['text']
+                    potential_full_text = ""
+                    first = True
+                    for txt in temp_texts:
+                        clean_txt = txt.strip()
+                        if clean_txt:
+                            if not first: 
+                                potential_full_text += " "
+                            potential_full_text += clean_txt
+                            first = False
+                    
+                    potential_chars = len(potential_full_text)
+
+                    # Zusammenführen wenn Kriterien erfüllt sind
+                    if (gap >= 0 and gap <= max_gap) and \
+                       (potential_duration <= max_dur) and \
+                       (potential_chars <= max_chars):
+                        current_chunk['end'] = potential_new_end
+                        if row_text:
+                            current_chunk['text'].append(row_text)
+                        current_chunk['original_end'] = row['endzeit']
+                    else:
+                        # Finalisiere vorherigen Chunk
+                        final_text = ""
+                        first = True
+                        for txt in current_chunk['text']:
+                            clean_txt = txt.strip()
+                            if clean_txt:
+                                if not first: 
+                                    final_text += " "
+                                final_text += clean_txt
+                                first = False
+                        
+                        if final_text:
+                            merged_data.append({
+                                'startzeit': current_chunk['original_start'],
+                                'endzeit': current_chunk['original_end'],
+                                'text': final_text
+                            })
+                        
+                        # Beginne neuen Chunk
+                        current_chunk = {
+                            'start': row['start_sec'], 
+                            'end': row['end_sec'],
+                            'text': [row_text] if row_text else [],
+                            'original_start': row['startzeit'], 
+                            'original_end': row['endzeit']
+                        }
+
+            # Letzten Chunk hinzufügen
+            if current_chunk:
+                final_text = ""
+                first = True
+                for txt in current_chunk['text']:
+                    clean_txt = txt.strip()
+                    if clean_txt:
+                        if not first: 
+                            final_text += " "
+                        final_text += clean_txt
+                        first = False
+                
+                if final_text:
+                    merged_data.append({
+                        'startzeit': current_chunk['original_start'],
+                        'endzeit': current_chunk['original_end'],
+                        'text': final_text
+                    })
+
+            print(f"Nach Zeit-Zusammenführung: {len(merged_data)} Segmente")
+
+            # Phase 2: Aufteilung zu langer Segmente mit 3-Wörter-Regel
+            current_data_list = []
+            segmente_aufgeteilt_max_chars = 0
+            segments_protected_by_3_word_rule = 0
+
+            for item in merged_data:
+                text = item['text'].strip()
+                start_time_sec = parse_time(item['startzeit'])
+                end_time_sec = parse_time(item['endzeit'])
+
+                if start_time_sec is None or end_time_sec is None:
+                    logger.warning(f"Überspringe Segment wegen ungültiger Zeit: {item}")
+                    current_data_list.append(item)
+                    continue
+
+                duration = end_time_sec - start_time_sec
+
+                # Prüfe ob Text das Zeichenlimit überschreitet
+                if len(text) <= max_chars:
+                    current_data_list.append(item)
+                else:
+                    # Prüfe 3-Wörter-Regel bevor Aufteilung
+                    word_count = len(text.split())
+                    if word_count < 3:
+                        # 3-Wörter-Regel greift - keine Aufteilung
+                        segments_protected_by_3_word_rule += 1
+                        print(f"Info: Segment mit {word_count} Wörtern wird wegen 3-Wörter-Regel nicht aufgeteilt " +
+                              f"(Länge: {len(text)} > {max_chars}): {item['startzeit']}-{item['endzeit']}")
+                        current_data_list.append(item)
+                        continue
+
+                    # Text kann aufgeteilt werden
+                    segmente_aufgeteilt_max_chars += 1
+                    print(f"Info: Segment wird aufgeteilt: {len(text)} > {max_chars} " +
+                          f"({item['startzeit']}-{item['endzeit']})")
+
+                    # Verwende die neue Aufteilungsfunktion mit 3-Wörter-Regel
+                    text_chunks = split_text_with_3_word_rule(text, max_chars)
+                    
+                    print(f"-> Aufgeteilt in {len(text_chunks)} Segmente")
+
+                    # Zeitverteilung proportional zur Textlänge
+                    num_new_segments = len(text_chunks)
+                    if num_new_segments == 0: 
+                        continue
+
+                    total_chars_in_split = sum(len(s) for s in text_chunks)
+                    if total_chars_in_split == 0:
+                        # Gleichmäßige Zeitverteilung bei fehlenden Zeichen
+                        segment_duration = duration / num_new_segments if num_new_segments > 0 else 0
+                        current_start_time = start_time_sec
+                        
+                        for i, segment_text in enumerate(text_chunks):
+                            segment_end_time = current_start_time + segment_duration
+                            if i == num_new_segments - 1: 
+                                segment_end_time = end_time_sec
+                            
+                            new_item = {
+                                'startzeit': format_time(current_start_time),
+                                'endzeit': format_time(segment_end_time),
+                                'text': segment_text
+                            }
+                            current_data_list.append(new_item)
+                            current_start_time = segment_end_time
+                        continue
+
+                    # Proportionale Zeitverteilung nach Zeichenanzahl
+                    current_start_time = start_time_sec
+                    for i, segment_text in enumerate(text_chunks):
+                        segment_chars = len(segment_text)
+                        segment_proportion = segment_chars / total_chars_in_split
+                        segment_duration = duration * segment_proportion
+                        segment_end_time = current_start_time + segment_duration
+
+                        # Korrektur für letztes Segment
+                        if i == num_new_segments - 1:
+                            segment_end_time = end_time_sec
+
+                        new_item = {
+                            'startzeit': format_time(current_start_time),
+                            'endzeit': format_time(segment_end_time),
+                            'text': segment_text
+                        }
+                        current_data_list.append(new_item)
+                        current_start_time = segment_end_time
+
+            print(f"Nach Längen-Aufteilung: {len(current_data_list)} Segmente")
+            print(f"  Segmente aufgeteilt wegen max. Zeichen: {segmente_aufgeteilt_max_chars}")
+            print(f"  Segmente durch 3-Wörter-Regel geschützt: {segments_protected_by_3_word_rule}")
+
+        # Finale Phase: Erzwinge min_dur und min_words durch Zusammenführen
+        print("\n--- Finale Bereinigung: Erzwinge Mindestdauer & Mindestwörter ---")
+        force_merge_iterations = 0
+        max_force_merge_iterations = len(current_data_list)
+        
+        while force_merge_iterations < max_force_merge_iterations:
+            force_merge_iterations += 1
+            print(f"Bereinigungsdurchlauf {force_merge_iterations}...")
+            changed = force_merge_short_segments(current_data_list, min_dur, min_words)
+            print(f"Segmente nach Durchlauf {force_merge_iterations}: {len(current_data_list)}")
+            
+            if not changed:
+                print("Keine weiteren Zusammenführungen nötig.")
+                break
+                
+        if force_merge_iterations == max_force_merge_iterations:
+            print("Warnung: Maximalzahl an Bereinigungsdurchläufen erreicht.")
+
+        # Abschluss und Speichern
+        if not current_data_list:
+            print("\n--- Verarbeitung abgeschlossen: KEINE finalen Segmente erzeugt ---")
+            final_df = pd.DataFrame(columns=['startzeit', 'endzeit', 'text'])
+            final_df.to_csv(output_file, sep='|', index=False)
+            print(f"Leere Ergebnisdatei {output_file} gespeichert.")
+            return final_df
+
+        result_df = pd.DataFrame(current_data_list)
+        result_df = result_df[['startzeit', 'endzeit', 'text']]
+        result_df.to_csv(output_file, sep='|', index=False)
+
+        # Abschlussbericht
+        final_segment_count = len(result_df)
+        print("\n--- Verarbeitungsstatistik (Final) ---")
+        print(f"Originale Segmente gelesen:           {original_segment_count}")
+        print(f"Gültige Segmente nach Init-Parse:     {len(df) if 'df' in locals() else 'N/A'}")
+        print(f"Finale Segmente geschrieben:          {final_segment_count}")
+        print(f"Durch 3-Wörter-Regel geschützt:       {segments_protected_by_3_word_rule}")
+        print(f"Ergebnis in {output_file} gespeichert")
+        print("--" * 20 + "\n")
+
+        return result_df
+
+    except FileNotFoundError:
+        print(f"Fehler: Eingabedatei nicht gefunden: {input_file}")
+        raise
+    except ValueError as e:
+        print(f"Fehler bei der Datenvalidierung: {str(e)}")
+        traceback.print_exc()
+        raise
+    except Exception as e:
+        print(f"Unerwarteter Fehler: {str(e)}")
+        traceback.print_exc()
+        raise
+
+def safe_punctuate(text, model, logger):
+    """
+    Eine sichere Wrapper-Funktion, um die Interpunktion wiederherzustellen.
+    Fängt Fehler ab, die durch leere oder problematische Texteingaben in der Bibliothek entstehen können.
+    """
+    # Prüfe, ob der Input ein gültiger, nicht-leerer String ist.
+    if not isinstance(text, str) or not text.strip():
+        # Wenn nicht, gib den Originaltext (z.B. leer oder None) zurück.
+        return text
+    try:
+        # Versuche, die Interpunktion mit dem Modell wiederherzustellen.
+        return model.restore_punctuation(text)
+    except IndexError:
+        # Fange den spezifischen IndexError ab, der bei leeren 'batches' auftritt.
+        logger.warning(f"Konnte Interpunktion für das Segment nicht wiederherstellen, da es wahrscheinlich leer oder ungültig ist. Segment: '{text}'")
+        # Gib den ursprünglichen Text zurück, um Datenverlust zu vermeiden.
+        return text
+    except Exception as e:
+        # Fange alle anderen unerwarteten Fehler ab.
+        logger.error(f"Ein unerwarteter Fehler ist bei der Interpunktion des Segments aufgetreten: '{text}'. Fehler: {e}")
+        # Gib auch hier den Originaltext zurück.
+        return text
+
+def restore_punctuation(input_file, output_file):
+    # Überprüft, ob die Ausgabedatei bereits existiert.
+    if os.path.exists(output_file):
+        # Fragt den Benutzer, ob die existierende Datei überschrieben werden soll.
+        if not ask_overwrite(output_file):
+            # Wenn nicht, wird die vorhandene Datei verwendet und die Funktion beendet.
+            logger.info(f"Verwende vorhandene Interpunktions-Datei: {output_file}", exc_info=True)
+            # Liest die bereits übersetzte/punktierte CSV-Datei und gibt sie zurück.
+            return read_translated_csv(output_file)
+
+    """Stellt die Interpunktion mit deepmultilingualpunctuation wieder her."""
+    # Lese die Eingabedatei in einen pandas DataFrame ein, Spaltentrenner ist '|', alle Daten als String behandeln.
+    df = pd.read_csv(input_file, sep='|', dtype=str)
+    
+    # Identifiziere die ursprüngliche Textspalte (ignoriere Groß/Kleinschreibung)
+    text_col_original = None # Initialisiere die Variable für den Spaltennamen 'text'.
+    for col in df.columns: # Durchlaufe alle Spaltennamen im DataFrame.
+        if col.strip().lower() == 'text': # Prüfe, ob der bereinigte Spaltenname (in Kleinbuchstaben) 'text' ist.
+            text_col_original = col # Speichere den originalen Spaltennamen (z.B. 'text', 'Text', ' text ').
+            break # Beende die Schleife, sobald die Spalte gefunden wurde.
+    if text_col_original is None: # Wenn nach der Schleife keine Textspalte gefunden wurde.
+        raise ValueError("Keine Spalte 'text' (unabhängig von Groß/Kleinschreibung) in der Eingabedatei gefunden.") # Wirf einen Fehler.
+    
+    # Nutze den GPU-Kontextmanager für die Modell-Ausführung.
+    with gpu_context():
+        # Initialisiere das Interpunktionsmodell.
+        model = PunctuationModel()
+        
+        # Wende das Modell mit unserer neuen, sicheren Funktion auf jede Zeile der Textspalte an und speichere das Ergebnis in einer NEUEN Spalte.
+        df['punctuated_text'] = df[text_col_original].apply(lambda x: safe_punctuate(x, model, logger))
+
+        # Lösche die ursprüngliche Textspalte, da wir nun die punktierte Version haben.
+        df = df.drop(columns=[text_col_original])
+
+        # Benenne die neue Spalte in den Standardnamen 'text' um (jetzt garantiert kleingeschrieben).
+        df = df.rename(columns={'punctuated_text': 'text'})
+
+        # Stelle sicher, dass die Spaltenreihenfolge sinnvoll ist (optional, aber gut für die Lesbarkeit).
+        cols = df.columns.tolist() # Hole eine Liste aller Spaltennamen.
+        # Prüfe, ob die Kernspalten für Zeitstempel und Text vorhanden sind.
+        if 'startzeit' in cols and 'endzeit' in cols and 'text' in cols:
+            # Definiere die gewünschte Reihenfolge der Kernspalten.
+            core_cols = ['startzeit', 'endzeit', 'text']
+            # Sammle alle anderen Spalten, die nicht zu den Kernspalten gehören.
+            other_cols = [c for c in cols if c not in core_cols]
+            # Ordne den DataFrame neu an: Zuerst die Kernspalten, dann der Rest.
+            df = df[core_cols + other_cols]
+        
+    # Speichere den bearbeiteten DataFrame in der Ausgabedatei, mit '|' als Trennzeichen und ohne den Index.
+    df.to_csv(output_file, sep='|', index=False)
+    # Gib den Pfad zur erstellten Datei zurück.
+    return output_file
+
+def read_transcripted_csv(file_path):
+    """Liest die übersetzte CSV-Datei."""
+    segments = []
+    with open(file_path, mode='r', encoding='utf-8') as csvfile:
+        csv_reader = csv.reader(csvfile, delimiter='|')
+        next(csv_reader)
+        for row in csv_reader:
+            if len(row) == 3:
+                start = sum(float(x) * 60 ** i for i, x in enumerate(reversed(row[0].split(':'))))
+                end = sum(float(x) * 60 ** i for i, x in enumerate(reversed(row[1].split(':'))))
+                segments.append({
+                    "start": start,
+                    "end": end,
+                    "text": row[2]
+                })
+    return segments
+
+def sanitize_for_csv_and_tts(text: str) -> str:
+    """
+    ERWEITERTE VERSION: Entfernt alle verbliebenen Entity-Platzhalter und normalisiert Text.
+    
+    Args:
+        text: Zu bereinigender Text
+        
+    Returns:
+        Bereinigter Text für CSV und TTS
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    
+    # Entferne alle möglichen Entity-Platzhalter-Patterns
+    entity_patterns = [
+        r'__ENTITY_[A-Z_]+_\d+__',      # Standard Entity-Platzhalter
+        r'__CUSTOM_PATTERN_\d+__',       # Custom Pattern-Platzhalter
+        r'__NAME_\d+_\d+__',             # Name-Platzhalter
+        r'__ABBR_\d+__',                 # Abkürzungs-Platzhalter
+        r'__NUM_\d+__',                  # Zahlen-Platzhalter
+        r'__[A-Z_]+_\d+__',              # Allgemeine Fallback-Pattern
+        r'\[PLACEHOLDER\]',              # Standard Placeholder
+        r'\[MASK\]',                     # Mask-Token
+        r'<2[a-z]{2}>',                  # MADLAD400 Sprachpräfixe
+        r'<[0-9][a-z]{2}>'               # Varianten mit Zahlen
+    ]
+    
+    cleaned_text = text
+    for pattern in entity_patterns:
+        cleaned_text = re.sub(pattern, '', cleaned_text, flags=re.IGNORECASE)
+    
+    # Normalisiere Leerzeichen und Satzzeichen
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text)           # Mehrfache Leerzeichen
+    cleaned_text = re.sub(r'\s*[,\.]\s*[,\.]+', '.', cleaned_text)  # Doppelte Satzzeichen
+    cleaned_text = re.sub(r'^[,\.\s]+|[,\.\s]+$', '', cleaned_text)  # Führende/nachgestellte Zeichen
+    
+    # Deutsche Kapitalisierung
+    cleaned_text = cleaned_text.strip()
+    if cleaned_text and cleaned_text[0].islower():
+        cleaned_text = cleaned_text[0].upper() + cleaned_text[1:]
+    
+    # CSV-konforme Bereinigung
+    cleaned_text = cleaned_text.replace('|', ',')              # CSV-Delimiter
+    cleaned_text = cleaned_text.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+    cleaned_text = re.sub(r'\s{2,}', ' ', cleaned_text)        # Finale Leerzeichen-Normalisierung
+    
+    return cleaned_text.strip()
+
+def setup_gpu_memory_optimization_rtx4050():
+    """
+    Konfiguriert GPU-Speicher optimal für RTX 4050 Mobile (6GB VRAM).
+    Diese Funktion sollte ganz am Anfang des Skripts aufgerufen werden.
+    """
+
+    # RTX 4050 Mobile-spezifische Memory-Pool-Konfiguration
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:256,expandable_segments:True'
+    
+    # CTranslate2-spezifische Optimierungen für 6GB VRAM
+    os.environ['CT2_CUDA_CACHING_ALLOCATOR_CONFIG'] = '4,3,10,104857600'  # 100MB Cache
+    os.environ['CT2_CUDA_ALLOW_FP16'] = '1'
+    os.environ['CT2_USE_EXPERIMENTAL_PACKED_GEMM'] = '1'
+    
+    # GPU-Optimierungen aktivieren
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True  
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        
+        # Memory-Fragmentierung reduzieren
+        torch.cuda.empty_cache()
+        
+        logger.info("RTX 4050 Mobile GPU-Optimierungen aktiviert")
+        logger.info(f"Verfügbarer GPU-Speicher: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    else:
+        logger.warning("CUDA nicht verfügbar - GPU-Optimierungen übersprungen")
+
+def estimate_memory_per_sample(
+    avg_text_length: float, 
+    max_length: int, 
+    translator, 
+    tokenizer,
+    dtype_multiplier: float = 2.0  # bfloat16 = 2 bytes per parameter
+) -> float:
+    """
+    Schätzt den Speicherverbrauch pro Sample basierend auf Modellgröße und Textlänge.
+    
+    Args:
+        avg_text_length: Durchschnittliche Textlänge in Zeichen
+        max_length: Maximale Token-Länge
+        model: MADLAD400 Modell
+        tokenizer: MADLAD400 Tokenizer
+        dtype_multiplier: Multiplikator für Datentyp (bfloat16 = 2.0)
+        
+    Returns:
+        Geschätzter Speicherverbrauch in Bytes
+    """
+    
+    # Geschätzte Token-Anzahl (ca. 4 Zeichen pro Token für deutsche Texte)
+    estimated_tokens = min(int(avg_text_length / 4), max_length)
+    
+    # Basis-Speicherverbrauch für MADLAD400-7B Modell
+    # Input-Tensoren: batch_size * seq_length * hidden_size * dtype_bytes
+    hidden_size = 1024  # Typisch für 7B Modelle
+    input_memory = estimated_tokens * hidden_size * dtype_multiplier
+    
+    # Output-Tensoren und Zwischenergebnisse (Faktor 3-4x für Transformer)
+    total_memory_per_sample = input_memory * 4
+    
+    # Zusätzlicher Speicher für Attention-Mechanismen
+    attention_memory = estimated_tokens * estimated_tokens * dtype_multiplier
+    
+    # Gesamtspeicher pro Sample
+    estimated_memory = total_memory_per_sample + attention_memory
+    
+    # Konservative Schätzung mit zusätzlichem Puffer für unvorhersehbare Allokationen
+    return estimated_memory * 1.5
+
+def prepend_previous_if_fragile(idx: int, segment_list: list) -> str:
+    """
+    Gibt den aktuellen Text zurück; beginnt er mit einem Gerundium/Partizip,
+    wird automatisch der vorherige Satz vorangestellt (Mini-Kontext).
+
+    Args:
+        idx: Position des Segments im übergebenen segment_list.
+        segment_list: Liste von Segment-Dicts bzw. Strings mit 'text'-Key.
+    """
+    # Rohtext des aktuellen Segments ermitteln
+    curr = (segment_list[idx]["text"]
+            if isinstance(segment_list[idx], dict)
+            else str(segment_list[idx])).strip()
+
+    # Muster: ing- oder ‑ed-Formen zu Satzbeginn (engl. Partizip/Gerundium)
+    if re.match(r"^(?:[A-Za-z]+ing\b|[A-Za-z]+ed\b)", curr, flags=re.I):
+        if idx > 0:
+            prev = (segment_list[idx - 1]["text"]
+                    if isinstance(segment_list[idx - 1], dict)
+                    else str(segment_list[idx - 1])).strip()
+            # max. 300 Zeichen Kontext, um VRAM zu schonen
+            CTX_TOKEN = "[CTX]"            # darf im Quelltext NICHT vorkommen
+            return f"{prev} {CTX_TOKEN} {curr}"[:300].strip()
+    return curr
+
+def calculate_optimal_batch_size_rtx4050(texts, tokenizer, max_length=512):
+    """
+    Berechnet optimale Batch-Größe für RTX 4050 Mobile basierend auf Textlängen.
+    
+    Args:
+        texts: Liste der zu übersetzenden Texte
+        tokenizer: SentencePiece Tokenizer
+        max_length: Maximale Token-Länge pro Text
+        
+    Returns:
+        int: Optimale Batch-Größe für RTX 4050 Mobile
+    """
+    if not torch.cuda.is_available():
+        return 2  # CPU-Fallback
+    
+    # RTX 4050 Mobile: 6GB VRAM - konservative Schätzung
+    available_memory = torch.cuda.get_device_properties(0).total_memory
+    allocated_memory = torch.cuda.memory_allocated()
+    free_memory = available_memory - allocated_memory
+    
+    # Durchschnittliche Textlänge bestimmen
+    sample_texts = texts[:min(5, len(texts))]
+    avg_tokens = 0
+    
+    for text in sample_texts:
+        if isinstance(text, dict):
+            text = text.get('text', '')
+        # Schätze Token-Anzahl (SentencePiece: ~4 Zeichen pro Token)
+        estimated_tokens = min(len(str(text)) // 4, max_length)
+        avg_tokens += estimated_tokens
+    
+    avg_tokens = avg_tokens / len(sample_texts) if sample_texts else max_length
+    
+    # Memory-Bedarf pro Sample schätzen (konservativ für MADLAD400-7B)
+    # Basis: ~2 bytes pro Parameter * geschätzte Aktivierungen
+    estimated_memory_per_sample = avg_tokens * 1024 * 8  # 8KB pro Token (konservativ)
+    
+    # Sicherheitspuffer: 70% des freien Speichers nutzen
+    usable_memory = free_memory * 0.7
+    
+    # Batch-Größe berechnen
+    if estimated_memory_per_sample > 0:
+        calculated_batch_size = int(usable_memory / estimated_memory_per_sample)
+        # RTX 4050 Mobile Limits: Min 1, Max 6 für Translation
+        optimal_batch_size = max(1, min(calculated_batch_size, 2))
+    else:
+        optimal_batch_size = 2  # Sicherer Standard
+    
+    logger.info(f"Berechnete optimale Batch-Größe: {optimal_batch_size}")
+    logger.info(f"Freier GPU-Speicher: {free_memory / 1024**3:.2f} GB")
+    
+    return optimal_batch_size
+
+# Übersetzen
+def translate_batch_madlad400(
+    texts,
+    translator,
+    tokenizer,
+    source_lang="en",
+    target_lang="de",
+    batch_size=None
+):
+    """
+    Führt eine korrekte Batch-Übersetzung mit MADLAD400 und CTranslate2 durch 
+    und bereinigt die Ausgabe robust von allen bekannten Modell-Artefakten.
+    
+    Args:
+        texts (list): Liste von Texten oder Dictionaries mit einem 'text'-Schlüssel.
+        translator (ctranslate2.Translator): Der geladene CTranslate2 Translator.
+        tokenizer (spm.SentencePieceProcessor): Der geladene SentencePiece Tokenizer.
+        source_lang (str): Kürzel der Quellsprache (z.B. "en").
+        target_lang (str): Kürzel der Zielsprache (z.B. "de").
+        batch_size (int, optional): Größe der Batches. Wird automatisch berechnet, wenn None.
+        
+    Returns:
+        list[str]: Eine Liste der bereinigten, übersetzten Texte.
+    """
+    if not texts:
+        logger.warning("Leere Textliste zur Übersetzung erhalten, gebe leere Liste zurück.")
+        return []
+    
+    if batch_size is None:
+        batch_size = calculate_optimal_batch_size_rtx4050(texts, tokenizer)
+    
+    all_translations = []
+    
+    for i in tqdm(range(0, len(texts), batch_size), desc="Übersetze Batches", unit="batch"):
+        batch_items = texts[i:i + batch_size]
+        
+        # Validierte Eingabetexte vorbereiten
+        validated_source_texts = []
+        for item in batch_items:
+            if isinstance(item, dict):
+                text_content = item.get('text', '')
+            else:
+                text_content = str(item).strip()
+            
+            if not isinstance(text_content, str):
+                text_content = str(text_content)
+            
+            if not text_content.strip():
+                text_content = ""
+            
+            # Entferne ALLE bestehenden Sprachpräfixe
+            text_content = re.sub(r'^<2[a-z]{2}>\s*', '', text_content).strip()
+            
+            # KRITISCH: Erstelle korrekten MADLAD400-Input mit Zielsprache im Source
+            # MADLAD400 Format: "<2de> source_text"
+            prefixed_text = f"<2{target_lang}> {text_content}"
+            validated_source_texts.append(prefixed_text)
+
+        try:
+            # Tokenisierung
+            source_encoded = tokenizer(
+                validated_source_texts,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt"
+            )
+            
+            # Token-Konvertierung für CTranslate2
+            source_tokens = []
+            for input_ids in source_encoded["input_ids"]:
+                tokens = tokenizer.convert_ids_to_tokens(input_ids)
+                while tokens and tokens[-1] in ["</s>", "<pad>"]:
+                    tokens.pop()
+                source_tokens.append(tokens)
+            
+            results = translator.translate_batch(
+                source_tokens,
+                beam_size=5,
+                patience=2.5,
+                length_penalty=0.9,
+                repetition_penalty=1.5,
+                no_repeat_ngram_size=3,
+                max_decoding_length=1024
+            )
+
+            # Dekodierung und Bereinigung
+            batch_translations = []
+            for result in results:
+                if result.hypotheses:
+                    translation_tokens = result.hypotheses[0]
+                    translation_ids = tokenizer.convert_tokens_to_ids(translation_tokens)
+                    translation = tokenizer.decode(
+                        translation_ids, 
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=True
+                    )
+
+                    # Bereinige eventuelle Restpräfixe
+                    translation = cleanup_translation_artifacts(translation)
+                    batch_translations.append(translation)
+                else:
+                    batch_translations.append("ERROR: NO TRANSLATION")
+
+            all_translations.extend(batch_translations)
+            
+        except Exception as e:
+            logger.error(f"Fehler bei der Batch-Übersetzung: {e}", exc_info=True)
+            # Fallback auf Einzelübersetzung
+            individual_translations = []
+            for single_text in validated_source_texts:
+                try:
+                    single_result = translate_single_text_fallback(
+                        single_text, translator, tokenizer, target_lang
+                    )
+                    individual_translations.append(single_result)
+                except Exception as se:
+                    logger.error(f"Einzelübersetzung fehlgeschlagen: {se}")
+                    individual_translations.append("ERROR: INDIVIDUAL TRANSLATION FAILED")
+            
+            all_translations.extend(individual_translations)
+        
+        # GPU-Speicher freigeben
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+    return all_translations
+
+def translate_single_text_fallback(text, translator, tokenizer, target_lang):
+    """
+    Fallback-Funktion für Einzeltextübersetzung bei MADLAD400-Fehlern.
+    """
+    try:
+        source_encoded = tokenizer(
+            text,
+            padding=False,
+            truncation=True,
+            max_length=512,
+            return_tensors="pt"
+        )
+        
+        tokens = tokenizer.convert_ids_to_tokens(source_encoded["input_ids"][0])
+        while tokens and tokens[-1] in ["</s>", "<pad>"]:
+            tokens.pop()
+        
+        # Einzelübersetzung OHNE Target-Prefix
+        result = translator.translate_batch(
+            [tokens],
+            # target_prefix=None,  # Kein Target-Prefix!
+            beam_size=3,
+            patience=1.0
+        )
+        
+        if result and result[0].hypotheses:
+            translation_tokens = result[0].hypotheses[0]
+            translation_ids = tokenizer.convert_tokens_to_ids(translation_tokens)
+            translation = tokenizer.decode(translation_ids, skip_special_tokens=True)
+            return cleanup_translation_artifacts(translation)
+        else:
+            return "ERROR: NO SINGLE TRANSLATION"
+            
+    except Exception as e:
+        logger.error(f"Fallback-Übersetzung fehlgeschlagen: {e}")
+        return "ERROR: FALLBACK FAILED"
+
+def cleanup_translation_artifacts(text: str) -> str:
+    """
+    Zusätzliche Bereinigung für spezifische Übersetzungsartefakte.
+    
+    Args:
+        text: Text mit möglichen Artefakten
+        
+    Returns:
+        Bereinigter Text
+    """
+    # MADLAD400-spezifische Artefakte
+    madlad_patterns = [
+        r'^<2[a-z]{2}>\s*',              # Sprachpräfixe am Anfang
+        r'\s*<2[a-z]{2}>\s*',            # Sprachpräfixe in der Mitte
+        r'^(de|en|fr|es|it)\s*[.:]?\s*', # Sprach-Identifikatoren
+    ]
+    
+    cleaned = text
+    for pattern in madlad_patterns:
+        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+    
+    # Wiederholte Phrasen entfernen (häufig bei NMT-Fehlern)
+    words = cleaned.split()
+    if len(words) > 4:
+        # Erkenne Wiederholungen von 2-3 Wörtern
+        for window_size in [3, 2]:
+            i = 0
+            while i < len(words) - window_size:
+                phrase = words[i:i+window_size]
+                next_phrase = words[i+window_size:i+2*window_size]
+                if phrase == next_phrase:
+                    # Entferne Wiederholung
+                    words = words[:i+window_size] + words[i+2*window_size:]
+                else:
+                    i += 1
+    
+    return ' '.join(words)
+
+def translate_segments_optimized_safe(transcription_file, translation_output_file, 
+                                    cleaned_source_output_file, source_lang="en", 
+                                    target_lang="de", batch_size=None):
+    """
+    Sichere Übersetzung mit Fortschrittsspeicherung, die robust gegen Wiederaufnahme ist,
+    indem sie die korrekte schlüsselbasierte Logik verwendet.
+    """
+    # Ruft eine spezialisierte Funktion für die schlüsselbasierte Wiederaufnahme auf.
+    should_continue_translation, processed_translation_keys = handle_key_based_continuation(
+        translation_output_file, transcription_file, key_column_index=0
+    )
+    should_continue_source, processed_source_keys = handle_key_based_continuation(
+        cleaned_source_output_file, transcription_file, key_column_index=0
+    )
+    
+    if not should_continue_translation or not should_continue_source:
+        logger.info("Eine der Ausgabedateien ist vollständig und wird nicht überschrieben. Überspringe Übersetzung.")
+        return translation_output_file, cleaned_source_output_file
+
+    all_input_segments = []
+    with open(transcription_file, mode="r", encoding="utf-8") as csvfile:
+        csvreader = csv.reader(csvfile, delimiter="|")
+        next(csvreader, None)
+        for row in csvreader:
+            if len(row) >= 3:
+                start_str, end_str, text_content = row[0], row[1], row[2]
+                segment_data = {
+                    "start": parse_time(start_str), "end": parse_time(end_str), 
+                    "text": text_content, "start_str": start_str, "end_str": end_str
+                }
+                if segment_data["start"] is not None and segment_data["end"] is not None:
+                    all_input_segments.append(segment_data)
+
+    if not all_input_segments:
+        logger.error("Keine gültigen Eingabesegmente nach der Validierung gefunden.")
+        return None, None
+    
+    processed_keys = processed_translation_keys.intersection(processed_source_keys)
+    segments_to_process = [
+        seg for seg in all_input_segments if seg['start_str'] not in processed_keys
+    ]
+    
+    logger.info(f"Übersetze {len(segments_to_process)} verbleibende Segmente von insgesamt {len(all_input_segments)}.")
+
+    if not segments_to_process:
+        logger.info("Alle Segmente bereits übersetzt.")
+        return translation_output_file, cleaned_source_output_file
+
+    existing_translations = []
+    if os.path.exists(translation_output_file):
+        df_existing = pd.read_csv(translation_output_file, sep='|', dtype=str)
+        existing_translations = df_existing.to_dict('records')
+
+    existing_source = []
+    if os.path.exists(cleaned_source_output_file):
+        df_existing_source = pd.read_csv(cleaned_source_output_file, sep='|', dtype=str)
+        existing_source = df_existing_source.to_dict('records')
+
+    all_translations = existing_translations
+    all_cleaned_sources = existing_source
+
+    try:
+        translate_start_time = time.time()
+        print("\n--- [ Übersetzung Live-Ausgabe ] ---\n")
+        with gpu_context():
+            translator, tokenizer = load_madlad400_translator_optimized()
+            optimal_batch_size = batch_size or calculate_optimal_batch_size_rtx4050(
+                segments_to_process, tokenizer
+            )
+            
+            batch_iterator = range(0, len(segments_to_process), optimal_batch_size)
+            for i in tqdm(batch_iterator, desc="\n\nÜbersetze Batches"):
+                batch = segments_to_process[i:i + optimal_batch_size]
+                
+                translations = translate_batch_madlad400(
+                    batch, translator, tokenizer, source_lang, target_lang, optimal_batch_size
+                )
+                
+                new_translations_batch = []
+                new_sources_batch = []
+
+                for j, seg in enumerate(batch):
+                    translated_text = translations[j] if j < len(translations) else ""
+                    
+                    print(f"[{seg['start_str']} --> {seg['end_str']}]:\n{translated_text}")
+                    
+                    validation_segment = {"start": seg['start'], "end": seg['end'], "text": translated_text}
+                    if is_valid_segment(validation_segment, check_text_content=True):
+                        new_translations_batch.append({
+                            'startzeit': seg["start_str"], 'endzeit': seg["end_str"],
+                            'text': sanitize_for_csv_and_tts(translated_text)
+                        })
+                        new_sources_batch.append({
+                            'startzeit': seg["start_str"], 'endzeit': seg["end_str"],
+                            'text': sanitize_for_csv_and_tts(seg['text'])
+                        })
+                    else:
+                        logger.warning(f"Ungültige Übersetzung verworfen für Segment bei {seg['start_str']}")
+                
+                if new_translations_batch:
+                    all_translations.extend(new_translations_batch)
+                    all_cleaned_sources.extend(new_sources_batch)
+                    save_progress_csv(all_translations, translation_output_file, headers=['startzeit', 'endzeit', 'text'])
+                    save_progress_csv(all_cleaned_sources, cleaned_source_output_file, headers=['startzeit', 'endzeit', 'text'])
+
+        logger.info(f"Übersetzung abgeschlossen: {len(all_translations)} gültige Segmente.")
+        print("\n---------------------------------")
+        print("|<< Übersetzung abgeschlossen! >>|")
+        print("---------------------------------")
+        translate_end_time = time.time() - translate_start_time
+        logger.info(f"Transkription abgeschlossen in {translate_end_time:.2f} Sekunden")
+        print(f"Transkription abgeschlossen in {translate_end_time:.2f} Sekunden -> {(translate_end_time / 60):.2f} Minuten")
+        return translation_output_file, cleaned_source_output_file
+
+    except Exception as e:
+        logger.error(f"Fehler bei der Übersetzung: {e}", exc_info=True)
+        if 'all_translations' in locals() and all_translations: save_progress_csv(all_translations, translation_output_file, headers=['startzeit', 'endzeit', 'text'])
+        if 'all_cleaned_sources' in locals() and all_cleaned_sources: save_progress_csv(all_cleaned_sources, cleaned_source_output_file, headers=['startzeit', 'endzeit', 'text'])
+        logger.info("Notfall-Speicherung des Fortschritts durchgeführt.")
+        return None, None
+
+def is_valid_segment(segment, check_text_content=True):
+    """
+    Erweiterte Hilfsfunktion zur Segmentvalidierung mit detailliertem Logging.
+    Prüft Zeitstempel und Textinhalt und protokolliert den genauen Grund für das Verwerfen.
+
+    Args:
+        segment (dict): Ein Dictionary, das ein Segment repräsentiert. Muss 'start', 'end', 'start_str', 'end_str' und 'text' enthalten.
+        check_text_content (bool): Wenn True, wird auch der Textinhalt validiert.
+
+    Returns:
+        bool: True, wenn das Segment gültig ist, andernfalls False.
+    """
+    start = segment.get("start")
+    end = segment.get("end")
+
+    # Prüfung 1: Zeitstempel müssen gültig und in der korrekten Reihenfolge sein.
+    if start is None or end is None or end <= start:
+        logger.warning(
+            f"Ungültiges Segment verworfen: Zeitstempel-Problem. "
+            f"Start: {segment.get('start_str', 'N/A')}, Ende: {segment.get('end_str', 'N/A')}. "
+            f"Geparsed als Start={start}, Ende={end}."
+        )
+        return False
+
+    # Prüfung 2: Textinhalt muss vorhanden und sinnvoll sein.
+    if check_text_content:
+        text = segment.get("text", "").strip()
+        
+        # Verwirf Segmente, die leer sind oder nur aus sehr kurzem, generischem Text bestehen.
+        forbidden_texts = {"de", "en", "fr", "es", "dt>", "de.", "en."}
+        if not text or len(text) < 3 or text.lower() in forbidden_texts:
+            logger.warning(
+                f"Ungültiges Segment verworfen: Text-Problem. "
+                f"Start: {segment.get('start_str', 'N/A')}, Text: '{text[:50]}...'"
+            )
+            return False
+            
+    # Wenn alle Prüfungen bestanden wurden, ist das Segment gültig.
+    return True
+
+def evaluate_translation_quality(source_csv_path, translated_csv_path, report_path, summary_path, model_name, threshold):
+    """
+    Prüft die semantische Ähnlichkeit, erstellt einen detaillierten CSV-Bericht
+    UND eine separate, saubere Zusammenfassungs-Datei.
+    FINALE, KORRIGIERTE VERSION.
+    """
+    if os.path.exists(report_path) and not ask_overwrite(report_path):
+        logger.info(f"Verwende vorhandenen Qualitätsbericht: {report_path}")
+        return report_path
+
+    logger.info(f"Starte Qualitätsprüfung der Übersetzung mit Modell: {model_name}")
+    print("------------------------------------------")
+    print("|<< Starte Qualitätsprüfung Übersetzung >>|")
+    print("------------------------------------------")
+
+    try:
+        # Daten laden
+        df_source = pd.read_csv(source_csv_path, sep='|', dtype=str).fillna('')
+        df_translated = pd.read_csv(translated_csv_path, sep='|', dtype=str).fillna('')
+        
+        # Originalspaltennamen für den finalen Bericht sichern
+        original_source_columns = df_source.columns.tolist()
+
+        if len(df_source) != len(df_translated):
+            logger.warning(f"Zeilenanzahl stimmt nicht überein ({len(df_source)} vs {len(df_translated)}). Qualitätsprüfung übersprungen."); return None
+        
+        # Spaltennamen intern für die Verarbeitung normalisieren
+        df_source.columns = [col.strip().lower() for col in df_source.columns]
+        df_translated.columns = [col.strip().lower() for col in df_translated.columns]
+        
+        if 'text' not in df_source.columns or 'text' not in df_translated.columns:
+            logger.error(f"Benötigte Spalte 'text' (oder 'Text') nicht in den CSVs gefunden."); return None
+
+        # KI-basierte Prüfung
+        with gpu_context():
+            model = SentenceTransformer(model_name, device=device)
+            source_texts = df_source['text'].tolist()
+            translated_texts = df_translated['text'].tolist()
+            
+            embeddings_source = model.encode(source_texts, convert_to_tensor=True, show_progress_bar=True)
+            embeddings_translated = model.encode(translated_texts, convert_to_tensor=True, show_progress_bar=True)
+
+            # Berechne die paarweise Ähnlichkeit aller Elemente
+            pairwise_similarities = cos_sim(embeddings_source, embeddings_translated)
+            # Extrahiere NUR die Diagonale (source[i] vs. translated[i]), dies gibt einen Vektor zurück
+            similarities_vector = torch.diag(pairwise_similarities).tolist()
+
+        # Ergebnisse aufbereiten
+        results = []
+        issues_found = 0
+        for i in range(len(df_source)):
+            # Greife direkt auf das Element im Vektor zu
+            similarity = similarities_vector[i]
+            
+            flag = ""
+            if similarity < threshold:
+                status = f"Niedrig ({similarity:.3f})"
+                flag = "CHECK MANUALLY"
+                issues_found += 1
+            else:
+                status = f"OK ({similarity:.3f})"
+            
+            results.append({
+                # Verwende die originalen Spaltennamen für den Bericht
+                original_source_columns[0]: df_source.iloc[i].get(original_source_columns[0].lower(), 'N/A'),
+                original_source_columns[1]: df_source.iloc[i].get(original_source_columns[1].lower(), 'N/A'),
+                "Quelltext": df_source.iloc[i]['text'],
+                "Uebersetzung": df_translated.iloc[i]['text'],
+                "Aehnlichkeit": f"{similarity:.4f}",
+                "Status": status,
+                "Flag": flag
+            })
+
+        # Detaillierten CSV-Bericht speichern
+        df_report = pd.DataFrame(results)
+        df_report.to_csv(report_path, sep='|', index=False, encoding='utf-8')
+        logger.info(f"Detaillierter Qualitätsbericht gespeichert: {report_path}")
+
+        # Zusammenfassung in separater Datei speichern
+        avg_similarity = sum(similarities_vector) / len(similarities_vector) if similarities_vector else 0.0
+        summary_content = (
+            f"Qualitätsprüfung der Übersetzung - Zusammenfassung\n"
+            f"====================================================\n"
+            f"Datum der Prüfung: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Quell-Segmente: {len(df_source)}\n"
+            f"Gefundene Probleme (Ähnlichkeit < {threshold}): {issues_found}\n"
+            f"Durchschnittliche semantische Ähnlichkeit: {avg_similarity:.4f}\n"
+            f"====================================================\n"
+        )
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write(summary_content)
+        
+        logger.info(f"Zusammenfassender Bericht gespeichert: {summary_path}")
+        print(f"Qualitätsprüfung abgeschlossen. Bericht: {report_path}, Zusammenfassung: {summary_path}")
+        print(f"Gefundene Probleme: {issues_found}")
+        print("-------------------------------------------")
+
+        return report_path
+
+    except Exception as e:
+        logger.error(f"Fehler bei der Qualitätsprüfung der Übersetzung: {e}", exc_info=True)
+        return None
+
+def read_translated_csv(file_path):
+    """Liest die übersetzte CSV-Datei."""
+    segments = []
+    with open(file_path, mode='r', encoding='utf-8') as csvfile:
+        csv_reader = csv.reader(csvfile, delimiter='|')
+        next(csv_reader)
+        for row in csv_reader:
+            if len(row) == 3:
+                start = sum(float(x) * 60 ** i for i, x in enumerate(reversed(row[0].split(':'))))
+                end = sum(float(x) * 60 ** i for i, x in enumerate(reversed(row[1].split(':'))))
+                segments.append({
+                    "start": start,
+                    "end": end,
+                    "text": row[2]
+                })
+    return segments
+
+def convert_time_to_seconds(time_str):
+    """Konvertiert verschiedene Zeitformate in Sekunden."""
+    if not time_str:
+        return 0
+    
+    # Normalisierung des Formats (entfernt führende Nullen)
+    time_str = time_str.strip()
+    
+    parts = time_str.split(':')
+    if len(parts) == 3:  # Format: h:mm:ss
+        hours, minutes, seconds = map(float, parts)
+        return hours * 3600 + minutes * 60 + seconds
+    elif len(parts) == 2:  # Format: mm:ss
+        minutes, seconds = map(float, parts)
+        return minutes * 60 + seconds
+    else:
+        try:
+            return float(time_str)  # Falls einfach Sekunden
+        except ValueError:
+            return 0
+
+def generate_semantic_embeddings(input_csv_path, output_npz_path, output_csv_path, model_name):
+    """
+    Generiert semantische Embeddings für Textsegmente aus einer CSV-Datei
+    und speichert sie als NPZ-Datei und optional in einer neuen CSV.
+    """
+    # Vorhandene Strukturen: Datei-Existenzprüfung
+    if os.path.exists(output_npz_path):
+        if not ask_overwrite(output_npz_path):
+            logger.info(f"Verwende vorhandene NPZ-Embedding-Datei: {output_npz_path}")
+            # Prüfe auch CSV, wenn NPZ nicht überschrieben wird
+            if os.path.exists(output_csv_path):
+                if not ask_overwrite(output_csv_path):
+                    logger.info(f"Verwende vorhandene CSV-Embedding-Datei: {output_csv_path}")
+                    return output_npz_path, output_csv_path # Beide vorhanden und nicht überschreiben
+                else:
+                    # CSV überschreiben, NPZ aber nicht -> Warnung oder Abbruch? Hier: nur loggen
+                    logger.warning(f"NPZ-Datei '{output_npz_path}' wird beibehalten, aber CSV '{output_csv_path}' wird neu erstellt.")
+            # Wenn nur NPZ vorhanden war und nicht überschrieben wird
+            return output_npz_path, None # Nur NPZ-Pfad zurückgeben, da CSV neu erstellt oder nicht vorhanden
+        else:
+            # NPZ wird überschrieben, prüfe CSV separat
+            if os.path.exists(output_csv_path):
+                if not ask_overwrite(output_csv_path):
+                    logger.info(f"Behalte vorhandene CSV '{output_csv_path}', aber NPZ '{output_npz_path}' wird neu erstellt.")
+                    # Führe Generierung durch, aber speichere nur NPZ
+                    output_csv_path = None # Signalisiert, CSV nicht zu speichern
+                #else: Beide werden überschrieben (Normalfall)
+
+
+    logger.info(f"Starte Generierung semantischer Embeddings mit Modell: {model_name}")
+    print("-----------------------------------------")
+    print("|<< Starte Embedding-Generierung      >>|")
+    print("-----------------------------------------")
+
+    try:
+        # Daten laden
+        try:
+            df = pd.read_csv(input_csv_path, sep='|', dtype=str).fillna('')
+            df.columns = df.columns.str.strip().str.lower() # Normalisieren
+        except FileNotFoundError as e:
+            logger.error(f"Fehler beim Laden der CSV-Datei für Embedding-Generierung: {e}")
+            return None, None
+        except Exception as e:
+            logger.error(f"Allgemeiner Fehler beim Lesen der CSV: {e}")
+            return None, None
+
+
+        if 'text' not in df.columns:
+            logger.error(f"Benötigte Spalte 'text' nicht in {input_csv_path} gefunden.")
+            return None, None
+
+        texts = df['text'].tolist()
+        if not texts:
+            logger.warning("Keine Texte in der Eingabedatei gefunden. Embedding-Generierung übersprungen.")
+            # Leere Dateien erzeugen? Oder None zurückgeben? Hier: None
+            return None, None
+
+        # Sentence Transformer Modell laden
+        with gpu_context():
+            logger.info(f"Lade Sentence Transformer Modell: {model_name}")
+            st_model = SentenceTransformer(model_name, device=device)
+
+            # Embeddings berechnen
+            logger.info(f"Berechne Embeddings für {len(texts)} Segmente...")
+            embeddings = st_model.encode(texts, convert_to_numpy=True, show_progress_bar=True)
+
+        # Embeddings als NPZ speichern
+        logger.info(f"Speichere Embeddings in NPZ-Datei: {output_npz_path}")
+        # Speichere Metadaten zusammen mit den Embeddings
+        metadata = {
+            'model_name': model_name,
+            'source_file': input_csv_path,
+            'original_indices': df.index.to_numpy() # Um die Reihenfolge zu bewahren
+        }
+        # Erstelle ein Dictionary für np.savez
+        save_dict = {'embeddings': embeddings, **metadata}
+        # Füge optional Originaldaten hinzu (z.B. Start/Endzeiten)
+        if 'startzeit' in df.columns: save_dict['startzeit'] = df['startzeit'].to_numpy()
+        if 'endzeit' in df.columns: save_dict['endzeit'] = df['endzeit'].to_numpy()
+
+        np.savez_compressed(output_npz_path, **save_dict) # Komprimiert speichern
+        logger.info(f"NPZ-Datei gespeichert.")
+
+
+        # Optional: Embeddings zur CSV hinzufügen und speichern
+        if output_csv_path:
+            logger.info(f"Füge Embeddings zur CSV hinzu und speichere als: {output_csv_path}")
+            # Konvertiere Embeddings in eine speicherbare Form (z.B. String-Liste)
+            df['embedding'] = [str(list(emb)) for emb in embeddings]
+            try:
+                df.to_csv(output_csv_path, sep='|', index=False, encoding='utf-8')
+                logger.info(f"CSV mit Embeddings gespeichert.")
+            except Exception as e:
+                logger.error(f"Fehler beim Speichern der CSV mit Embeddings: {e}")
+                output_csv_path = None # Signalisiert, dass CSV-Speichern fehlschlug
+
+        print("-----------------------------------------")
+        print("|<< Embedding-Generierung abgeschlossen >>|")
+        print("-----------------------------------------")
+
+        return output_npz_path, output_csv_path # Gibt Pfade zurück
+
+    except Exception as e:
+        logger.error(f"Fehler bei der Embedding-Generierung: {e}", exc_info=True)
+        traceback.print_exc()
+        return None, None # Gibt None zurück im Fehlerfall
+    finally:
+        # Speicher freigeben
+        if 'st_model' in locals():
+            del st_model
+        torch.cuda.empty_cache()
+        logger.info("Sentence Transformer Ressourcen freigegeben.")
+
+# Lade das englische und deutsche Transformer-Modell einmal global
+def load_spacy_model(model_name):
+    """Lädt ein spaCy-Modell sicher."""
+    try:
+        return spacy.load(model_name)
+    except OSError:
+        logger.critical(f"spaCy-Modell '{model_name}' nicht gefunden. Bitte mit 'python -m spacy download {model_name}' installieren.")
+        sys.exit(1)
+
+_SPACY_MODELS_CACHE = {}
+
+def get_spacy_model(model_name: str):
+    """
+    Lädt ein spaCy-Modell nur beim ersten Aufruf und speichert es im Cache.
+    Dies verhindert, dass jeder neue Prozess das Modell erneut laden muss.
+    """
+    if model_name not in _SPACY_MODELS_CACHE:
+        logger.info(f"Lade spaCy-Modell '{model_name}' zum ersten Mal...")
+        try:
+            # spacy.require_gpu() sollte idealerweise vor dem Laden aufgerufen werden.
+            # Da wir es global bereits tun, ist es hier sicher.
+            _SPACY_MODELS_CACHE[model_name] = spacy.load(model_name)
+            logger.info(f"Modell '{model_name}' erfolgreich geladen und im Cache gespeichert.")
+        except OSError:
+            logger.critical(f"spaCy-Modell '{model_name}' nicht gefunden. Bitte mit 'python -m spacy download {model_name}' installieren.")
+            sys.exit(1)
+    return _SPACY_MODELS_CACHE[model_name]
+
+# Erweiterte Entity-Labels für umfassende NEE
+TARGET_ENTITY_LABELS: Set[str] = {
+    "PER", "PERSON", # Personen
+    "ORG",           # Organisationen  
+    "WORK_OF_ART",   # Kunstwerke, Shows, Filme
+    "EVENT",         # Events, Veranstaltungen
+    "PRODUCT",       # Produkte, Marken
+    "LAW",           # Gesetze, Regelwerke
+    "GPE",           # Geopolitische Entitäten
+    "FACILITY",      # Gebäude, Orte
+    "LANGUAGE",      # Sprachen
+    "NORP"           # Nationalitäten, religiöse/politische Gruppen
+}
+
+# Zusätzliche Patterns für Social Media Handles und spezielle Namen
+SOCIAL_MEDIA_PATTERNS = [
+    r'\b[A-Za-z0-9_]+K\d+\b',           # KittyK38, UserK123
+#    r'\b@[A-Za-z0-9_]+\b',              # @username
+#    r'\b#[A-Za-z0-9_]+\b',              # #hashtag
+    r'\b[A-Za-z]+\d{1,3}\b',            # Name mit Zahlen
+#    r'\b[A-Z][a-z]*[A-Z][a-z]*\d*\b'   # CamelCase mit optionalen Zahlen
+]
+
+def refine_text_batch(batch: Dict[str, List], nlp_model, lt_tool, punctuation_model) -> Dict[str, List[str]]:
+    """
+    Diese Funktion wird mit `dataset.map` auf einen Batch von Daten angewendet.
+    Sie führt die komplette Veredelungs-Logik GPU-effizient aus.
+
+    Args:
+        batch (Dict[str, List]): Ein Batch von Daten, wie von `datasets.map` übergeben.
+        nlp_model: Das geladene spaCy-Modell.
+        lt_tool: Die initialisierte LanguageTool-Instanz.
+        punctuation_model: Die initialisierte PunctuationModel-Instanz.
+
+    Returns:
+        Dict[str, List[str]]: Ein Dictionary mit der neuen Spalte 'refined_text'.
+    """
+    original_texts = batch['text']
+    
+    # --- GPU-beschleunigte Batch-Schritte ---
+    # 1. Interpunktion für den gesamten Batch wiederherstellen
+    punctuated_texts = punctuation_model.restore_punctuation(original_texts)
+    
+    # 2. Entitäten für den gesamten Batch mit nlp.pipe erkennen
+    # Dies ist um Größenordnungen schneller als einzelne Aufrufe.
+    docs = list(nlp_model.pipe(punctuated_texts))
+    
+    refined_texts = []
+    
+    # --- CPU-gebundene Schritte (einzeln pro Eintrag im Batch) ---
+    for i in range(len(original_texts)):
+        doc = docs[i]
+        text_to_process = doc.text
+
+        # 2a. Entitäten schützen
+        protected_text, entity_map = entity_protection(text_to_process, doc=doc) # Verwende den bereits prozessierten doc
+        
+        # 3. Grammatik korrigieren
+        corrected_text = lt_tool.correct(protected_text)
+        
+        # 4. Entitäten wiederherstellen
+        restored_text = restore_entities(corrected_text, entity_map)
+        
+        refined_texts.append(restored_text.strip())
+
+    return {"refined_text": refined_texts}
+
+def entity_protection(text: str, nlp_model) -> Tuple[str, Dict[str, EntityInfo]]:
+    """
+    Erkennt und schützt Entitäten (Eigennamen, Orte etc.) in einem Text.
+    Ersetzt sie durch Platzhalter, um sie vor nachfolgenden Verarbeitungsschritten zu schützen.
+
+    Args:
+        text (str): Der zu verarbeitende Text.
+        nlp_model: Das geladene spaCy-Sprachmodell.
+
+    Returns:
+        Tuple[str, Dict[str, EntityInfo]]: Ein Tupel mit dem geschützten Text und einem Mapping
+        von Platzhaltern zu den ursprünglichen Entitätsinformationen.
+    """
+    if not text or not text.strip():
+        return text, {}
+
+    doc = nlp_model(text)
+    entities_found: List[Span] = list(doc.ents)
+    entity_mapping: Dict[str, EntityInfo] = {}
+
+    # Entitäten nach ihrer Startposition sortieren (rückwärts), um Ersetzungsfehler zu vermeiden.
+    entities_found.sort(key=lambda x: x.start_char, reverse=True)
+
+    protected_text = text
+    for i, ent in enumerate(entities_found):
+        # Nur relevante Entitätstypen schützen (erweiterbar in config.py)
+        if ent.label_ in TARGET_ENTITY_LABELS:
+            placeholder = f"__ENTITY_{ent.label_}_{i}__"
+            # Ersetze die Entität im Text durch den Platzhalter.
+            protected_text = protected_text[:ent.start_char] + placeholder + protected_text[ent.end_char:]
+            entity_mapping[placeholder] = EntityInfo(
+                text=ent.text, label=ent.label_, start=ent.start_char, end=ent.end_char, language=nlp_model.lang
+            )
+    return protected_text, entity_mapping
+
+def restore_entities(text: str, entity_mapping: Dict[str, EntityInfo]) -> str:
+    """
+    Setzt die geschützten Entitäten aus dem Mapping wieder in den Text ein.
+
+    Args:
+        text (str): Der Text mit Platzhaltern.
+        entity_mapping (Dict[str, EntityInfo]): Das Mapping von Platzhaltern zu Entitäten.
+
+    Returns:
+        str: Der Text mit wiederhergestellten Entitäten.
+    """
+    restored_text = text
+    for placeholder, entity_info in entity_mapping.items():
+        # Ersetze jeden Platzhalter durch den ursprünglichen Text der Entität.
+        restored_text = restored_text.replace(placeholder, entity_info.text)
+    return restored_text
+
+def ensure_context_closure(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Analysiert Segmente und fügt Kontext vom vorherigen Segment hinzu, wenn ein
+    Segment logisch unvollständig erscheint (z.B. mit Kleinbuchstaben beginnt).
+
+    Args:
+        df (pd.DataFrame): DataFrame mit den zu prüfenden Segmenten.
+
+    Returns:
+        pd.DataFrame: DataFrame mit kontextuell vervollständigten Segmenten.
+    """
+    new_rows = []
+    for i, row in df.iterrows():
+        current_text = row['text'].strip()
+        # Ein Segment ist "fragil", wenn es mit einem Kleinbuchstaben oder einer Konjunktion beginnt.
+        is_fragile = current_text and (current_text[0].islower() or re.match(r'^(und|aber|oder|doch)\b', current_text, re.I))
+
+        if i > 0 and is_fragile:
+            # Hole den Text des vorherigen Segments als Kontext.
+            prev_text = new_rows[-1]['text'].strip()
+            # Kombiniere Kontext und aktuellen Text.
+            combined_text = f"{prev_text} {current_text}"
+            # Aktualisiere den Text der *letzten* Zeile in der neuen Liste.
+            new_rows[-1]['text'] = combined_text
+            # Erweitere die Endzeit des vorherigen Segments auf die des aktuellen.
+            new_rows[-1]['endzeit'] = row['endzeit']
+        else:
+            # Wenn das Segment nicht fragil ist, füge es einfach hinzu.
+            new_rows.append(row.to_dict())
+
+    return pd.DataFrame(new_rows)
+
+def refine_text_pipeline(input_file: str, output_file: str, spacy_model_name: str, lang_code: str, lt_path: str):
+    """
+    Zentrale Pipeline zur Veredelung von Texten.
+    Führt Entity-Schutz, Interpunktion, Grammatikkorrektur und kontextuelle Bereinigung durch.
+    """
+    if os.path.exists(output_file):
+        if not ask_overwrite(output_file):
+            logger.info(f"Verwende vorhandene veredelte Datei: {output_file}")
+            return output_file
+
+    logger.info(f"Starte Text-Veredelungs-Pipeline für {lang_code} auf Datei: {input_file}")
+    print(f"\n--- Starte Text-Veredelung ({lang_code}) ---")
+    
+    nlp_model = get_spacy_model(spacy_model_name)
+    
+    df = pd.read_csv(input_file, sep='|', dtype=str).fillna('')
+
+    # Modelle initialisieren
+    punctuation_model = PunctuationModel()
+    lt_tool = language_tool_python.LanguageTool(lang_code, remote_server=f'http://localhost:{LT_PORT}')
+
+    processed_rows = []
+    for i, row in tqdm(df.iterrows(), total=len(df), desc=f"Veredele {lang_code}-Text"):
+        original_text = row['text']
+
+        # 1. Interpunktion wiederherstellen
+        punctuated_text = punctuation_model.restore_punctuation(original_text)
+        
+        # 2. Entitäten schützen
+        protected_text, entity_map = entity_protection(punctuated_text, nlp_model)
+        
+        # 3. Grammatik korrigieren (auf dem Text mit Platzhaltern)
+        corrected_text = lt_tool.correct(protected_text)
+        
+        # 4. Entitäten wiederherstellen
+        restored_text = restore_entities(corrected_text, entity_map)
+        
+        row['text'] = restored_text.strip()
+        processed_rows.append(row)
+        
+    lt_tool.close()
+
+    if not processed_rows:
+        logger.warning("Keine Zeilen nach der Verarbeitung übrig.")
+        return None
+
+    # 5. Kontextuellen Abschluss und Satz-Zusammenhänge prüfen
+    final_df = pd.DataFrame(processed_rows)
+    final_df = ensure_context_closure(final_df)
+
+    # 6. Finale Bereinigung und Speichern
+    final_df['text'] = final_df['text'].apply(lambda x: re.sub(r'<.*?>', ' ', x).strip()) # HTML-Tags entfernen
+    final_df.to_csv(output_file, sep='|', index=False, encoding='utf-8')
+    
+    logger.info(f"Text-Veredelung abgeschlossen. Ergebnis in: {output_file}")
+    print(f"--- Veredelung ({lang_code}) abgeschlossen ---")
+    
+    return output_file
+
+def restore_entities_intelligently(
+    text: str,
+    entity_mapping: Dict[str, EntityInfo],
+    target_language: str = "de"
+) -> str:
+    """
+    Intelligente Entity-Wiederherstellung basierend auf Zielsprache und Entity-Typ.
+    
+    Args:
+        text: Text mit Platzhaltern
+        entity_mapping: Mapping von Platzhaltern zu EntityInfo
+        target_language: Zielsprache für Übersetzungslogik
+        
+    Returns:
+        Text mit wiederhergestellten Entities
+    """
+    if not entity_mapping:
+        return text
+    
+    restored_text = text
+    
+    for placeholder, entity_info in entity_mapping.items():
+        if placeholder in restored_text:
+            # Entscheidung basierend auf Entity-Typ und Zielsprache
+            replacement = _get_entity_replacement(entity_info, target_language)
+            restored_text = restored_text.replace(placeholder, replacement)
+    
+    return restored_text
+
+def _get_entity_replacement(entity_info: EntityInfo, target_language: str) -> str:
+    """
+    Bestimmt die korrekte Ersetzung für ein Entity.
+    
+    Args:
+        entity_info: Entity-Information
+        target_language: Zielsprache
+        
+    Returns:
+        Korrekte Entity-Ersetzung
+    """
+    # Eigennamen: Immer Original beibehalten
+    if entity_info.label in {"PERSON", "PER", "ORG", "ORGANIZATION"}:
+        return entity_info.text
+    
+    # Social Media: Original beibehalten
+    if entity_info.label == "CUSTOM":
+        return entity_info.text
+    
+    # Kunstwerke: Je nach Kontext
+    if entity_info.label == "WORK_OF_ART":
+        # Bekannte Titel können übersetzt werden, aber sicher ist Original
+        return entity_info.text
+    
+    # Geopolitische Entitäten: Original (Berlin bleibt Berlin)
+    if entity_info.label in {"GPE", "FACILITY"}:
+        return entity_info.text
+    
+    # Fallback: Original beibehalten
+    return entity_info.text
+
+def validate_entity_restoration(
+    original_text: str,
+    restored_text: str,
+    entity_mapping: Dict[str, EntityInfo]
+) -> List[str]:
+    """
+    Validiert die Entity-Wiederherstellung und gibt Warnungen zurück.
+    
+    Args:
+        original_text: Ursprünglicher Text
+        restored_text: Wiederhergestellter Text
+        entity_mapping: Entity-Mapping
+        
+    Returns:
+        Liste von Validierungsfehlern
+    """
+    issues = []
+    
+    for placeholder, entity_info in entity_mapping.items():
+        original_entity = entity_info.text
+        
+        # Prüfe ob Entity im wiederhergestellten Text vorhanden
+        if original_entity not in restored_text:
+            if placeholder in restored_text:
+                issues.append(
+                    f"Entity '{original_entity}' nicht wiederhergestellt "
+                    f"(Platzhalter: {placeholder})"
+                )
+        
+        # Prüfe auf Fragmentierung bei Multi-Word Entities
+        if len(original_entity.split()) > 1:
+            parts = original_entity.split()
+            if any(part in restored_text for part in parts):
+                if original_entity not in restored_text:
+                    issues.append(
+                        f"Entity '{original_entity}' möglicherweise fragmentiert"
+                    )
+    
+    return issues
+
+def format_for_tts_splitting(input_file, output_file, char_limit):
+    """Teilt die final veredelten Segmente nur noch nach Zeichenlimit auf."""
+    if os.path.exists(output_file) and not ask_overwrite(output_file):
+        return output_file
+        
+    df = pd.read_csv(input_file, sep='|', dtype=str).fillna('')
+    final_segments = []
+    
+    for _, row in df.iterrows():
+        text = row['text']
+        start_sec, end_sec = parse_time(row['startzeit']), parse_time(row['endzeit'])
+        
+        chunks = split_text_robust_improved(text, char_limit)
+        
+        if len(chunks) == 1:
+            final_segments.append(row.to_dict())
+        else:
+            total_duration = end_sec - start_sec
+            total_chars = sum(len(c) for c in chunks)
+            current_start = start_sec
+            for i, chunk in enumerate(chunks):
+                proportion = len(chunk) / total_chars if total_chars > 0 else 1/len(chunks)
+                chunk_duration = total_duration * proportion
+                chunk_end = current_start + chunk_duration if i < len(chunks) - 1 else end_sec
+                final_segments.append({
+                    'startzeit': format_time(current_start),
+                    'endzeit': format_time(chunk_end),
+                    'text': chunk
+                })
+                current_start = chunk_end
+                
+    pd.DataFrame(final_segments).to_csv(output_file, sep='|', index=False)
+    return output_file
+
+def initialize_language_tool(lang: str, lt_path: str):
+    """Initialisiert LanguageTool mit lokalem Server"""
+    lt_jar_path = os.path.join(lt_path, "languagetool-server.jar")
+    if not os.path.exists(lt_jar_path):
+        raise FileNotFoundError(f"LanguageTool nicht gefunden: {lt_jar_path}")
+    
+    port = 8010
+    lt_process = subprocess.Popen([
+        "java", "-Xmx4g", "-cp", lt_jar_path,
+        "org.languagetool.server.HTTPServer",
+        "--port", str(port), "--allow-origin", "*"
+    ], cwd=lt_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    time.sleep(15)  # Server-Start abwarten
+    
+    os.environ["LANGUAGE_TOOL_HOST"] = "localhost"
+    os.environ["LANGUAGE_TOOL_PORT"] = str(port)
+    
+    return language_tool_python.LanguageTool(lang)
+
+def create_atempo_filter_string(speed_factor):
+    """
+    Erstellt eine robuste FFmpeg-Filterkette für die Geschwindigkeitsanpassung.
+    Berücksichtigt den gültigen Bereich von atempo [0.5, 100.0] und verkettet 
+    Filter für Werte außerhalb des Standardbereichs [0.5, 2.0].
+
+    Args:
+        speed_factor (float): Gewünschter Geschwindigkeitsfaktor.
+
+    Returns:
+        str: FFmpeg-Filterkette für atempo.
+    """
+    # Den Faktor auf den von FFmpeg unterstützten Gesamtbereich begrenzen
+    speed_factor = max(0.5, min(speed_factor, 100.0))
+    
+    # Wenn der Faktor bereits im optimalen Einzel-Filter-Bereich liegt
+    if 0.5 <= speed_factor <= 2.0:
+        return f"atempo={speed_factor}"
+    
+    atempo_chain = []
+    
+    # Für extreme Beschleunigung (Faktor > 2.0)
+    if speed_factor > 2.0:
+        remaining_factor = speed_factor
+        while remaining_factor > 2.0:
+            atempo_chain.append("atempo=2.0")
+            remaining_factor /= 2.0
+        # Den verbleibenden Restfaktor hinzufügen
+        if remaining_factor > 0.5: # Sicherstellen, dass der Restfaktor gültig ist
+            atempo_chain.append(f"atempo={remaining_factor}")
+            
+    # Für extreme Verlangsamung (Faktor < 0.5)
+    # Diese Logik ist theoretisch, da wir den Faktor bereits auf 0.5 begrenzen,
+    # aber für die Vollständigkeit hier belassen.
+    elif speed_factor < 0.5:
+        atempo_chain.append("atempo=0.5") # Direkt auf das Minimum setzen
+
+    return ",".join(atempo_chain)
+
+def load_existing_progress():
+    """
+    HILFSFUNKTION: Lädt bereits verarbeitete Segmente.
+    """
+    processed = {}
+    if os.path.exists(TTS_PROGRESS_MANIFEST):
+        try:
+            with open(TTS_PROGRESS_MANIFEST, "r", encoding="utf-8") as csvf:
+                reader = csv.reader(csvf, delimiter="|")
+                next(reader, None)  # Header überspringen
+                for row in reader:
+                    if len(row) >= 5:
+                        processed[int(row[4])] = row[3]
+        except Exception as e:
+            logger.warning(f"Fehler beim Laden des Fortschritts: {e}")
+    return processed
+
+def load_segments_from_file(translation_file):
+    """
+    HILFSFUNKTION: Lädt Segmente aus CSV-Datei.
+    """
+    segments = []
+    try:
+        with open(translation_file, "r", encoding="utf-8", errors="replace") as f:
+            reader = csv.reader(f, delimiter="|")
+            next(reader)  # Header überspringen
+            for i, row in enumerate(reader):
+                if len(row) >= 3:
+                    segments.append({
+                        "id": i,
+                        "start": row[0],
+                        "end": row[1],
+                        "text": row[2].strip()
+                    })
+    except Exception as e:
+        logger.error(f"Fehler beim Laden der Segmente: {e}")
+    return segments
+
+def filter_new_segments(segments, processed):
+    """
+    HILFSFUNKTION: Filtert neue, nicht verarbeitete Segmente.
+    """
+    todo = []
+    for seg in segments:
+        is_valid, reason = validate_text_for_tts_robust(seg["text"])
+        if not is_valid:
+            logger.warning(f"Segment {seg['id']} übersprungen: {reason}")
+        elif seg["id"] not in processed:
+            todo.append(seg)
+    return todo
+
+def log_progress(segment_info, chunk_path):
+    """
+    HILFSFUNKTION: Protokolliert Fortschritt in Manifest-Datei.
+    """
+    try:
+        with open(TTS_PROGRESS_MANIFEST, mode='a', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f, delimiter='|')
+            
+            # Header schreiben falls Datei neu ist
+            if os.path.getsize(TTS_PROGRESS_MANIFEST) == 0:
+                writer.writerow(['startzeit', 'endzeit', 'text', 'chunk_path', 'original_id'])
+            
+            writer.writerow([
+                segment_info['start'], 
+                segment_info['end'], 
+                segment_info['text'], 
+                chunk_path, 
+                segment_info['id']
+            ])
+    except Exception as e:
+        logger.error(f"Fehler beim Protokollieren des Fortschritts: {e}")
+
+def assemble_final_audio_optimized(output_path: str):
+    """
+    OPTIMIERTE VERSION: Verbesserte Audio-Assemblierung mit Qualitätsprüfungen.
+    
+    Änderungen:
+    - Bessere Crossfade-Übergänge
+    - Konsistente Lautstärke-Normalisierung  
+    - Erweiterte Fehlerbehandlung
+    """
+    # Manifest einlesen
+    manifest = []
+    with open(TTS_PROGRESS_MANIFEST, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f, delimiter='|')
+        next(reader)  # Header überspringen
+        for row in reader:
+            if len(row) >= 4 and os.path.exists(row[3]):
+                manifest.append(row)
+    
+    if not manifest:
+        raise RuntimeError("Keine Audio-Chunks zum Assemblieren gefunden")
+    
+    # Nach Startzeit sortieren
+    manifest.sort(key=lambda x: parse_time(x[0]))
+    
+    # Audio-Parameter
+    sampling_rate = 24000
+    last_segment = manifest[-1]
+    max_length_seconds = parse_time(last_segment[1])
+    
+    # Buffer für finales Audio mit Puffer
+    max_audio_length = int(max_length_seconds * sampling_rate) + (2 * sampling_rate)
+    final_audio = np.zeros(max_audio_length, dtype=np.float32)
+    
+    # OPTIMIERUNG: Crossfade-Parameter für weichere Übergänge
+    crossfade_samples = int(0.05 * sampling_rate)  # 50ms Crossfade
+    
+    current_position = 0
+    previous_audio_end = 0
+    
+    for i, segment_data in enumerate(tqdm(manifest, desc="Assembliere Audio-Chunks")):
+        start_sec = parse_time(segment_data[0])
+        chunk_path = segment_data[3]
+        
+        # Audio-Chunk laden
+        try:
+            audio_clip, loaded_sr = sf.read(chunk_path, dtype='float32')
+            if loaded_sr != sampling_rate:
+                logger.warning(f"Sample-Rate-Mismatch: {loaded_sr} vs {sampling_rate}")
+                # Resampling falls nötig (einfache Implementierung)
+                audio_clip = audio_clip[::int(loaded_sr/sampling_rate)]
+        except Exception as e:
+            logger.error(f"Fehler beim Laden von {chunk_path}: {e}")
+            continue
+        
+        start_pos = int(start_sec * sampling_rate)
+        
+        # OPTIMIERUNG: Überlappungsbehandlung mit Crossfade
+        if start_pos < previous_audio_end and i > 0:
+            # Überlappung erkannt - verwende Crossfade
+            overlap_start = max(start_pos, previous_audio_end - crossfade_samples)
+            overlap_end = min(previous_audio_end, start_pos + len(audio_clip))
+            
+            if overlap_end > overlap_start:
+                # Crossfade zwischen vorherigem und aktuellem Audio
+                fade_length = overlap_end - overlap_start
+                fade_out = np.linspace(1.0, 0.0, fade_length)
+                fade_in = np.linspace(0.0, 1.0, fade_length)
+                
+                # Anwenden des Crossfades
+                old_segment = final_audio[overlap_start:overlap_end]
+                new_segment_start = overlap_start - start_pos
+                new_segment_end = new_segment_start + fade_length
+                
+                if new_segment_end <= len(audio_clip):
+                    mixed_segment = (old_segment * fade_out + 
+                                   audio_clip[new_segment_start:new_segment_end] * fade_in)
+                    final_audio[overlap_start:overlap_end] = mixed_segment
+                    
+                    # Rest des neuen Audio-Clips hinzufügen
+                    remaining_start = overlap_end
+                    remaining_clip_start = new_segment_end
+                    remaining_length = len(audio_clip) - remaining_clip_start
+                    
+                    if remaining_length > 0:
+                        end_pos = remaining_start + remaining_length
+                        if end_pos > len(final_audio):
+                            final_audio = np.pad(final_audio, (0, end_pos - len(final_audio)))
+                        final_audio[remaining_start:end_pos] = audio_clip[remaining_clip_start:]
+                        current_position = end_pos
+                else:
+                    # Fallback: Einfaches Überschreiben
+                    start_pos = previous_audio_end
+            else:
+                start_pos = previous_audio_end
+        
+        # Standard-Fall: Kein Overlap
+        if start_pos >= previous_audio_end:
+            end_pos = start_pos + len(audio_clip)
+            
+            # Buffer erweitern falls nötig
+            if end_pos > len(final_audio):
+                final_audio = np.pad(final_audio, (0, end_pos - len(final_audio)))
+            
+            # Audio einfügen
+            final_audio[start_pos:end_pos] = audio_clip
+            current_position = end_pos
+        
+        previous_audio_end = current_position
+    
+    # OPTIMIERUNG: Finale Audio-Verarbeitung
+    final_audio = final_audio[:current_position]
+    
+    if final_audio.size > 0:
+        # RMS-basierte Normalisierung für konsistente Lautstärke
+        rms = np.sqrt(np.mean(final_audio**2))
+        if rms > 0:
+            target_rms = 0.15  # Ziel-RMS für angemessene Lautstärke
+            final_audio = final_audio * (target_rms / rms)
+        
+        # Peak-Limiting zur Vermeidung von Clipping
+        peak = np.max(np.abs(final_audio))
+        if peak > 0.95:
+            final_audio = final_audio * (0.95 / peak)
+        
+        # OPTIMIERUNG: Sanfte Ein-/Ausblendung
+        fade_samples = int(0.1 * sampling_rate)  # 100ms Fade
+        if len(final_audio) > 2 * fade_samples:
+            # Einblendung
+            final_audio[:fade_samples] *= np.linspace(0, 1, fade_samples)
+            # Ausblendung
+            final_audio[-fade_samples:] *= np.linspace(1, 0, fade_samples)
+    else:
+        logger.warning("Kein Audio generiert, erstelle Stille.")
+        final_audio = np.zeros((int(0.1 * sampling_rate),), dtype=np.float32)
+    
+    # Speichern mit optimaler Qualität
+    sf.write(output_path, final_audio.astype(np.float32), sampling_rate)
+    logger.info(f"Optimiertes Audio assembliert: {len(final_audio)/sampling_rate:.2f}s")
+
+def transfer_conditioning_to_device(gpt_cond_latent, speaker_embedding, target_device):
+    """
+    SPEZIALISIERTE FUNKTION: Sichere Übertragung von Conditioning-Tensoren.
+    """
+    print(f"🔄 Übertrage Conditioning-Tensoren auf {target_device}")
+    
+    # GPT Conditioning übertragen
+    if gpt_cond_latent is not None:
+        original_device = gpt_cond_latent.device
+        gpt_cond_latent = gpt_cond_latent.to(target_device)
+        print(f"✅ GPT Conditioning: {original_device} → {gpt_cond_latent.device}")
+    
+    # Speaker Embedding übertragen
+    if speaker_embedding is not None:
+        original_device = speaker_embedding.device
+        speaker_embedding = speaker_embedding.to(target_device)
+        print(f"✅ Speaker Embedding: {original_device} → {speaker_embedding.device}")
+    
+    return gpt_cond_latent, speaker_embedding
+
+@contextmanager
+def synchronized_cuda_stream(stream, wait_for_streams=None):
+    """
+    ERWEITERTE VERSION: Context Manager mit automatischer Synchronisation.
+    
+    Args:
+        stream: Zu verwendender Stream
+        wait_for_streams: Liste von Streams auf die gewartet werden soll
+    """
+    if not torch.cuda.is_available():
+        yield
+        return
+    
+    # Vor Stream-Wechsel: Synchronisation mit anderen Streams
+    if wait_for_streams:
+        for wait_stream in wait_for_streams:
+            if wait_stream != stream:
+                stream.wait_stream(wait_stream)
+    
+    # Stream-Context ausführen
+    with torch.cuda.stream(stream):
+        yield
+
+def safe_tts_inference_with_device_handling(
+    model, 
+    text, 
+    gpt_cond_latent, 
+    speaker_embedding, 
+    **kwargs
+):
+    """
+    SICHERE TTS-INFERENZ: Mit umfassender Device-Behandlung.
+    """
+    try:
+        # Inferenz mit Device-Monitoring
+        with torch.inference_mode():
+            result = model.inference(
+                text=text,
+                language="de",
+                gpt_cond_latent=gpt_cond_latent,
+                speaker_embedding=speaker_embedding,
+                **kwargs
+            )
+        
+        return result
+        
+    except RuntimeError as e:
+        if "same device" in str(e).lower():
+            logger.error(f"Device-Mismatch während Inferenz: {e}")
+            
+            # Automatische Korrektur versuchen
+            model_device = next(model.parameters()).device
+            logger.info(f"Versuche automatische Korrektur auf {model_device}")
+            
+            corrected_gpt = gpt_cond_latent.to(model_device) if gpt_cond_latent is not None else None
+            corrected_speaker = speaker_embedding.to(model_device) if speaker_embedding is not None else None
+            
+            # Retry mit korrigierten Tensoren
+            with torch.inference_mode():
+                result = model.inference(
+                    text=text,
+                    language="de",
+                    gpt_cond_latent=corrected_gpt,
+                    speaker_embedding=corrected_speaker,
+                    **kwargs
+                )
+            
+            logger.info("✅ Automatische Device-Korrektur erfolgreich")
+            return result
+        else:
+            raise
+    
+    except Exception as e:
+        logger.error(f"Unerwarteter Fehler bei TTS-Inferenz: {e}")
+        raise
+
+# Synthetisieren
+def text_to_speech_with_voice_cloning(
+    translation_file,
+    sample_path_1,
+    sample_path_2,
+    sample_path_3,
+    #sample_path_4,
+    #sample_path_5,
+    output_path,
+    batch_size=32
+):
+    """
+    Optimiert Text-to-Speech mit Voice Cloning und verschiedenen Beschleunigungen.
+
+    Args:
+        translation_file: Pfad zur CSV-Datei mit übersetzten Texten.
+        sample_path_1, sample_path_2: Pfade zu Sprachbeispielen für die Stimmenklonung.
+        output_path: Ausgabepfad für die generierte Audiodatei.
+        batch_size: Größe des Batches für parallele Verarbeitung.
+    """
+
+    # Segmente laden
+    processed = load_existing_progress()
+    all_segments = load_segments_from_file(translation_file)
+    segments_to_process  = filter_new_segments(all_segments, processed)
+    
+    if not segments_to_process:
+        logger.info("Alle TTS-Segmente bereits verarbeitet. Überspringe.")
+        # Optional: Audio-Assemblierung trotzdem durchführen, falls sie zuvor fehlschlug
+        if not os.path.exists(output_path):
+            assemble_final_audio_optimized(output_path)
+        return
+    
+    # Eingabe-Segmente einlesen
+    with open(translation_file, "r", encoding="utf-8", errors="replace") as f:
+        reader = csv.reader(f, delimiter="|")
+        next(reader)
+        segments = [{"id": i, "start": r[0], "end": r[1], "text": r[2].strip()}
+                    for i, r in enumerate(reader) if len(r) >= 3]
+    
+    # VALIDIERE & FILTERE mit neuer robuster Funktion
+    todo = []
+    for seg in segments:
+        is_valid, reason = validate_text_for_tts_robust(seg["text"])
+        if not is_valid:
+            logger.warning(f"Segment {seg['id']} übersprungen: {reason}")
+        elif seg["id"] not in processed:
+            todo.append(seg)
+    
+    if not todo:
+        logger.info("Keine neuen Segmente zu synthetisieren.")
+        return
+    else:
+        logger.info(f"{len(todo)} Segmente werden neu synthetisiert …")
+    
+    if os.path.exists(output_path):
+        if not ask_overwrite(output_path):
+            logger.info(f"TTS-Audio bereits vorhanden: {output_path}")
+            return
+        else:
+            # Bereinige alte Artefakte für einen sauberen Neustart
+            if os.path.exists(TTS_TEMP_CHUNKS_DIR): shutil.rmtree(TTS_TEMP_CHUNKS_DIR)
+            if os.path.exists(TTS_PROGRESS_MANIFEST): os.remove(TTS_PROGRESS_MANIFEST)
+    
+    os.makedirs(TTS_TEMP_CHUNKS_DIR, exist_ok=True)
+    
+    with gpu_context():
+        try:
+            print("------------------")
+            print("|<< Starte TTS >>|")
+            print("------------------")
+            tts_start_time = time.time()
+            
+            target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            logger.info(f"TTS wird auf Gerät ausgeführt: {target_device}")
+
+            # Modell laden und auf das Zielgerät verschieben
+            xtts_model = load_xtts_v2()
+            xtts_model.to(target_device)
+            xtts_model.eval()
+        
+            print(f"✅ Modell auf {next(xtts_model.parameters()).device} geladen")
+        
+            # Conditioning-Latents direkt auf dem Zielgerät erstellen
+            sample_paths = [sample_path_1, sample_path_2, sample_path_3]
+            gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(
+                audio_path=sample_paths, load_sr=22050
+            )
+            gpt_cond_latent = gpt_cond_latent.to(target_device)
+            speaker_embedding = speaker_embedding.to(target_device)
+            
+            logger.info("TTS-Modell und Conditioning-Latents erfolgreich geladen.")
+
+            print("🚀 DeepSpeed-Initialisierung...")
+            ds_engine = deepspeed.init_inference(
+                model=xtts_model,
+                tensor_parallel={"tp_size": 1},
+                dtype=torch.float32,
+                replace_with_kernel_inject=False
+            )
+            optimized_tts_model = ds_engine.module
+            logger.info("✅ DeepSpeed erfolgreich initialisiert")
+
+            # PHASE 5: TTS-Synthese mit Device-Validation
+            for segment_info in tqdm(todo, desc="TTS-Synthese mit Device-Validation"):
+            # KRITISCH: Vor jeder Inferenz Device-Zustand validieren
+                model_device = next(optimized_tts_model.parameters()).device
+            
+            # Conditioning-Tensoren auf korrektes Device sicherstellen
+            gpt_cond_latent = ensure_tensor_on_device(gpt_cond_latent, model_device)
+            speaker_embedding = ensure_tensor_on_device(speaker_embedding, model_device)
+            
+            # TTS-Inferenz mit expliziter Device-Prüfung
+            with torch.inference_mode():
+                # Letzter Device-Check vor Inferenz
+                if (gpt_cond_latent.device != model_device or 
+                    speaker_embedding.device != model_device):
+                    raise RuntimeError(f"Device-Mismatch vor Inferenz: "
+                                    f"Modell={model_device}, "
+                                    f"GPT={gpt_cond_latent.device}, "
+                                    f"Speaker={speaker_embedding.device}")
+
+            # Der innere `StreamManager` kümmert sich um die Inferenz-Operationen.
+            with StreamManager() as stream:
+                # 'stream' ist der hochpriore Stream; kann für Logging/Debugging verwendet werden.
+                # PyTorch-Operationen innerhalb dieses Blocks werden automatisch auf diesem Stream ausgeführt.
+                
+                for segment_info in tqdm(segments_to_process, desc="Synthetisiere Audio-Chunks"):
+                    try:
+                        # Die validate_text_for_tts_robust Prüfung ist bereits in filter_new_segments,
+                        # eine doppelte Prüfung ist nicht notwendig.
+
+                        with torch.inference_mode():
+                            # Die Inferenz wird nun auf dem vom StreamManager verwalteten Stream ausgeführt.
+                            result = xtts_model.inference(
+                                text=segment_info['text'],
+                                language="de",
+                                gpt_cond_latent=gpt_cond_latent,
+                                speaker_embedding=speaker_embedding,
+                                speed=1.1,
+                                temperature=0.85,
+                                repetition_penalty=5.0,
+                                top_k=65,
+                                top_p=1.0,
+                                enable_text_splitting=False
+                            )
+                            print(f"[{segment_info['start']} --> {segment_info['end']}]:\n{segment_info['text']}...\n")
+                        audio_clip = result.get("wav")
+                        if audio_clip is None or audio_clip.size == 0:
+                            logger.warning(f"Leeres Audio für Segment {segment_info['id']} erhalten.")
+                            continue
+                    
+                        # Audio speichern (nachdem der Stream synchronisiert wurde)
+                        chunk_filename = f"chunk_{segment_info['id']}.wav"
+                        chunk_path = os.path.join(TTS_TEMP_CHUNKS_DIR, chunk_filename)
+                        
+                        # Um sicherzugehen, dass die CPU-Daten bereit sind, wird hier synchronisiert.
+                        # Der StreamManager synchronisiert am Ende des with-Blocks nochmals global.
+
+                        sf.write(chunk_path, audio_clip, 24000)
+                        log_progress(segment_info, chunk_path)
+
+                    except Exception as e:
+                        logger.error(f"Fehler bei der TTS-Synthese für Segment {segment_info['id']}: {e}", exc_info=True)
+                        continue # Zum nächsten Segment springen
+        
+            # PHASE 6: Audio-Assembly
+            print("🔄 Finalisiere Audio-Assembly...")
+            assemble_final_audio_optimized(output_path)
+            
+            print(f"---------------------------")
+            print(f"|<< TTS abgeschlossen!! >>|")
+            print(f"---------------------------")
+            
+            tts_end_time = time.time() - tts_start_time
+            logger.info(f"TTS abgeschlossen in {tts_end_time:.2f} Sekunden")
+            print(f"{(tts_end_time):.2f} Sekunden")
+            print(f"{(tts_end_time / 60):.2f} Minuten")
+            print(f"{(tts_end_time / 3600):.2f} Stunden")
+            logger.info(f"TTS-Audio mit geklonter Stimme erstellt: {output_path}")
+            logger.info("🎉 Stream-optimierte TTS-Synthese abgeschlossen")
+            
+        except Exception as e:
+            logger.critical(f"Ein schwerwiegender Fehler ist im TTS-Prozess aufgetreten: {e}", exc_info=True)
+        # Am Ende des `with gpu_context()`-Blocks wird der Speicher automatisch geleert.
+
+    # 4. Finale Audio-Assemblierung (außerhalb des GPU-Kontexts)
+    logger.info("Starte finale Audio-Assemblierung.")
+    assemble_final_audio_optimized(output_path)
+    
+    logger.info(f"TTS-Prozess abgeschlossen. Finale Audiodatei: {output_path}")
+
+def create_conditioning_tensors_on_device(
+    xtts_model, 
+    sample_paths, 
+    target_device=None, 
+    load_sr=22050
+):
+    """
+    KORRIGIERTE VERSION: Erstellt Conditioning-Tensoren direkt auf dem Ziel-Device.
+    """
+    if target_device is None:
+        target_device = next(xtts_model.parameters()).device
+    
+    print(f"🔄 Erstelle Conditioning-Tensoren auf Device: {target_device}")
+    
+    try:
+        # WICHTIG: Modell muss sich im eval-Modus befinden
+        xtts_model.eval()
+        
+        with torch.inference_mode():
+            # Conditioning-Tensoren erstellen
+            gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(
+                audio_path=sample_paths,
+                load_sr=load_sr
+            )
+            
+            # KRITISCH: Explizite Device-Übertragung
+            if gpt_cond_latent is not None:
+                gpt_cond_latent = gpt_cond_latent.to(target_device)
+                print(f"✅ GPT Conditioning auf {gpt_cond_latent.device} übertragen")
+            
+            if speaker_embedding is not None:
+                speaker_embedding = speaker_embedding.to(target_device)
+                print(f"✅ Speaker Embedding auf {speaker_embedding.device} übertragen")
+            
+            # Validierung
+            if gpt_cond_latent is not None and speaker_embedding is not None:
+                model_device = next(xtts_model.parameters()).device
+                
+                if (gpt_cond_latent.device == model_device and 
+                    speaker_embedding.device == model_device):
+                    print("✅ Alle Conditioning-Tensoren korrekt auf Modell-Device")
+                else:
+                    print(f"❌ Device-Mismatch: Modell={model_device}, "
+                        f"GPT={gpt_cond_latent.device}, Speaker={speaker_embedding.device}")
+            
+            return gpt_cond_latent, speaker_embedding
+    
+    except Exception as e:
+        print(f"❌ Fehler bei Conditioning-Erstellung: {e}")
+        return None, None
+
+def ensure_tensor_on_device(tensor, target_device):
+    """
+    HILFSFUNKTION: Stellt sicher, dass Tensor auf dem richtigen Device ist.
+    """
+    if tensor is None:
+        return None
+    
+    if hasattr(tensor, 'device') and tensor.device != target_device:
+        print(f"🔄 Übertrage Tensor von {tensor.device} auf {target_device}")
+        return tensor.to(target_device)
+    
+    return tensor
+
+def ensure_memory_safety_with_streams(tensor, target_stream):
+    """
+    KRITISCHE FUNKTION: Verhindert Memory-Corruption bei Multi-Stream-Usage.
+    
+    Args:
+        tensor: PyTorch Tensor
+        target_stream: Stream auf dem Tensor verwendet wird
+    """
+    if not torch.cuda.is_available() or tensor is None:
+        return
+    
+    if hasattr(tensor, 'record_stream'):
+        # Markiert Tensor als "verwendet" auf diesem Stream
+        # Verhindert vorzeitige Speicher-Freigabe
+        tensor.record_stream(target_stream)
+        
+        logger.debug(f"Memory-Safety: Tensor auf Stream {target_stream} registriert")
+    else:
+        logger.warning("Tensor unterstützt record_stream nicht - Memory-Corruption möglich")
+
+def tts_tensor_postprocessing(tensor):
+    """
+    ECHTE OPERATION: TTS-spezifische Tensor-Nachbearbeitung.
+    """
+    if tensor is None:
+        return None
+    
+    # Audio-Tensor-Normalisierung
+    if tensor.dtype == torch.float32:
+        # RMS-Normalisierung
+        rms = torch.sqrt(torch.mean(tensor**2))
+        if rms > 0:
+            target_rms = 0.15
+            tensor = tensor * (target_rms / rms)
+        
+        # Peak-Limiting
+        peak = torch.max(torch.abs(tensor))
+        if peak > 0.95:
+            tensor = tensor * (0.95 / peak)
+    
+    return tensor
+
+def tts_conditioning_transfer(conditioning_tensor):
+    """
+    ECHTE OPERATION: TTS-Conditioning-Tensor-Transfer.
+    """
+    if conditioning_tensor is None:
+        return None
+    
+    # Sicherstellen dass Conditioning-Tensor korrekt formatiert ist
+    if conditioning_tensor.dim() == 2:
+        # Batch-Dimension hinzufügen falls nötig
+        if conditioning_tensor.shape[0] != 1:
+            conditioning_tensor = conditioning_tensor.unsqueeze(0)
+    
+    return conditioning_tensor.contiguous()
+
+def transfer_to_stream(tensor, target_stream):
+    """
+    HILFSFUNKTION: Tensor sicher auf anderen Stream transferieren.
+    """
+    if tensor is None or not torch.cuda.is_available():
+        return tensor
+    
+    with torch.cuda.stream(target_stream):
+        # Kopiere Tensor auf aktuellen Stream
+        transferred = tensor.detach().clone()
+        
+        # WICHTIG: record_stream für Memory-Safety
+        if hasattr(tensor, 'record_stream'):
+            tensor.record_stream(target_stream)
+        
+        return transferred
+
+def transfer_audio_to_cpu_async(audio_tensor, stream):
+    """
+    HILFSFUNKTION: Asynchroner Transfer von GPU zu CPU.
+    """
+    with torch.cuda.stream(stream):
+        # non_blocking=True für asynchronen Transfer
+        cpu_tensor = audio_tensor.to('cpu', non_blocking=True)
+        
+        # record_stream für Memory-Safety
+        if hasattr(audio_tensor, 'record_stream'):
+            audio_tensor.record_stream(stream)
+        
+        return cpu_tensor
+
+def cleanup_cuda_streams(streams):
+    """
+    HILFSFUNKTION: Sichere Stream-Bereinigung.
+    """
+    for stream in streams:
+        if stream is not None:
+            try:
+                stream.synchronize()
+            except Exception as e:
+                logger.warning(f"Stream-Cleanup-Fehler: {e}")
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+class nullcontext:
+    def __enter__(self):
+        return None
+    def __exit__(self, *excinfo):
+        pass
+
+def resample_to_44100_stereo(input_path, output_path, speed_factor):
+    """
+    Resample das Audio auf 44.100 Hz (Stereo), passe die Wiedergabegeschwindigkeit sowie die Lautstärke an.
+    """
+    if os.path.exists(output_path) and not ask_overwrite(output_path):
+        logger.info(f"Verwende vorhandene resampelte Datei: {output_path}")
+        return
+
+    try:
+        print("-------------------------")
+        print("|<< Starte ReSampling >>|")
+        print("-------------------------")
+
+        # Extrahiere die Originalsampling-Rate mit FFprobe für die Protokollierung
+        try:
+            probe_command = [
+                "ffprobe", 
+                "-v", "quiet", 
+                "-show_entries", "stream=sample_rate", 
+                "-of", "default=noprint_wrappers=1:nokey=1", 
+                input_path
+            ]
+            original_sr = subprocess.check_output(probe_command).decode().strip()
+            logger.info(f"Original-Samplingrate: {original_sr} Hz", exc_info=True)
+        except Exception as e:
+            logger.warning(f"Konnte Original-Samplingrate nicht ermitteln: {e}")
+            original_sr = "unbekannt"
+        
+        # Erstelle den FFmpeg-Befehl mit allen Parametern
+        # 1. Setze atempo-Filter für Geschwindigkeitsanpassung
+        atempo_filter = create_atempo_filter_string(speed_factor)
+        
+        # 2. Bereite Audiofilter vor (Resample auf 44.100 Hz, Stereo-Konvertierung, Geschwindigkeit, Lautstärke)
+        
+        # Vollständige Filterkette erstellen
+        filter_complex = (
+            f"aresample=44100:resampler=soxr:precision=28," +  # Hochwertiges Resampling auf 44.100 Hz
+            f"aformat=sample_fmts=s16:channel_layouts=stereo," +  # Ausgabeformat festlegen
+            f"{atempo_filter},"  # Geschwindigkeitsanpassung
+        )
+        
+        # FFmpeg-Befehl zusammenstellen
+        command = [
+            "ffmpeg",
+            "-i", input_path,
+            "-filter:a", filter_complex,
+            "-y",  # Ausgabedatei überschreiben
+            output_path
+        ]
+        
+        # Befehl ausführen
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, stderr = process.communicate()
+        
+        if process.returncode != 0:
+            raise Exception(f"FFmpeg-Fehler: {stderr.decode()}")
+        
+        logger.info("\n".join([
+            f"Audio auf 44100 Hz (Stereo) resampled:",
+            f"- Geschwindigkeitsfaktor: {speed_factor}",
+            f"- Datei: {output_path}"
+            ]), exc_info=True)
+        print("--------------------------")
+        print("|<< ReSampling beendet >>|")
+        print("--------------------------")
+    except Exception as e:
+        logger.error(f"Fehler beim Resampling auf 44.100 Hz: {e}")
+
+def create_atempo_filter_string(speed_factor):
+    """
+    Erstellt eine FFmpeg-Filterkette für die Geschwindigkeitsanpassung.
+    Der atempo-Filter unterstützt nur Faktoren zwischen 0.5 und 2.0,
+    daher müssen wir für extreme Werte mehrere Filter verketten.
+    
+    Args:
+        speed_factor (float): Geschwindigkeitsfaktor
+        
+    Returns:
+        str: FFmpeg-Filterkette für atempo
+    """
+    if 0.5 <= speed_factor <= 2.0:
+        return f"atempo={speed_factor}"
+    
+    # Für Werte außerhalb des Bereichs verketten wir mehrere atempo-Filter
+    atempo_chain = []
+    remaining_factor = speed_factor
+    
+    # Für extreme Verlangsamung
+    if remaining_factor < 0.5:
+        while remaining_factor < 0.5:
+            atempo_chain.append("atempo=0.5")
+            remaining_factor /= 0.5
+    
+    # Für extreme Beschleunigung
+    while remaining_factor > 2.0:
+        atempo_chain.append("atempo=2.0")
+        remaining_factor /= 2.0
+    
+    # Restfaktor hinzufügen
+    if 0.5 <= remaining_factor <= 2.0:
+        atempo_chain.append(f"atempo={remaining_factor}")
+    
+    return ",".join(atempo_chain)
+
+def adjust_playback_speed(video_path, adjusted_video_path, speed_factor):
+    """Passt die Wiedergabegeschwindigkeit des Originalvideos an und nutzt einen separaten Lautstärkefaktor für das Video."""
+    if os.path.exists(adjusted_video_path):
+        if not ask_overwrite(adjusted_video_path):
+            logger.info(f"Verwende vorhandene Datei: {adjusted_video_path}", exc_info=True)
+            return
+    try:
+        print("--------------------------------")
+        print("|<< Videoanpassung gestartet >>|")
+        print("--------------------------------")
+        
+        video_speed = 1 / speed_factor
+        audio_speed = speed_factor
+        
+        temp_output = adjusted_video_path + ".temp.mp4"
+        with gpu_context():
+            (
+            ffmpeg
+            .input(video_path, hwaccel="cuda")
+            .output(temp_output, vcodec="h264_nvenc", acodec="copy")
+            .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
+            )
+            print("-----------------------------")
+            print("|<< Teil 1 von 2 erledigt >>|")
+            print("-----------------------------")
+            (
+            ffmpeg
+            .input(temp_output)
+            .output(
+                    adjusted_video_path,
+                    vf=f"setpts={video_speed}*PTS",
+                    af=f"atempo={audio_speed}",
+                    vcodec="h264_nvenc",
+                    **{"max_muxing_queue_size": "1024"}
+                    )
+            .run(
+                overwrite_output=True,
+                capture_stdout=True,
+                capture_stderr=True
+                )
+            )
+        
+        if os.path.exists(temp_output):
+            os.remove(temp_output)
+        
+        print("------------------------------")
+        print("|<< Videoanpassung beendet >>|")
+        print("------------------------------")
+        
+        logger.info(
+            f"Videogeschwindigkeit angepasst (Faktor={speed_factor}): {adjusted_video_path} ",
+            exc_info=True
+            #f"und Lautstärke={VOLUME_ADJUSTMENT_VIDEO}"
+        )
+    except ffmpeg.Error as e:
+        stderr = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else "Keine stderr-Details verfügbar"
+        logger.error(f"Fehler bei der Anpassung der Wiedergabegeschwindigkeit: {e}")
+        logger.error(f"FFmpeg stderr-Ausgabe: {stderr}")
+
+def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final_video_path):
+    """
+    Kombiniert das angepasste Video mit dem neu erstellten Audio (z.B. TTS).
+    Dabei wird zusätzlich ein Mixdown durchgeführt, wo beide Audiospuren (Video-Audio mit geringer Lautstärke und TTS-Audio) gemischt werden.
+    """
+    if not os.path.exists(adjusted_video_path):
+        logger.error("Eingabevideo für das Kombinieren nicht gefunden.")
+        return
+    if not os.path.exists(translated_audio_path):
+        logger.error("Übersetzte Audiodatei nicht gefunden.")
+        return
+    if os.path.exists(final_video_path):
+        if not ask_overwrite(final_video_path):
+            logger.info(f"Verwende vorhandene Datei: {final_video_path}", exc_info=True)
+            return
+    try:
+        
+        print("----------------------------------")
+        print("|<< Starte Video-Audio-Mixdown >>|")
+        print("----------------------------------")
+
+        mix_start_time = time.time()
+        
+        filter_complex = (
+            f"[0:a]volume={VOLUME_ADJUSTMENT_VIDEO}[a1];"  # Reduziere die Lautstärke des Originalvideos
+            f"[1:a]volume={VOLUME_ADJUSTMENT_44100}[a2];"  # Halte die Lautstärke des TTS-Audios konstant
+            "[a1][a2]amix=inputs=2:duration=longest"
+        )
+        
+        video_path = ffmpeg.input(
+                    adjusted_video_path,
+                    hwaccel="cuda"
+                    )
+        audio_path = ffmpeg.input(
+                    translated_audio_path,
+                    hwaccel="cuda"
+                    )
+        with gpu_context():
+            (
+            ffmpeg
+            .output(
+                video_path.video,
+                audio_path.audio,
+                final_video_path,
+                vcodec="h264_nvenc",
+                acodec="aac",
+                strict="experimental",
+                filter_complex=filter_complex,
+                map="0:v",
+                map_metadata="-1"
+                )
+            .overwrite_output()
+            .run(capture_stdout=True, capture_stderr=True)
+            )
+        print("-----------------------------------")
+        print("|<< Video-Audio-Mixdown beendet >>|")
+        print("-----------------------------------")
+        logger.info(f"Finales Video erstellt und gemischt: {final_video_path}", exc_info=True)
+
+        mix_end_time = time.time() - mix_start_time
+        logger.info(f"Mixdown abgeschlossen in {mix_end_time:.2f} Sekunden")
+        print(f"{(mix_end_time):.2f} Sekunden")
+        print(f"{(mix_end_time / 60 ):.2f} Minuten")
+        print(f"{(mix_end_time / 3600):.2f} Stunden")
+
+    except ffmpeg.Error as e:
+        stderr = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else "Keine stderr-Details verfügbar"
+        logger.error(f"Fehler beim Kombinieren von Video und Audio: {e}")
+        logger.error(f"FFmpeg stderr-Ausgabe: {stderr}")
+
+# ==============================
+# Hauptprogramm
+# ==============================
+
+def main():
+    """
+    Orchestriert alle Schritte, um das Video zu übersetzen, TTS-Audio zu erzeugen und schließlich ein fertiges Video zu erstellen.
+    NEUE, BEREINIGTE VERSION.
+    """
+    # ======================================================================
+    # NEU: Performance-Optimierungen als allererster Schritt aktivieren
+    initialize_performance_optimizations()
+    # ======================================================================
+
+    # LanguageTool-Server einmalig für das gesamte Skript starten
+    lt_process = None
+    try:
+        lt_jar_path = os.path.join("D:\\LanguageTool-6.6", "languagetool-server.jar")
+        if not os.path.exists(lt_jar_path):
+            raise FileNotFoundError(f"LanguageTool nicht gefunden: {lt_jar_path}")
+        
+        global LT_PORT
+        LT_PORT = 8010
+        lt_process = subprocess.Popen(
+            ["java", "-Xmx4g", "-cp", lt_jar_path, "org.languagetool.server.HTTPServer", "--port", str(LT_PORT), "--allow-origin", "*"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
+        )
+        logger.info(f"LanguageTool-Server-Prozess gestartet (PID: {lt_process.pid}).")
+        
+        # ## ÄNDERUNG: Ersetze time.sleep durch die robuste "Health Check"-Schleife ##
+        if not wait_for_server_ready(port=LT_PORT, timeout=60):
+            # Wenn der Server nicht startet, beende das Skript sauber.
+            lt_process.terminate()
+            raise RuntimeError("LanguageTool-Server konnte nicht gestartet werden.")
+
+        # --------------------------------------------------------------------------
+        # SCHRITT 1: VORBEREITUNG & TRANSKRIPTION
+        # --------------------------------------------------------------------------
+        if not os.path.exists(VIDEO_PATH):
+            logger.error(f"Eingabevideo nicht gefunden: {VIDEO_PATH}"); return
+
+        extract_audio_ffmpeg(VIDEO_PATH, ORIGINAL_AUDIO_PATH)
+        create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3)
+        transcribe_audio_with_timestamps(ORIGINAL_AUDIO_PATH, TRANSCRIPTION_FILE)
+
+        # --------------------------------------------------------------------------
+        # SCHRITT 2: VEREDELUNG DER ENGLISCHEN TRANSKRIPTION
+        # --------------------------------------------------------------------------
+        refined_transcription_path = refine_text_pipeline(
+            input_file=TRANSCRIPTION_FILE,
+            output_file=REFINED_TRANSCRIPTION_FILE,
+            spacy_model_name="en_core_web_trf",
+            lang_code='en-US',
+            lt_path="D:\\LanguageTool-6.6"
+        )
+        if not refined_transcription_path:
+            logger.error("Veredelung der Transkription fehlgeschlagen."); return
+
+        # --------------------------------------------------------------------------
+        # SCHRITT 3: ÜBERSETZUNG
+        # --------------------------------------------------------------------------
+        translation_file_path, cleaned_source_path = translate_segments_optimized_safe(
+            transcription_file=refined_transcription_path,
+            translation_output_file=TRANSLATION_FILE,
+            cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
+            source_lang="en",
+            target_lang="de"
+        )
+        if not translation_file_path:
+            logger.error("Übersetzung fehlgeschlagen."); return
+
+        # --------------------------------------------------------------------------
+        # SCHRITT 4: QUALITÄTSPRÜFUNG
+        # --------------------------------------------------------------------------
+        evaluate_translation_quality(
+            source_csv_path=cleaned_source_path,
+            translated_csv_path=translation_file_path,
+            report_path=TRANSLATION_QUALITY_REPORT,
+            summary_path=TRANSLATION_QUALITY_SUMMARY,
+            model_name=ST_QUALITY_MODEL,
+            threshold=SIMILARITY_THRESHOLD
+        )
+
+        # --------------------------------------------------------------------------
+        # SCHRITT 5: VEREDELUNG DER DEUTSCHEN ÜBERSETZUNG
+        # --------------------------------------------------------------------------
+        refined_translation_path = refine_text_pipeline(
+            input_file=translation_file_path,
+            output_file=REFINED_TRANSLATION_FILE,
+            spacy_model_name="de_dep_news_trf",
+            lang_code='de-DE',
+            lt_path="D:\\LanguageTool-6.6"
+        )
+        if not refined_translation_path:
+            logger.error("Veredelung der Übersetzung fehlgeschlagen."); return
+            
+        # --------------------------------------------------------------------------
+        # SCHRITT 6: TTS-FORMATIERUNG & SYNTHESE
+        # --------------------------------------------------------------------------
+        # Die alte format_translation_for_tts wird durch eine einfachere Version ersetzt
+        # die nur noch das finale Splitting durchführt.
+        tts_formatted_file = format_for_tts_splitting(
+            input_file=refined_translation_path,
+            output_file=TTS_FORMATTED_TRANSLATION_FILE,
+            char_limit=CHAR_LIMIT_TRANSLATION
+        )
+        
+        text_to_speech_with_voice_cloning(
+            tts_formatted_file,
+            SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3,
+            TRANSLATED_AUDIO_WITH_PAUSES
+        )
+
+        # --------------------------------------------------------------------------
+        # SCHRITT 7: FINALES VIDEO ERSTELLEN
+        # --------------------------------------------------------------------------
+        resample_to_44100_stereo(TRANSLATED_AUDIO_WITH_PAUSES, RESAMPLED_AUDIO_FOR_MIXDOWN, SPEED_FACTOR_RESAMPLE_44100)
+        adjust_playback_speed(VIDEO_PATH, ADJUSTED_VIDEO_PATH, SPEED_FACTOR_PLAYBACK)
+        combine_video_audio_ffmpeg(ADJUSTED_VIDEO_PATH, RESAMPLED_AUDIO_FOR_MIXDOWN, FINAL_VIDEO_PATH)
+
+        total_time = time.time() - start_time
+        logger.info(f"Projekt erfolgreich abgeschlossen in {(total_time / 60):.2f} Minuten.")
+        print(f"\n\n--- PROJEKT ABGESCHLOSSEN ---")
+        print(f"Gesamtdauer: {(total_time / 60):.2f} Minuten")
+        print(f"Finale Ausgabedatei: {FINAL_VIDEO_PATH}")
+
+    except Exception as e:
+        logger.critical(f"Ein nicht abgefangener Fehler ist in main aufgetreten: {e}", exc_info=True)
+    finally:
+        if lt_process:
+            logger.info("Beende LanguageTool-Server...")
+            lt_process.terminate()
+            lt_process.wait()
+            logger.info("LanguageTool-Server beendet.")
+
+if __name__ == "__main__":
+    lt_process = start_language_tool_server()
+    
+    if lt_process:
+        try:
+            main()
+        except Exception as e:
+            logger.critical(f"Ein nicht abgefangener Fehler ist aufgetreten: {e}", exc_info=True)
+        finally:
+            stop_language_tool_server(lt_process)
+            logger.info("Programm wird beendet.")
+            logging.shutdown()
+    else:
+        logger.critical("Programm wird beendet, da der LanguageTool-Server nicht gestartet werden konnte.")
+        logging.shutdown()
