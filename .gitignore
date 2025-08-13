@@ -6,7 +6,12 @@
 /TTS/
 /rubberband-4.0.0/
 /#fertig/
-/venv/
 /venv310/
+/venv/
 .wolf*
 /wsl_venv/
+/__pycache__/
+/OpenVoice/
+/fairseq/
+/tts_temp_chunks/
+/#fertig/
