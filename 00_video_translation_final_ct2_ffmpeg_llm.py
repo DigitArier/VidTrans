@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__) # Logger für dieses Modul holen
 
 def setup_logging():
     """
-    NEU: Kapselt die gesamte Logging-Konfiguration.
+    Kapselt die gesamte Logging-Konfiguration.
     Wird nur aus dem Hauptprozess aufgerufen, um Log-Spam durch Worker zu verhindern.
     """
     # Basiskonfiguration für unser eigenes Logging
@@ -181,6 +181,8 @@ def setup_global_torch_optimizations():
     
     # WICHTIG: Umgebungsvariablen für PyTorch CUDA müssen VOR dem ersten GPU-Zugriff gesetzt werden.
     # Konfiguriert den PyTorch CUDA Memory Allocator, um Speicherfragmentierung bei großen Modellen zu reduzieren.
+    os.environ['TRITON_DISABLE_AUTOTUNE'] = '1'
+    os.environ['TRITON_DISABLE_CACHE'] = '1'
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:256,expandable_segments:True'
     # Setzt CTranslate2-spezifische Caching-Parameter für den Speicher, optimiert für Inferenz.
     os.environ['CT2_CUDA_CACHING_ALLOCATOR_CONFIG'] = '4,3,10,104857600'
@@ -429,15 +431,14 @@ def comprehensive_gpu_cleanup():
     
     # Schritt 3: CUDA-Cache mehrfach leeren
     torch.cuda.empty_cache()
-    time.sleep(0.1)  # Kleine Verzögerung
+    time.sleep(0.5)  # Kleine Verzögerung
     torch.cuda.empty_cache()
     
     for i in range(3):  # Mehrere Runden helfen bei zirkulären Referenzen
         gc.collect()
     
     torch.cuda.empty_cache()
-    time.sleep(0.1)  # Kleine Verzögerung
-    torch.cuda.empty_cache()
+    time.sleep(0.5)  # Kleine Verzögerung
     
     # Schritt 4: Speicherstatistiken und Allocator zurücksetzen
     torch.cuda.reset_peak_memory_stats()
@@ -510,8 +511,7 @@ def load_madlad400_translator_ct2(model_path: str = "madlad400-3b-mt-int8_bfloat
     logger.info("✅ CTranslate2-Übersetzer und Tokenizer erfolgreich geladen.")
     return translator, tokenizer
 
-def load_nllb200_translator_ct2(model_dir: str = "nllb-200-1.3B-bfloat16",
-                                device: str = "cuda") -> tuple[ctranslate2.Translator, PreTrainedTokenizerFast]:
+def load_nllb200_translator_ct2(model_dir: str = "nllb-200-1.3B-bfloat16", device: str = "cuda") -> tuple[ctranslate2.Translator, PreTrainedTokenizerFast]:
     """
     Lädt den NLLB-200-3.3B-Translator (CT2-Runtime, bfloat16) und den zugehörigen Tokenizer.
     """
@@ -2207,6 +2207,188 @@ def _is_refusal(text: str) -> bool:
     return any(pattern in text_lower for pattern in refusal_patterns)
 
 # Übersetzen
+def translate_segments_optimized_safe(
+    refined_transcription_path: str,
+    master_entity_map: Dict[int, Dict[str, EntityInfo]],
+    translation_output_file: str,
+    cleaned_source_output_file: str,
+    source_lang: str = "en",
+    target_lang: str = "de",
+    src_lang: str = "eng_Latn",
+    tgt_lang: str = "deu_Latn",
+    batch_size: int = 1
+) -> Tuple[str, str]:
+    """
+    KORRIGIERTE VERSION: Übersetzt Segmente mit verbesserter Entity-Behandlung.
+    
+    Args:
+        refined_transcription_path (str): Pfad zur veredelten Quell-CSV.
+        master_entity_map (Dict[int, ...]): Das von `refine_text_pipeline` erzeugte Mapping.
+        translation_output_file (str): Zieldatei für die Übersetzung.
+        cleaned_source_output_file (str): Zieldatei für den bereinigten Quelltext.
+        source_lang (str): Quellsprache
+        target_lang (str): Zielsprache
+        batch_size (int): Batch-Größe für Übersetzung
+        
+    Returns:
+        Tuple[str, str]: Pfade zu den erstellten Dateien.
+    """
+
+    if os.path.exists(translation_output_file) and not ask_overwrite(translation_output_file):
+        logger.info(f"Verwende vorhandenen Übersetzungsbericht: {translation_output_file}")
+        return translation_output_file, cleaned_source_output_file
+    else:
+        # Der Benutzer möchte überschreiben, also räumen wir auf.
+        logger.info(f"Benutzer hat dem Überschreiben von '{translation_output_file}' zugestimmt. Alte temporäre Dateien werden entfernt.")
+        if os.path.exists(cleaned_source_output_file): os.remove(cleaned_source_output_file)
+        if os.path.exists(translation_output_file): os.remove(translation_output_file)
+
+    should_continue_translation, processed_keys = handle_key_based_continuation(
+        translation_output_file, refined_transcription_path, key_column_index=0
+    )
+
+    # Zusätzliche Abfrage, falls die Datei vollständig ist
+    if not should_continue_translation:
+        logger.info("Übersetzung wird übersprungen, da die Zieldatei vollständig ist.")
+        return translation_output_file, cleaned_source_output_file
+
+    df_source = pd.read_csv(refined_transcription_path, sep='|', dtype=str).fillna('')
+    segments_to_process = []
+    for i, row in df_source.iterrows():
+        if row['startzeit'] not in processed_keys:
+            entity_map_str = row.get('entity_map', '{}')
+            current_entity_map = _json_str_to_entity_map(entity_map_str)
+            # Der Text aus der Veredelungs-Pipeline enthält bereits die Platzhalter.
+            protected_text = row['text']
+            segments_to_process.append({
+                "id": i, "startzeit": row['startzeit'], "endzeit": row['endzeit'],
+                "original_text": row['text'], "protected_text": protected_text,
+                "entity_mapping": current_entity_map
+            })
+
+    if not segments_to_process:
+        logger.info("Alle Segmente bereits übersetzt.")
+        return translation_output_file, cleaned_source_output_file
+
+    logger.info(f"Übersetze {len(segments_to_process)} verbleibende Segmente...")
+
+    all_translations = [] if not os.path.exists(translation_output_file) else pd.read_csv(translation_output_file, sep='|', dtype=str).to_dict('records')
+    all_cleaned_sources = [] if not os.path.exists(cleaned_source_output_file) else pd.read_csv(cleaned_source_output_file, sep='|', dtype=str).to_dict('records')
+
+    translate_start_time = time.time()
+
+    with gpu_context():
+        # ==============================================================================
+        # ## AUSWAHL DES ÜBERSETZUNGS-BACKENDS ##
+        # Aktivieren Sie EINEN der folgenden Blöcke, um die Übersetzungsmethode zu wählen.
+        # ==============================================================================
+
+        # --- OPTION 1: OLLAMA (LLM-basiert, robust, empfohlen) ---
+        # logger.info("Verwende Bloom für die Übersetzung.")
+        # texts_to_translate = [item['protected_text'] for item in segments_to_process]
+        # translation_generator = translate_batch_openhermes_ct2_local(
+        #     texts=texts_to_translate,
+        #     ct2_model_dir="OpenHermes-2.5-Mistral-7B_int8_bfloat16", # ANPASSEN: Name Ihres Bloom-Modells
+        #     target_lang=target_lang
+        # )
+
+        # --- OPTION 2: NLLB-200 ---
+        #logger.info("Verwende NLLB-200 CTranslate2 für die Übersetzung.")
+        #translator_nllb, tokenizer_nllb = load_nllb200_translator_ct2(device=device)
+        #for i in tqdm(range(0, len(segments_to_process), batch_size), desc="Übersetze geschützte Batches"):
+        #    batch_data = segments_to_process[i:i + batch_size]
+        #    texts_to_translate = [item['protected_text'] for item in batch_data]
+        #    # Aufruf der NLLB-Übersetzungsfunktion (Batch-Übersetzung mit CTranslate2)
+        #    translated_protected_texts = translate_batch_nllb200(
+        #        texts=texts_to_translate,
+        #        translator=translator_nllb,
+        #        tokenizer=tokenizer_nllb,
+        #        src_lang=src_lang,
+        #        tgt_lang=tgt_lang
+        #    )
+        #    for j, translated_protected in enumerate(translated_protected_texts):
+        #        segment_data = batch_data[j]
+        #        # Entity-Wiederherstellung
+        #        current_entity_map = segment_data.get('entity_mapping', {})
+        #        if not current_entity_map:
+        #            logger.warning(f"Kein Mapping für Segment {segment_data['id']}. Verwende leeres Dict.")
+        #            current_entity_map = {}
+        #        # Verwende robuste Wiederherstellung
+        #        final_translated_text = restore_entities_final(
+        #            translated_protected,
+        #            current_entity_map
+        #        )
+        #        # Debug-Logging für Entity-Pipeline
+        #        logger.debug(f"Segment {segment_data['id']}: {len(current_entity_map)} Entities, "
+        #                     f"Übersetzung: {final_translated_text[:100]}...")
+        #        print(f"\n[{segment_data['startzeit']} --> {segment_data['endzeit']}]:\n{final_translated_text}\n")
+        #        print(f"Entities: {len(current_entity_map)} gefunden\n")
+        #        all_translations.append({
+        #            'startzeit': segment_data["startzeit"],
+        #            'endzeit': segment_data["endzeit"],
+        #            'text': sanitize_for_csv_and_tts(final_translated_text)
+        #        })
+        #        all_cleaned_sources.append({
+        #            'startzeit': segment_data["startzeit"],
+        #            'endzeit': segment_data["endzeit"],
+        #            'text': sanitize_for_csv_and_tts(segment_data['original_text'])
+        #        })
+
+        # --- OPTION 3: MADLAD (mit CTranslate2) ---
+        logger.info("Verwende MADLAD CTranslate2 für die Übersetzung.")
+        translator_madlad, tokenizer_madlad = load_madlad400_translator_ct2(device=device)
+        for i in tqdm(range(0, len(segments_to_process), batch_size), desc="Übersetze geschützte Batches"):
+            batch_data = segments_to_process[i:i + batch_size]
+            texts_to_translate = [item['protected_text'] for item in batch_data]
+            # Aufruf der neuen MADLAD-Übersetzungsfunktion
+            translated_protected_texts = translate_batch_madlad(
+                texts=texts_to_translate,
+                translator=translator_madlad,
+                tokenizer=tokenizer_madlad,
+                target_lang=target_lang
+            )
+            for j, translated_protected in enumerate(translated_protected_texts):
+                segment_data = batch_data[j]
+                # Entity-Wiederherstellung
+                current_entity_map = segment_data.get('entity_mapping', {})
+                if not current_entity_map:
+                    logger.warning(f"Kein Mapping für Segment {segment_data['id']}. Verwende leeres Dict.")
+                    current_entity_map = {}
+                # Verwende robuste Wiederherstellung
+                final_translated_text = restore_entities_final(
+                    translated_protected,
+                    current_entity_map
+                )
+                # Debug-Logging für Entity-Pipeline
+                logger.debug(f"Segment {segment_data['id']}: {len(current_entity_map)} Entities, "
+                            f"Übersetzung: {final_translated_text[:100]}...")
+                print(f"\n[{segment_data['startzeit']} --> {segment_data['endzeit']}]:\n{final_translated_text}\n")
+                print(f"Entities: {len(current_entity_map)} gefunden\n")
+                all_translations.append({
+                    'startzeit': segment_data["startzeit"],
+                    'endzeit': segment_data["endzeit"],
+                    'text': sanitize_for_csv_and_tts(final_translated_text)
+                })
+                all_cleaned_sources.append({
+                    'startzeit': segment_data["startzeit"],
+                    'endzeit': segment_data["endzeit"],
+                    'text': sanitize_for_csv_and_tts(segment_data['original_text'])
+                })
+
+    save_progress_csv(all_translations, translation_output_file)
+    save_progress_csv(all_cleaned_sources, cleaned_source_output_file)
+
+    logger.info(f"Übersetzung abgeschlossen: {len(all_translations)} gültige Segmente.")
+    print("\n---------------------------------")
+    print("|<< Übersetzung abgeschlossen! >>|")
+    print("---------------------------------")
+
+    translate_end_time = time.time() - translate_start_time
+    logger.info(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden")
+    print(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden -> {(translate_end_time / 60):.2f} Minuten")
+
+    return translation_output_file, cleaned_source_output_file
+
 def translate_batch_madlad(
     texts: List[str],
     translator: ctranslate2.Translator,
@@ -2257,7 +2439,7 @@ def translate_batch_nllb200(
     src_lang: str,
     tgt_lang: str,
     beam_size: int = 5,
-    max_retries: int = 2  # NEU: Max. Wiederholungen bei Fehlern
+    max_retries: int = 2  # Max. Wiederholungen bei Fehlern
 ) -> list[str]:
     """
     KORRIGIERTE VERSION: Übersetzt eine Liste von Texten per NLLB-200 mit CTranslate2.
@@ -2265,7 +2447,7 @@ def translate_batch_nllb200(
     - Retry-Mechanismus bei leeren Hypothesen (verhindert Fallback auf Originaltext ohne Warnung).
     - Explizites Logging von Fallbacks für bessere Debugbarkeit.
     - Sichere Prefix-Entfernung nur, wenn Prefix vorhanden.
-    - NEU: Automatisches Splitten langer Texte (>768 Tokens) in Teile, separate Übersetzung und Rekombination,
+    - Automatisches Splitten langer Texte (>768 Tokens) in Teile, separate Übersetzung und Rekombination,
       um Abkürzungen durch truncation zu vermeiden. Erweiterte Split-Logik für komplexe Sätze.
 
     Args:
@@ -2289,7 +2471,7 @@ def translate_batch_nllb200(
         # 1. Source-Sprache für Tokenizer setzen
         tokenizer.src_lang = src_lang
 
-        # NEU: Erweiterte Hilfsfunktion zum Splitten langer Texte (verhindert Abkürzungen)
+        # Erweiterte Hilfsfunktion zum Splitten langer Texte (verhindert Abkürzungen)
         def _split_long_text(text: str, max_tokens: int = 768) -> list[str]:
             """Splittet langen Text in Teile <= max_tokens (basierend auf erweiterten Satzgrenzen)."""
             encoded = tokenizer(text, add_special_tokens=False)
@@ -2660,7 +2842,7 @@ def translate_batch_dolphin(
     model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")  # GPU-Autozuweisung (RTX 4050)
     model.eval()  # Inferenz-Modus für Geschwindigkeit
 
-    # NEU: Deaktiviere SDPA und Flash Attention global für diesen Aufruf
+    # Deaktiviere SDPA und Flash Attention global für diesen Aufruf
     # Verhindert 'No available kernel'-Fehler durch Fallback auf stabile Implementierung
     torch.backends.cuda.enable_flash_sdp(False)
     torch.backends.cuda.enable_mem_efficient_sdp(False)
@@ -2720,7 +2902,7 @@ def translate_batch_dolphin_ct2_local(
     - Prompt: Garantiert direkte Übersetzung ohne Verweigerungen und respektiert Entity-Platzhalter.
     - GPU-Nutzung: Automatisch auf RTX 4050.
     - Fehlerbehandlung: Fängt OOM ab und reduziert Batch-Größe.
-    - NEU: Debug-Ausgabe nach jedem übersetzten Segment.
+    - Debug-Ausgabe nach jedem übersetzten Segment.
     - OPTIMIERT: Multi-Threading für CPU-Fallback (inter_threads=6), dynamische Quantisierung.
 
     Args:
@@ -2739,7 +2921,7 @@ def translate_batch_dolphin_ct2_local(
     from transformers import AutoTokenizer  # Lazy Import für Abhängigkeiten
     import re  # Für robuste Prompt-Bereinigung
 
-    # NEU: Speicherbereinigung vor Modell-Laden
+    # Speicherbereinigung vor Modell-Laden
     torch.cuda.empty_cache()
     gc.collect()
     logger.info(f"GPU-Speicher vor Modell-Laden bereinigt. Verfügbar: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
@@ -2799,7 +2981,7 @@ def translate_batch_dolphin_ct2_local(
         # Entferne den Prompt-Teil aus der Ausgabe (verbessert: Regex für robuste Bereinigung)
         cleaned_translations = [re.sub(r'^(.*Output ONLY the translated text, nothing else\.)', '', trans).strip() for trans in batch_translations]
         
-        # NEU: Debug-Ausgabe nach jedem Segment (mit vollem Text bei Fehlern)
+        # Debug-Ausgabe nach jedem Segment (mit vollem Text bei Fehlern)
         for j, trans in enumerate(cleaned_translations):
             if not trans:  # Bei leerem Text: Warnung und vollen Originaltext loggen
                 logger.warning(f"Debug: Leeres Segment {i + j + 1}/{len(texts)} - Volltext: {batch_translations[j]}")
@@ -2832,7 +3014,7 @@ def translate_batch_bloom_ct2_local(
     - Prompt: Garantiert direkte Übersetzung ohne Verweigerungen und respektiert Entity-Platzhalter.
     - GPU-Nutzung: Automatisch auf RTX 4050.
     - Fehlerbehandlung: Fängt OOM ab und reduziert Batch-Größe.
-    - NEU: Debug-Ausgabe nach jedem übersetzten Segment.
+    - Debug-Ausgabe nach jedem übersetzten Segment.
     - OPTIMIERT: Multi-Threading für CPU-Fallback (inter_threads=6), dynamische Quantisierung.
 
     Args:
@@ -2851,7 +3033,7 @@ def translate_batch_bloom_ct2_local(
     from transformers import AutoTokenizer  # Lazy Import für Abhängigkeiten
     import re  # Für robuste Prompt-Bereinigung
 
-    # NEU: Speicherbereinigung vor Modell-Laden
+    # Speicherbereinigung vor Modell-Laden
     torch.cuda.empty_cache()
     gc.collect()
     logger.info(f"GPU-Speicher vor Modell-Laden bereinigt. Verfügbar: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
@@ -2911,7 +3093,7 @@ def translate_batch_bloom_ct2_local(
         # Entferne den Prompt-Teil aus der Ausgabe (verbessert: Regex für robuste Bereinigung)
         cleaned_translations = [re.sub(r'^(.*Output ONLY the translated text, nothing else\.)', '', trans).strip() for trans in batch_translations]
         
-        # NEU: Debug-Ausgabe nach jedem Segment (mit vollem Text bei Fehlern)
+        # Debug-Ausgabe nach jedem Segment (mit vollem Text bei Fehlern)
         for j, trans in enumerate(cleaned_translations):
             if not trans:  # Bei leerem Text: Warnung und vollen Originaltext loggen
                 logger.warning(f"Debug: Leeres Segment {i + j + 1}/{len(texts)} - Volltext: {batch_translations[j]}")
@@ -2944,7 +3126,7 @@ def translate_batch_openhermes_ct2_local(
     - Prompt: Garantiert direkte Übersetzung ohne Verweigerungen und respektiert Entity-Platzhalter.
     - GPU-Nutzung: Automatisch auf RTX 4050.
     - Fehlerbehandlung: Fängt OOM ab und reduziert Batch-Größe.
-    - NEU: Debug-Ausgabe nach jedem übersetzten Segment.
+    - Debug-Ausgabe nach jedem übersetzten Segment.
     - OPTIMIERT: Multi-Threading für CPU-Fallback (inter_threads=6), dynamische Quantisierung.
 
     Args:
@@ -2960,7 +3142,7 @@ def translate_batch_openhermes_ct2_local(
         List[str]: Übersetzte Texte.
     """
 
-    # NEU: Speicherbereinigung vor Modell-Laden
+    # Speicherbereinigung vor Modell-Laden
     torch.cuda.empty_cache()
     gc.collect()
     logger.info(f"GPU-Speicher vor Modell-Laden bereinigt. Verfügbar: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
@@ -3017,7 +3199,7 @@ def translate_batch_openhermes_ct2_local(
         # Entferne den Prompt-Teil aus der Ausgabe (verbessert: Regex für robuste Bereinigung)
         cleaned_translations = [re.sub(r'^(.*Output ONLY the translated text, nothing else\.)', '', trans).strip() for trans in batch_translations]
         
-        # NEU: Debug-Ausgabe nach jedem Segment (mit vollem Text bei Fehlern)
+        # Debug-Ausgabe nach jedem Segment (mit vollem Text bei Fehlern)
         for j, trans in enumerate(cleaned_translations):
             if not trans:  # Bei leerem Text: Warnung und vollen Originaltext loggen
                 logger.warning(f"Debug: Leeres Segment {i + j + 1}/{len(texts)} - Volltext: {batch_translations[j]}")
@@ -3110,188 +3292,6 @@ def cleanup_translation_artifacts(text: str) -> str:
     
     return ' '.join(words)
 
-def translate_segments_optimized_safe(
-    refined_transcription_path: str,
-    master_entity_map: Dict[int, Dict[str, EntityInfo]],
-    translation_output_file: str,
-    cleaned_source_output_file: str,
-    source_lang: str = "en",
-    target_lang: str = "de",
-    src_lang: str = "eng_Latn",
-    tgt_lang: str = "deu_Latn",
-    batch_size: int = 2
-) -> Tuple[str, str]:
-    """
-    KORRIGIERTE VERSION: Übersetzt Segmente mit verbesserter Entity-Behandlung.
-    
-    Args:
-        refined_transcription_path (str): Pfad zur veredelten Quell-CSV.
-        master_entity_map (Dict[int, ...]): Das von `refine_text_pipeline` erzeugte Mapping.
-        translation_output_file (str): Zieldatei für die Übersetzung.
-        cleaned_source_output_file (str): Zieldatei für den bereinigten Quelltext.
-        source_lang (str): Quellsprache
-        target_lang (str): Zielsprache
-        batch_size (int): Batch-Größe für Übersetzung
-        
-    Returns:
-        Tuple[str, str]: Pfade zu den erstellten Dateien.
-    """
-
-    if os.path.exists(translation_output_file) and not ask_overwrite(translation_output_file):
-        logger.info(f"Verwende vorhandenen Übersetzungsbericht: {translation_output_file}")
-        return translation_output_file, cleaned_source_output_file
-    else:
-        # Der Benutzer möchte überschreiben, also räumen wir auf.
-        logger.info(f"Benutzer hat dem Überschreiben von '{translation_output_file}' zugestimmt. Alte temporäre Dateien werden entfernt.")
-        if os.path.exists(cleaned_source_output_file): os.remove(cleaned_source_output_file)
-        if os.path.exists(translation_output_file): os.remove(translation_output_file)
-
-    should_continue_translation, processed_keys = handle_key_based_continuation(
-        translation_output_file, refined_transcription_path, key_column_index=0
-    )
-
-    # NEU: Zusätzliche Abfrage, falls die Datei vollständig ist
-    if not should_continue_translation:
-        logger.info("Übersetzung wird übersprungen, da die Zieldatei vollständig ist.")
-        return translation_output_file, cleaned_source_output_file
-
-    df_source = pd.read_csv(refined_transcription_path, sep='|', dtype=str).fillna('')
-    segments_to_process = []
-    for i, row in df_source.iterrows():
-        if row['startzeit'] not in processed_keys:
-            entity_map_str = row.get('entity_map', '{}')
-            current_entity_map = _json_str_to_entity_map(entity_map_str)
-            # Der Text aus der Veredelungs-Pipeline enthält bereits die Platzhalter.
-            protected_text = row['text']
-            segments_to_process.append({
-                "id": i, "startzeit": row['startzeit'], "endzeit": row['endzeit'],
-                "original_text": row['text'], "protected_text": protected_text,
-                "entity_mapping": current_entity_map
-            })
-
-    if not segments_to_process:
-        logger.info("Alle Segmente bereits übersetzt.")
-        return translation_output_file, cleaned_source_output_file
-
-    logger.info(f"Übersetze {len(segments_to_process)} verbleibende Segmente...")
-
-    all_translations = [] if not os.path.exists(translation_output_file) else pd.read_csv(translation_output_file, sep='|', dtype=str).to_dict('records')
-    all_cleaned_sources = [] if not os.path.exists(cleaned_source_output_file) else pd.read_csv(cleaned_source_output_file, sep='|', dtype=str).to_dict('records')
-
-    translate_start_time = time.time()
-
-    with gpu_context():
-        # ==============================================================================
-        # ## AUSWAHL DES ÜBERSETZUNGS-BACKENDS ##
-        # Aktivieren Sie EINEN der folgenden Blöcke, um die Übersetzungsmethode zu wählen.
-        # ==============================================================================
-
-        # --- OPTION 1: OLLAMA (LLM-basiert, robust, empfohlen) ---
-        # logger.info("Verwende Bloom für die Übersetzung.")
-        # texts_to_translate = [item['protected_text'] for item in segments_to_process]
-        # translation_generator = translate_batch_openhermes_ct2_local(
-        #     texts=texts_to_translate,
-        #     ct2_model_dir="OpenHermes-2.5-Mistral-7B_int8_bfloat16", # ANPASSEN: Name Ihres Bloom-Modells
-        #     target_lang=target_lang
-        # )
-
-        # --- OPTION 2: NLLB-200 ---
-        #logger.info("Verwende NLLB-200 CTranslate2 für die Übersetzung.")
-        #translator_nllb, tokenizer_nllb = load_nllb200_translator_ct2(device=device)
-        #for i in tqdm(range(0, len(segments_to_process), batch_size), desc="Übersetze geschützte Batches"):
-        #    batch_data = segments_to_process[i:i + batch_size]
-        #    texts_to_translate = [item['protected_text'] for item in batch_data]
-        #    # Aufruf der NLLB-Übersetzungsfunktion (Batch-Übersetzung mit CTranslate2)
-        #    translated_protected_texts = translate_batch_nllb200(
-        #        texts=texts_to_translate,
-        #        translator=translator_nllb,
-        #        tokenizer=tokenizer_nllb,
-        #        src_lang=src_lang,
-        #        tgt_lang=tgt_lang
-        #    )
-        #    for j, translated_protected in enumerate(translated_protected_texts):
-        #        segment_data = batch_data[j]
-        #        # Entity-Wiederherstellung
-        #        current_entity_map = segment_data.get('entity_mapping', {})
-        #        if not current_entity_map:
-        #            logger.warning(f"Kein Mapping für Segment {segment_data['id']}. Verwende leeres Dict.")
-        #            current_entity_map = {}
-        #        # Verwende robuste Wiederherstellung
-        #        final_translated_text = restore_entities_final(
-        #            translated_protected,
-        #            current_entity_map
-        #        )
-        #        # Debug-Logging für Entity-Pipeline
-        #        logger.debug(f"Segment {segment_data['id']}: {len(current_entity_map)} Entities, "
-        #                     f"Übersetzung: {final_translated_text[:100]}...")
-        #        print(f"\n[{segment_data['startzeit']} --> {segment_data['endzeit']}]:\n{final_translated_text}\n")
-        #        print(f"Entities: {len(current_entity_map)} gefunden\n")
-        #        all_translations.append({
-        #            'startzeit': segment_data["startzeit"],
-        #            'endzeit': segment_data["endzeit"],
-        #            'text': sanitize_for_csv_and_tts(final_translated_text)
-        #        })
-        #        all_cleaned_sources.append({
-        #            'startzeit': segment_data["startzeit"],
-        #            'endzeit': segment_data["endzeit"],
-        #            'text': sanitize_for_csv_and_tts(segment_data['original_text'])
-        #        })
-
-        # --- OPTION 3: MADLAD (mit CTranslate2) ---
-        logger.info("Verwende MADLAD CTranslate2 für die Übersetzung.")
-        translator_madlad, tokenizer_madlad = load_madlad400_translator_ct2(device=device)
-        for i in tqdm(range(0, len(segments_to_process), batch_size), desc="Übersetze geschützte Batches"):
-            batch_data = segments_to_process[i:i + batch_size]
-            texts_to_translate = [item['protected_text'] for item in batch_data]
-            # Aufruf der neuen MADLAD-Übersetzungsfunktion
-            translated_protected_texts = translate_batch_madlad(
-                texts=texts_to_translate,
-                translator=translator_madlad,
-                tokenizer=tokenizer_madlad,
-                target_lang=target_lang
-            )
-            for j, translated_protected in enumerate(translated_protected_texts):
-                segment_data = batch_data[j]
-                # Entity-Wiederherstellung
-                current_entity_map = segment_data.get('entity_mapping', {})
-                if not current_entity_map:
-                    logger.warning(f"Kein Mapping für Segment {segment_data['id']}. Verwende leeres Dict.")
-                    current_entity_map = {}
-                # Verwende robuste Wiederherstellung
-                final_translated_text = restore_entities_final(
-                    translated_protected,
-                    current_entity_map
-                )
-                # Debug-Logging für Entity-Pipeline
-                logger.debug(f"Segment {segment_data['id']}: {len(current_entity_map)} Entities, "
-                            f"Übersetzung: {final_translated_text[:100]}...")
-                print(f"\n[{segment_data['startzeit']} --> {segment_data['endzeit']}]:\n{final_translated_text}\n")
-                print(f"Entities: {len(current_entity_map)} gefunden\n")
-                all_translations.append({
-                    'startzeit': segment_data["startzeit"],
-                    'endzeit': segment_data["endzeit"],
-                    'text': sanitize_for_csv_and_tts(final_translated_text)
-                })
-                all_cleaned_sources.append({
-                    'startzeit': segment_data["startzeit"],
-                    'endzeit': segment_data["endzeit"],
-                    'text': sanitize_for_csv_and_tts(segment_data['original_text'])
-                })
-
-    save_progress_csv(all_translations, translation_output_file)
-    save_progress_csv(all_cleaned_sources, cleaned_source_output_file)
-
-    logger.info(f"Übersetzung abgeschlossen: {len(all_translations)} gültige Segmente.")
-    print("\n---------------------------------")
-    print("|<< Übersetzung abgeschlossen! >>|")
-    print("---------------------------------")
-
-    translate_end_time = time.time() - translate_start_time
-    logger.info(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden")
-    print(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden -> {(translate_end_time / 60):.2f} Minuten")
-
-    return translation_output_file, cleaned_source_output_file
-
 def is_valid_segment(segment, check_text_content=True):
     """
     Erweiterte Hilfsfunktion zur Segmentvalidierung mit detailliertem Logging.
@@ -3332,18 +3332,19 @@ def is_valid_segment(segment, check_text_content=True):
     # Wenn alle Prüfungen bestanden wurden, ist das Segment gültig.
     return True
 
+# Qualitätsbewertung mit automatischer Korrektur via Ollama
 def evaluate_translation_quality(
     source_csv_path,
     translated_csv_path,
     report_path,
     summary_path,
-    model_name="sentence-transformers/multi-qa-mpnet-base-dot-v1",
-    threshold=0.75,
+    model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+    threshold=0.8,
     correction_model="llama3.1:8b",
-    max_retries=3  # Max. Wiederholungen bei Fehlern
+    max_retries=5  # Max. Wiederholungen bei Fehlern
 ) -> str:
     """
-    KORRIGIERTE VERSION: Prüft semantische Ähnlichkeit, korrigiert niedrige Segmente automatisch via Ollama
+    Prüft semantische Ähnlichkeit, korrigiert niedrige Segmente automatisch via Ollama
     und erzeugt detaillierten Bericht + Zusammenfassung.
     """
     if os.path.exists(report_path) and not ask_overwrite(report_path):
@@ -3443,7 +3444,7 @@ def evaluate_translation_quality(
                         new_similarity = cos_sim(embeddings_source[i:i+1], new_embedding).item()
                         corrected_similarities[i] = new_similarity
 
-                        if new_similarity > (similarity + 0.02): # Nur bei deutlicher Verbesserung korrigieren
+                        if new_similarity > (similarity + 0.1): # Nur bei deutlicher Verbesserung korrigieren
                             corrections_made += 1
                             correction_note = f"Korrigiert auf {new_similarity:.3f}"
                             translated_texts[i] = corrected_text  # Übersetzung aktualisieren
@@ -3855,12 +3856,12 @@ def entity_protection_final(
     text: str,
     nlp_model,
     tokenizer: T5Tokenizer,
-    custom_words: List[str] = ["Datura", "Acid"]  # NEU: Optionale Liste benutzerdefinierter Wörter zum Schützen
+    custom_words: List[str] = ["Datura", "Acid"]  # Optionale Liste benutzerdefinierter Wörter zum Schützen
 ) -> Tuple[str, Dict[str, EntityInfo]]:
     """
     Stellt sicher, dass T5-native Sentinel-Tokens (<extra_id_0>) verwendet werden,
     wie in der offiziellen Dokumentation vorgesehen.
-    NEU: Schützt benutzerdefinierte Wörter (z. B. spezifische Begriffe) vor der NER-Erkennung.
+    Schützt benutzerdefinierte Wörter (z. B. spezifische Begriffe) vor der NER-Erkennung.
     Diese werden als Entities mit Label "CUSTOM" behandelt und ersetzt.
     Args:
         text: Zu verarbeitender Text.
@@ -3873,7 +3874,7 @@ def entity_protection_final(
     if not text or not text.strip():
         return text, {}  # Leerer Text: Kein Schutz nötig
 
-    # NEU: Schritt 1 - Benutzerdefinierte Wörter schützen (vor spaCy-NER)
+    # Schritt 1 - Benutzerdefinierte Wörter schützen (vor spaCy-NER)
     entity_mapping: Dict[str, EntityInfo] = {}
     entity_counter = 0
     protected_text = text
@@ -3892,7 +3893,7 @@ def entity_protection_final(
                 protected_text = protected_text[:pos] + placeholder + protected_text[end_pos:]
                 entity_mapping[placeholder] = EntityInfo(
                     text=word,
-                    label="CUSTOM",  # NEU: Label für benutzerdefinierte Wörter
+                    label="CUSTOM",  # Label für benutzerdefinierte Wörter
                     start=pos,
                     end=end_pos,
                     language=nlp_model.lang
@@ -4019,13 +4020,13 @@ def refine_text_pipeline(
     spacy_model_name: str,
     lang_code: str,
     tokenizer_path: str,
-    min_words: int = 5  # NEU: Mindestwortanzahl pro Segment (verhindert zu kurze Fragmente)
+    min_words: int = 5  # Mindestwortanzahl pro Segment (verhindert zu kurze Fragmente)
 ) -> Tuple[str, Dict[int, Dict[str, EntityInfo]]]:
     """
     FINALE HOCHPERFORMANTE VERSION: Nutzt Batch-Verarbeitung und manuelle Parallelisierung
     für maximale Geschwindigkeit und respektiert die Benutzerentscheidung zum Überschreiben.
     
-    NEU: Integriert Ein-Satz-Splitting mit proportionalen Zeitstempeln und Entity-Übertragung.
+    Integriert Ein-Satz-Splitting mit proportionalen Zeitstempeln und Entity-Übertragung.
     ERWEITERT: Post-Splitting-Merge, falls Segmente < min_words haben (z. B. 5 Wörter).
     
     Args:
@@ -4034,7 +4035,7 @@ def refine_text_pipeline(
     spacy_model_name: spaCy-Modell (z. B. "en_core_web_trf")
     lang_code: LanguageTool-Code (z. B. 'en-US')
     tokenizer_path: Pfad zum Tokenizer
-    min_words: Mindestanzahl Wörter pro Segment (NEU: verhindert zu kurze Segmente)
+    min_words: Mindestanzahl Wörter pro Segment (verhindert zu kurze Segmente)
     
     Returns:
     Tuple[str, Dict]: Pfad zur Ausgabedatei und Entity-Map
@@ -4083,116 +4084,118 @@ def refine_text_pipeline(
             protected_texts.append(protected_text)
             master_entity_map[i] = entity_map
 
-        # Stufe 3: Grammatikkorrektur im BATCH (CPU-parallelisiert)
-        logger.info("Stufe 3/4: Grammatik im Batch korrigieren (parallelisiert)...")
-        corrected_texts = correct_texts_in_parallel(protected_texts, lang_code, LT_PORT)
+    # Stufe 3: Grammatikkorrektur im BATCH (CPU-parallelisiert)
+    logger.info("Stufe 3/4: Grammatik im Batch korrigieren (parallelisiert)...")
+    corrected_texts = correct_texts_in_parallel(protected_texts, lang_code, LT_PORT)
 
-        # Stufe 4: Entitäten wiederherstellen und Daten finalisieren
-        logger.info("Stufe 4/4: Entitäten wiederherstellen und Daten finalisieren...")
-        processed_rows = []
-        for i in range(len(df)):
-            restored_text = restore_entities_final(corrected_texts[i], master_entity_map[i])
-            processed_rows.append({
-                'startzeit': df.iloc[i]['startzeit'],
-                'endzeit': df.iloc[i]['endzeit'],
-                'text': restored_text,
-                'entity_map': _entity_map_to_json_str(master_entity_map[i])
+    # Stufe 4: Entitäten wiederherstellen und Daten finalisieren
+    logger.info("Stufe 4/4: Entitäten wiederherstellen und Daten finalisieren...")
+    processed_rows = []
+    for i in range(len(df)):
+        restored_text = restore_entities_final(corrected_texts[i], master_entity_map[i])
+        processed_rows.append({
+            'startzeit': df.iloc[i]['startzeit'],
+            'endzeit': df.iloc[i]['endzeit'],
+            'text': restored_text,
+            'entity_map': _entity_map_to_json_str(master_entity_map[i])
+        })
+
+    final_df = pd.DataFrame(processed_rows)
+    final_df = ensure_context_closure(final_df)
+    final_df['text'] = final_df['text'].apply(lambda x: (sanitize_for_csv_and_tts_preserve_placeholders(x)))
+
+    # Stufe 5: Ein-Satz-Splitting mit proportionalen Zeitstempeln, Entity-Übertragung und Mindestwort-Merge
+    logger.info(f"Stufe 5/5: Teile Segmente in Ein-Satz-Segmente (mind. {min_words} Wörter) mit proportionalen Zeiten...")
+    split_rows = []
+    for idx, row in final_df.iterrows():
+        # Hole Original-Zeiten und Entity-Map
+        orig_start = parse_time(row['startzeit'])
+        orig_end = parse_time(row['endzeit'])
+        orig_duration = orig_end - orig_start
+        orig_text = row['text']
+        orig_entity_map = _json_str_to_entity_map(row['entity_map'])
+
+        # Splitte in Sätze (verwende englische Variante von split_sentences_german)
+        sentences = split_sentences_german(orig_text)  # Annahme: Funktion arbeitet auch für Englisch
+
+        if len(sentences) == 0:
+            split_rows.append(row.to_dict())  # Leeres Segment: Behalte original
+            continue
+
+        # Proportionale Verteilung: Basierend auf Zeichenlänge
+        total_chars = sum(len(s) for s in sentences)
+        current_time = orig_start
+        temp_segments = []  # Temporäre Liste für Split-Segmente (vor Merge)
+        for j, sentence in enumerate(sentences):
+            sentence_chars = len(sentence)
+            proportion = sentence_chars / total_chars if total_chars > 0 else 1 / len(sentences)
+            sentence_duration = orig_duration * proportion
+            sentence_end = current_time + sentence_duration
+            if j == len(sentences) - 1:
+                sentence_end = orig_end  # Letztes Segment: Exakt zum Original-Ende
+
+            # Entities auf neues Segment übertragen (relative Positionen anpassen)
+            new_entity_map = {}
+            for placeholder, entity_info in orig_entity_map.items():
+                # Passe Start/End relativ zum neuen Satz an
+                rel_start = max(0, entity_info.start - sum(len(s) for s in sentences[:j]))
+                rel_end = rel_start + (entity_info.end - entity_info.start)
+                if rel_start < len(sentence):  # Nur wenn Entity im neuen Satz liegt
+                    new_entity_map[placeholder] = EntityInfo(
+                        text=entity_info.text,
+                        label=entity_info.label,
+                        start=rel_start,
+                        end=rel_end,
+                        language=entity_info.language
+                    )
+
+            temp_segments.append({
+                'startzeit': format_time(current_time),
+                'endzeit': format_time(sentence_end),
+                'text': sentence.strip(),
+                'entity_map': _entity_map_to_json_str(new_entity_map)
             })
+            current_time = sentence_end
 
-        final_df = pd.DataFrame(processed_rows)
-        final_df = ensure_context_closure(final_df)
-        final_df['text'] = final_df['text'].apply(lambda x: (sanitize_for_csv_and_tts_preserve_placeholders(x)))
-
-        # NEU: Stufe 5: Ein-Satz-Splitting mit proportionalen Zeitstempeln, Entity-Übertragung und Mindestwort-Merge
-        logger.info(f"Stufe 5/5: Teile Segmente in Ein-Satz-Segmente (mind. {min_words} Wörter) mit proportionalen Zeiten...")
-        split_rows = []
-        for idx, row in final_df.iterrows():
-            # Hole Original-Zeiten und Entity-Map
-            orig_start = parse_time(row['startzeit'])
-            orig_end = parse_time(row['endzeit'])
-            orig_duration = orig_end - orig_start
-            orig_text = row['text']
-            orig_entity_map = _json_str_to_entity_map(row['entity_map'])
-
-            # Splitte in Sätze (verwende englische Variante von split_sentences_german)
-            sentences = split_sentences_german(orig_text)  # Annahme: Funktion arbeitet auch für Englisch
-
-            if len(sentences) == 0:
-                split_rows.append(row.to_dict())  # Leeres Segment: Behalte original
-                continue
-
-            # Proportionale Verteilung: Basierend auf Zeichenlänge
-            total_chars = sum(len(s) for s in sentences)
-            current_time = orig_start
-            temp_segments = []  # Temporäre Liste für Split-Segmente (vor Merge)
-            for j, sentence in enumerate(sentences):
-                sentence_chars = len(sentence)
-                proportion = sentence_chars / total_chars if total_chars > 0 else 1 / len(sentences)
-                sentence_duration = orig_duration * proportion
-                sentence_end = current_time + sentence_duration
-                if j == len(sentences) - 1:
-                    sentence_end = orig_end  # Letztes Segment: Exakt zum Original-Ende
-
-                # Entities auf neues Segment übertragen (relative Positionen anpassen)
-                new_entity_map = {}
-                for placeholder, entity_info in orig_entity_map.items():
-                    # Passe Start/End relativ zum neuen Satz an
-                    rel_start = max(0, entity_info.start - sum(len(s) for s in sentences[:j]))
-                    rel_end = rel_start + (entity_info.end - entity_info.start)
-                    if rel_start < len(sentence):  # Nur wenn Entity im neuen Satz liegt
-                        new_entity_map[placeholder] = EntityInfo(
-                            text=entity_info.text,
-                            label=entity_info.label,
-                            start=rel_start,
-                            end=rel_end,
-                            language=entity_info.language
-                        )
-
-                temp_segments.append({
-                    'startzeit': format_time(current_time),
-                    'endzeit': format_time(sentence_end),
-                    'text': sentence.strip(),
-                    'entity_map': _entity_map_to_json_str(new_entity_map)
-                })
-                current_time = sentence_end
-
-            # NEU: Post-Splitting-Merge: Kombiniere zu kurze Segmente (< min_words)
-            merged_segments = []
-            current_merged = None
-            for seg in temp_segments:
-                seg_text = seg['text']
-                seg_words = len(seg_text.split())  # Wortanzahl zählen
-                if current_merged is None:
-                    current_merged = seg.copy()  # Starte neuen Merge
+        # Post-Splitting-Merge: Kombiniere zu kurze Segmente (< min_words)
+        merged_segments = []
+        current_merged = None
+        for seg in temp_segments:
+            seg_text = seg['text']
+            seg_words = len(seg_text.split())  # Wortanzahl zählen
+            if current_merged is None:
+                current_merged = seg.copy()  # Starte neuen Merge
+            else:
+                if seg_words < min_words:  # Zu kurz: Merge mit aktuellem
+                    # Text und Entity-Map kombinieren
+                    current_merged['text'] += " " + seg_text
+                    current_merged['entity_map'] = _entity_map_to_json_str({**_json_str_to_entity_map(current_merged['entity_map']), **_json_str_to_entity_map(seg['entity_map'])})
+                    current_merged['endzeit'] = seg['endzeit']  # Endzeit aktualisieren
                 else:
-                    if seg_words < min_words:  # Zu kurz: Merge mit aktuellem
-                        # Text und Entity-Map kombinieren
-                        current_merged['text'] += " " + seg_text
-                        current_merged['entity_map'] = _entity_map_to_json_str({**_json_str_to_entity_map(current_merged['entity_map']), **_json_str_to_entity_map(seg['entity_map'])})
-                        current_merged['endzeit'] = seg['endzeit']  # Endzeit aktualisieren
-                    else:
-                        merged_segments.append(current_merged)  # Speichere abgeschlossenen Merge
-                        current_merged = seg.copy()  # Starte neuen
+                    merged_segments.append(current_merged)  # Speichere abgeschlossenen Merge
+                    current_merged = seg.copy()  # Starte neuen
 
-            if current_merged:  # Letzten Merge hinzufügen
-                merged_segments.append(current_merged)
+        if current_merged:  # Letzten Merge hinzufügen
+            merged_segments.append(current_merged)
 
-            split_rows.extend(merged_segments)  # Zu finaler Liste hinzufügen
-            logger.debug(f"Segment {idx} in {len(sentences)} Sätze gesplittet, nach Merge: {len(merged_segments)} Segmente (mind. {min_words} Wörter).")
+        split_rows.extend(merged_segments)  # Zu finaler Liste hinzufügen
+        logger.debug(f"Segment {idx} in {len(sentences)} Sätze gesplittet, nach Merge: {len(merged_segments)} Segmente (mind. {min_words} Wörter).")
 
-        final_df = pd.DataFrame(split_rows)
-        final_df.to_csv(output_file, sep='|', index=False, encoding='utf-8')
+    final_df = pd.DataFrame(split_rows)
+    final_df.to_csv(output_file, sep='|', index=False, encoding='utf-8')
 
-        total_entities = sum(len(mapping) for mapping in master_entity_map.values())
-        logger.info(f"Hochperformante Text-Veredelung abgeschlossen. {total_entities} Entitäten verarbeitet.")
-        logger.info(f"Ergebnis in: {output_file}")
+    total_entities = sum(len(mapping) for mapping in master_entity_map.values())
+    logger.info(f"Hochperformante Text-Veredelung abgeschlossen. {total_entities} Entitäten verarbeitet.")
+    logger.info(f"Ergebnis in: {output_file}")
 
-        del nlp_model
-        del punctuation_model
-        del tokenizer
-        comprehensive_gpu_cleanup()
+    del nlp_model
+    del punctuation_model
+    del tokenizer
+    time.sleep(2)
+    comprehensive_gpu_cleanup()
+    time.sleep(2)
 
-        return output_file, master_entity_map
+    return output_file, master_entity_map
 
 def refine_text_batch(batch: Dict[str, List], nlp_model, lt_tool, punctuation_model) -> Dict[str, List[str]]:
     """
@@ -4342,7 +4345,7 @@ def validate_entity_pipeline(
 def format_for_tts_splitting(
     input_file: str,
     output_file: str,
-    target_char_range: Tuple[int, int] = (100, 210),
+    target_char_range: Tuple[int, int] = (100, 200),
     min_words_for_final_segment: int = 3
 ) -> str:
     """
@@ -5004,7 +5007,9 @@ def text_to_speech_with_voice_cloning(
                 model=xtts_model,
                 tensor_parallel={"tp_size": 1},
                 dtype=torch.float32,
-                replace_with_kernel_inject=False
+                replace_with_kernel_inject=False,
+                use_triton=False,
+                triton_autotune=False
             )
             optimized_tts_model = ds_engine.module
             logger.info("✅ DeepSpeed erfolgreich initialisiert")
@@ -5523,6 +5528,7 @@ def main():
         if not refined_transcription_path:
             logger.error("Veredelung der Transkription fehlgeschlagen."); return
         comprehensive_gpu_cleanup()
+        time.sleep(2)
 
         # SCHRITT 3: ÜBERSETZUNG MIT OLLAMA
         translation_file_path, cleaned_source_path = translate_segments_optimized_safe(
@@ -5563,7 +5569,7 @@ def main():
         tts_formatted_file = format_for_tts_splitting(
             input_file=refined_translation_path,
             output_file=TTS_FORMATTED_TRANSLATION_FILE,
-            target_char_range=(150, 230),  # Optimale Länge: 150, Maximale Länge: 230
+            target_char_range=(150, 200),  # Optimale Länge: 150, Maximale Länge: 200
             min_words_for_final_segment=3
             )
         text_to_speech_with_voice_cloning(
