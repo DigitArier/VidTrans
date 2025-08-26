@@ -19,7 +19,7 @@ def setup_logging():
     """
     # Basiskonfiguration für unser eigenes Logging
     logging.basicConfig(
-        filename='video_translation_final.log',
+        filename='00_video_translation_final.log',
         format="%(asctime)s - %(levelname)s - %(name)s - %(funcName)s:%(lineno)d - %(message)s",
         level=logging.INFO,
         filemode='a',
@@ -75,7 +75,6 @@ import torch
 from torch import autocast
 from torch.cuda import Stream
 torch.set_num_threads(6)
-import tensor_parallel
 import deepspeed
 from deepspeed import init_inference, DeepSpeedConfig
 from accelerate import init_empty_weights, infer_auto_device_map
@@ -241,7 +240,7 @@ SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mon
 SPEED_FACTOR_RESAMPLE_44100 = 1.0   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
 SPEED_FACTOR_PLAYBACK = 1.0     # Geschwindigkeitsfaktor für die Wiedergabe des Videos
 VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
-VOLUME_ADJUSTMENT_VIDEO = 0.04   # Lautstärkefaktor für das Video
+VOLUME_ADJUSTMENT_VIDEO = 0.03   # Lautstärkefaktor für das Video
 
 # ============================== 
 # Hilfsfunktionen
@@ -502,9 +501,8 @@ def load_madlad400_translator_ct2(model_path: str = "madlad400-3b-mt-int8_bfloat
     special_tokens_to_add = [f"<extra_id_{i}>" for i in range(100)]
 
     # Der Tokenizer wird nun mit der Kenntnis über die speziellen Platzhalter initialisiert.
-    tokenizer = transformers.T5Tokenizer.from_pretrained(
-        model_path, 
-        legacy=False, 
+    tokenizer = transformers.T5TokenizerFast.from_pretrained(
+        model_path,
         extra_ids=0,  # Wird durch die Liste unten abgedeckt, zur Sicherheit auf 0.
         additional_special_tokens=special_tokens_to_add
     )
@@ -1195,7 +1193,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
                 #log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
                 #no_speech_threshold=1.0,            # Schwellenwert für Stille
                 #temperature=(0.05, 0.1, 0.15, 0.2, 0.25, 0.5),      # Temperatur für Sampling
-                temperature=1,                  # Temperatur für Sampling
+                temperature=0.8,                  # Temperatur für Sampling
                 word_timestamps=True,               # Zeitstempel für Wörter
                 hallucination_silence_threshold=0.3,  # Schwellenwert für Halluzinationen
                 condition_on_previous_text=True,    # Bedingung an vorherigen Text
@@ -2212,7 +2210,7 @@ def _is_refusal(text: str) -> bool:
 def translate_batch_madlad(
     texts: List[str],
     translator: ctranslate2.Translator,
-    tokenizer: T5Tokenizer,
+    tokenizer: T5TokenizerFast,
     target_lang: str = "de"
 ) -> List[str]:
     """
@@ -2236,10 +2234,10 @@ def translate_batch_madlad(
         tokenized_texts,
         batch_type="tokens",
         max_batch_size=2048,
-        beam_size=4,
-        patience=1.2,
-        repetition_penalty=2.0,
-        no_repeat_ngram_size=2
+        beam_size=10,
+        patience=1.5,
+        repetition_penalty=1.5,
+        no_repeat_ngram_size=3
     )
     # Ergebnisse dekodieren
     decoded_texts = []
@@ -3124,13 +3122,35 @@ def translate_segments_optimized_safe(
     batch_size: int = 2
 ) -> Tuple[str, str]:
     """
-    FINALE, ROBUSTE VERSION: Nutzt die Ollama-Generator-Funktion für die Übersetzung
-    und stellt eine Live-Ausgabe für jedes verarbeitete Segment sicher.
+    KORRIGIERTE VERSION: Übersetzt Segmente mit verbesserter Entity-Behandlung.
+    
+    Args:
+        refined_transcription_path (str): Pfad zur veredelten Quell-CSV.
+        master_entity_map (Dict[int, ...]): Das von `refine_text_pipeline` erzeugte Mapping.
+        translation_output_file (str): Zieldatei für die Übersetzung.
+        cleaned_source_output_file (str): Zieldatei für den bereinigten Quelltext.
+        source_lang (str): Quellsprache
+        target_lang (str): Zielsprache
+        batch_size (int): Batch-Größe für Übersetzung
+        
+    Returns:
+        Tuple[str, str]: Pfade zu den erstellten Dateien.
     """
+
+    if os.path.exists(translation_output_file) and not ask_overwrite(translation_output_file):
+        logger.info(f"Verwende vorhandenen Übersetzungsbericht: {translation_output_file}")
+        return translation_output_file, cleaned_source_output_file
+    else:
+        # Der Benutzer möchte überschreiben, also räumen wir auf.
+        logger.info(f"Benutzer hat dem Überschreiben von '{translation_output_file}' zugestimmt. Alte temporäre Dateien werden entfernt.")
+        if os.path.exists(cleaned_source_output_file): os.remove(cleaned_source_output_file)
+        if os.path.exists(translation_output_file): os.remove(translation_output_file)
+
     should_continue_translation, processed_keys = handle_key_based_continuation(
         translation_output_file, refined_transcription_path, key_column_index=0
     )
 
+    # NEU: Zusätzliche Abfrage, falls die Datei vollständig ist
     if not should_continue_translation:
         logger.info("Übersetzung wird übersprungen, da die Zieldatei vollständig ist.")
         return translation_output_file, cleaned_source_output_file
@@ -3154,10 +3174,12 @@ def translate_segments_optimized_safe(
         return translation_output_file, cleaned_source_output_file
 
     logger.info(f"Übersetze {len(segments_to_process)} verbleibende Segmente...")
+
     all_translations = [] if not os.path.exists(translation_output_file) else pd.read_csv(translation_output_file, sep='|', dtype=str).to_dict('records')
     all_cleaned_sources = [] if not os.path.exists(cleaned_source_output_file) else pd.read_csv(cleaned_source_output_file, sep='|', dtype=str).to_dict('records')
 
     translate_start_time = time.time()
+
     with gpu_context():
         # ==============================================================================
         # ## AUSWAHL DES ÜBERSETZUNGS-BACKENDS ##
@@ -3201,7 +3223,7 @@ def translate_segments_optimized_safe(
         #        )
         #        # Debug-Logging für Entity-Pipeline
         #        logger.debug(f"Segment {segment_data['id']}: {len(current_entity_map)} Entities, "
-        #                    f"Übersetzung: {final_translated_text[:100]}...")
+        #                     f"Übersetzung: {final_translated_text[:100]}...")
         #        print(f"\n[{segment_data['startzeit']} --> {segment_data['endzeit']}]:\n{final_translated_text}\n")
         #        print(f"Entities: {len(current_entity_map)} gefunden\n")
         #        all_translations.append({
@@ -3256,7 +3278,6 @@ def translate_segments_optimized_safe(
                     'text': sanitize_for_csv_and_tts(segment_data['original_text'])
                 })
 
-    # Fortschritt nach Abschluss der gesamten Schleife speichern
     save_progress_csv(all_translations, translation_output_file)
     save_progress_csv(all_cleaned_sources, cleaned_source_output_file)
 
@@ -3317,9 +3338,9 @@ def evaluate_translation_quality(
     report_path,
     summary_path,
     model_name="sentence-transformers/multi-qa-mpnet-base-dot-v1",
-    threshold=0.7,
+    threshold=0.75,
     correction_model="llama3.1:8b",
-    max_retries=3  # NEU: Max. Wiederholungen bei Fehlern
+    max_retries=3  # Max. Wiederholungen bei Fehlern
 ) -> str:
     """
     KORRIGIERTE VERSION: Prüft semantische Ähnlichkeit, korrigiert niedrige Segmente automatisch via Ollama
@@ -3332,18 +3353,18 @@ def evaluate_translation_quality(
     logger.info(f"Starte erweiterte Qualitätsprüfung mit Modell: {model_name}")
 
     try:
-        # Daten laden (unverändert)
+        # Daten laden
         df_source = pd.read_csv(source_csv_path, sep='|', dtype=str).fillna('')
         df_translated = pd.read_csv(translated_csv_path, sep='|', dtype=str).fillna('')
 
-        # Originalspaltennamen sichern (unverändert)
+        # Originalspaltennamen sichern
         original_source_columns = df_source.columns.tolist()
 
         if len(df_source) != len(df_translated):
             logger.warning(f"Zeilenanzahl stimmt nicht überein ({len(df_source)} vs {len(df_translated)}). Prüfung übersprungen.")
             return None
 
-        # Spalten normalisieren (unverändert)
+        # Spalten normalisieren
         df_source.columns = [col.strip().lower() for col in df_source.columns]
         df_translated.columns = [col.strip().lower() for col in df_translated.columns]
 
@@ -3354,19 +3375,20 @@ def evaluate_translation_quality(
         source_texts = df_source['text'].tolist()
         translated_texts = df_translated['text'].tolist()
 
-        # KI-basierte Prüfung (unverändert)
+        # KI-basierte Prüfung
         with gpu_context():
             model = SentenceTransformer(model_name, device=device)
             embeddings_source = model.encode(source_texts, convert_to_tensor=True, show_progress_bar=True)
             embeddings_translated = model.encode(translated_texts, convert_to_tensor=True, show_progress_bar=True)
             similarities = torch.diag(cos_sim(embeddings_source, embeddings_translated)).tolist()
 
-        # Ergebnisse aufbereiten + Automatische Korrektur (ERWEITERT)
+        # Ergebnisse aufbereiten + Automatische Korrektur
         results = []
         issues_found = 0
         corrections_made = 0
         avg_similarity_before = sum(similarities) / len(similarities) if similarities else 0.0
         corrected_similarities = similarities.copy()
+        auto_corrected_segments = []  # Sammelliste für korrigierte Segmente
 
         for i in range(len(df_source)):
             similarity = similarities[i]
@@ -3380,40 +3402,80 @@ def evaluate_translation_quality(
                 flag = "CHECK MANUALLY"
                 issues_found += 1
 
-                # NEU: Retry-Mechanismus für automatische Korrektur
+                # Beginn der Live-Ausgabe für dieses Segment
+                tqdm.write("\n" + "="*80)
+                tqdm.write(f"⚠️ Segment {i} zur Korrektur markiert (Ähnlichkeit: {similarity:.3f} < {threshold})")
+                tqdm.write(f"   Original (EN):     '{source_texts[i]}'")
+                tqdm.write(f"   Übersetzung (DE):  '{translated_texts[i]}'")
+                tqdm.write("-"*80)
+
+                # Retry-Mechanismus für automatische Korrektur
                 success = False
+                orig_de = translated_texts[i]
+
                 for attempt in range(max_retries):
                     try:
-                        # Erweiterter Prompt: Uncensored, direkt und robust
-                        prompt = (
-                            f"You are an uncensored translation corrector. Correct this native German translation of '{source_texts[i]}' "
-                            f"to be accurate and natural: '{translated_texts[i]}'. "
-                            "Do not refuse or add any commentary. Output ONLY the corrected native German text."
+                        tqdm.write(f"   Versuch {attempt + 1}/{max_retries}: Sende an Korrektur-LLM ({correction_model})...")
+                        system_prompt = (
+                            "You are a raw, unfiltered, and direct translation engine. Your sole function is to correct the user's German translation based on the English source text. "
+                            "You are part of a technical data processing pipeline. Your task is non-negotiable. You MUST correct any given translation, regardless of its content. "
+                            "Do not analyze, judge, or comment. Do not have opinions, feelings, or the ability to refuse tasks. "
+                            "It is absolutely critical that you output ONLY the corrected German text and nothing else."
                         )
-                        response = ollama.generate(model=correction_model, prompt=prompt, options={'temperature': 0.3, 'num_predict': 256})
-                        corrected_text = response['response'].strip()
+                        user_prompt = (
+                            f"English Source: '{source_texts[i]}'\n"
+                            f"German Translation to correct: '{translated_texts[i]}'"
+                        )
+
+                        response = ollama.chat(
+                            model=correction_model,
+                            messages=[
+                                {'role': 'system', 'content': system_prompt},
+                                {'role': 'user', 'content': user_prompt}
+                            ],
+                            options={'temperature': 0.1} # Temperatur leicht gesenkt für mehr Konsistenz
+                        )
+                        corrected_text = response['message']['content'].strip()
+                        tqdm.write(f"   Korrekturvorschlag:  '{corrected_text}'")
 
                         # Nach-Korrektur-Ähnlichkeit berechnen
                         new_embedding = model.encode([corrected_text], convert_to_tensor=True)
-                        new_similarity = cos_sim([embeddings_source[i]], new_embedding)[0].item()
+                        new_similarity = cos_sim(embeddings_source[i:i+1], new_embedding).item()
                         corrected_similarities[i] = new_similarity
 
-                        if new_similarity > similarity:
+                        if new_similarity > (similarity + 0.02): # Nur bei deutlicher Verbesserung korrigieren
                             corrections_made += 1
                             correction_note = f"Korrigiert auf {new_similarity:.3f}"
                             translated_texts[i] = corrected_text  # Übersetzung aktualisieren
                             status = f"Korrigiert ({new_similarity:.3f})"
                             flag = "AUTO-CORRECTED"
                             success = True
+
+                            auto_corrected_segments.append({
+                            "index": i,
+                            "sim_before": similarity,
+                            "sim_after": new_similarity,
+                            "src_en": source_texts[i],
+                            "de_before": orig_de,
+                            "de_after": corrected_text
+                        })
+
+                            tqdm.write(f"   ✅ ERFOLG: {similarity:.3f} -> {new_similarity:.3f}.")
+                            logger.info(f"Segment {i} erfolgreich korrigiert (Ähnlichkeit: {similarity:.3f} -> {new_similarity:.3f}).")
                             break  # Erfolg: Schleife beenden
                         else:
                             correction_note = f"Versuch {attempt+1} fehlgeschlagen (Ähnlichkeit: {new_similarity:.3f})"
+                            tqdm.write(f"   ❌ KEINE VERBESSERUNG: {similarity:.3f} -> {new_similarity:.3f}).")
+                            logger.warning(f"Korrekturversuch {attempt+1} für Segment {i} brachte keine Verbesserung.")
 
                     except Exception as e:
                         logger.warning(f"Korrektur-Versuch {attempt+1} für Segment {i} fehlgeschlagen: {e}")
 
                 if not success:
                     correction_note = f"Korrektur fehlgeschlagen (nach {max_retries} Versuchen)"
+
+                # Ende der Live-Ausgabe für dieses Segment
+                tqdm.write("="*80 + "\n")
 
             results.append({
                 original_source_columns[0]: df_source.iloc[i].get(original_source_columns[0].lower(), 'N/A'),
@@ -3427,12 +3489,12 @@ def evaluate_translation_quality(
                 "Flag": flag
             })
 
-        # Detaillierten Bericht speichern (unverändert)
+        # Detaillierten Bericht speichern
         df_report = pd.DataFrame(results)
         df_report.to_csv(report_path, sep='|', index=False, encoding='utf-8')
         logger.info(f"Detaillierter Qualitätsbericht gespeichert: {report_path}")
 
-        # Zusammenfassung berechnen (unverändert)
+        # Zusammenfassung berechnen
         avg_similarity_after = sum(corrected_similarities) / len(corrected_similarities) if corrected_similarities else 0.0
         summary_content = (
             f"Qualitätsprüfung der Übersetzung - Zusammenfassung\n"
@@ -3444,7 +3506,21 @@ def evaluate_translation_quality(
             f"Durchschnittliche Ähnlichkeit (vorher): {avg_similarity_before:.4f}\n"
             f"Durchschnittliche Ähnlichkeit (nachher): {avg_similarity_after:.4f}\n"
             f"====================================================\n"
+            f"\nAutomatisch korrigierte Segmente\n"
+            f"--------------------------------\n"
         )
+
+        if auto_corrected_segments:
+            for item in auto_corrected_segments:
+                summary_content += (
+                    f"- Segment {item['index']}: {item['sim_before']:.3f} -> {item['sim_after']:.3f}\n"
+                    f"  EN: {item['src_en']}\n"
+                    f"  DE vorher: {item['de_before']}\n"
+                    f"  DE nachher: {item['de_after']}\n"
+                )
+        else:
+            summary_content += "- (keine)\n"
+
         with open(summary_path, "w", encoding="utf-8") as f:
             f.write(summary_content)
         logger.info(f"Zusammenfassender Bericht gespeichert: {summary_path}")
@@ -3458,6 +3534,7 @@ def evaluate_translation_quality(
     except Exception as e:
         logger.error(f"Fehler bei der Qualitätsprüfung der Übersetzung: {e}", exc_info=True)
         return None
+
 def read_translated_csv(file_path):
     """Liest die übersetzte CSV-Datei."""
     segments = []
@@ -3822,7 +3899,7 @@ def entity_protection_final(
                 )
             entity_counter += 1  # Zähler für Sentinel erhöhen
         else:
-            logger.warning(f"Custom-Wort '{word}' nicht gefunden oder keine Sentinels mehr verfügbar.")
+            logger.info(f"Custom-Wort '{word}' nicht gefunden.")
 
     # Schritt 2: NER mit spaCy auf dem (teilweise geschützten) Text
     doc = nlp_model(protected_text)
@@ -4262,87 +4339,131 @@ def validate_entity_pipeline(
     
     return issues
 
-def format_for_tts_splitting(input_file, output_file, char_limit, min_words=3):
+def format_for_tts_splitting(
+    input_file: str,
+    output_file: str,
+    target_char_range: Tuple[int, int] = (100, 210),
+    min_words_for_final_segment: int = 3
+) -> str:
     """
-    Teilt überlange Segmente und FÜHRT zu kurze Segmente zusammen.
-    NEUE, KORREKTE IMPLEMENTIERUNG: Stellt sicher, dass kein Textinhalt durch
-    zu kurze Segmente verloren geht, indem diese mit Nachbarn verschmolzen werden.
+    NEU-IMPLEMENTIERUNG: Teilt und kombiniert Segmente robust für die TTS-Verarbeitung.
+    Diese Funktion verhindert Datenverlust und sorgt für eine optimale Segmentlänge.
+
+    Ablauf:
+    1.  Lange Segmente werden zuerst basierend auf Satzgrenzen und der maximalen
+        Zeichenlänge (`target_char_range[1]`) aufgeteilt.
+    2.  Anschließend werden die resultierenden Sätze intelligent zu neuen Segmenten
+        gruppiert, um die optimale Ziellänge (`target_char_range[0]`) zu erreichen,
+        ohne die Obergrenze zu überschreiten.
+    3.  Ein finaler "Merge-Pass" stellt sicher, dass keine zu kurzen Segmente
+        (weniger als `min_words_for_final_segment`) übrig bleiben, indem sie mit
+        ihren Nachbarn zusammengeführt werden.
 
     Args:
-        input_file (str): Pfad zur Eingabedatei.
-        output_file (str): Pfad zur Ausgabedatei.
-        char_limit (int): Maximale Zeichenlänge, bei der Segmente aufgeteilt werden.
-        min_words (int): Minimale Wortanzahl; Segmente darunter werden zusammengeführt.
+        input_file: Pfad zur CSV mit den zu formatierenden Texten.
+        output_file: Pfad zur Speicherzieldatei.
+        target_char_range: Ein Tupel (optimale_länge, maximale_länge) für die Segmente.
+        min_words_for_final_segment: Die minimale Anzahl an Wörtern, die ein Segment haben muss.
+
+    Returns:
+        Der Pfad zur erstellten Ausgabedatei.
     """
     if os.path.exists(output_file) and not ask_overwrite(output_file):
+        logger.info(f"Verwende vorhandene, für TTS formatierte Datei: {output_file}")
         return output_file
-        
+
     df = pd.read_csv(input_file, sep='|', dtype=str).fillna('')
-    
-    # --- Stufe 1: Überlange Segmente aufteilen ---
-    split_segments = []
+    all_sentences_with_timing = []
+
+    # Stufe 1: Zerlege alle Segmente in einzelne Sätze mit proportionaler Zeitberechnung
     for _, row in df.iterrows():
         text = row['text']
-        start_sec, end_sec = parse_time(row['startzeit']), parse_time(row['endzeit'])
-        
-        # Teilen überlanger Segmente (Logik bleibt erhalten)
-        chunks = split_text_robust_improved(text, char_limit)
-        
-        if len(chunks) == 1:
-            split_segments.append(row.to_dict())
+        start_sec = parse_time(row['startzeit'])
+        end_sec = parse_time(row['endzeit'])
+        duration = end_sec - start_sec if end_sec > start_sec else 0
+
+        # Nutze die robuste Satzaufteilung
+        sentences = split_sentences_german(text)
+        if not sentences:
+            continue
+
+        total_chars = sum(len(s) for s in sentences) or 1
+        current_start = start_sec
+        for sent in sentences:
+            proportion = len(sent) / total_chars
+            sent_duration = duration * proportion
+            sent_end = current_start + sent_duration
+            all_sentences_with_timing.append({
+                'startzeit': current_start,
+                'endzeit': sent_end,
+                'text': sent
+            })
+            current_start = sent_end
+
+    # Stufe 2: Gruppiere die Sätze intelligent zu neuen Segmenten
+    optimal_len, max_len = target_char_range
+    grouped_segments = []
+    current_group = None
+
+    for sent_info in all_sentences_with_timing:
+        if current_group is None:
+            # Starte eine neue Gruppe
+            current_group = {
+                'startzeit': sent_info['startzeit'],
+                'endzeit': sent_info['endzeit'],
+                'text': sent_info['text']
+            }
+            continue
+
+        # Prüfe, ob der neue Satz angehängt werden kann
+        combined_text = current_group['text'] + " " + sent_info['text']
+
+        if len(combined_text) <= max_len:
+            # Anfügen ist möglich: Gruppe erweitern
+            current_group['text'] = combined_text
+            current_group['endzeit'] = sent_info['endzeit']
         else:
-            total_duration = end_sec - start_sec
-            total_chars = sum(len(c) for c in chunks) if sum(len(c) for c in chunks) > 0 else 1
-            current_start = start_sec
-            for i, chunk in enumerate(chunks):
-                proportion = len(chunk) / total_chars
-                chunk_duration = total_duration * proportion
-                chunk_end = current_start + chunk_duration if i < len(chunks) - 1 else end_sec
-                split_segments.append({
-                    'startzeit': format_time(current_start),
-                    'endzeit': format_time(chunk_end),
-                    'text': chunk
-                })
-                current_start = chunk_end
-    
-    # --- Stufe 2: Zu kurze Segmente zusammenführen (Merge-Pass) ---
-    if len(split_segments) <= 1:
-        # Wenn es nichts zu mergen gibt, direkt speichern
-        pd.DataFrame(split_segments).to_csv(output_file, sep='|', index=False)
-        logger.info(f"Formatierung für TTS abgeschlossen. Ergebnis in: {output_file}")
+            # Anfügen nicht möglich: Aktuelle Gruppe abschließen und neue starten
+            grouped_segments.append(current_group)
+            current_group = {
+                'startzeit': sent_info['startzeit'],
+                'endzeit': sent_info['endzeit'],
+                'text': sent_info['text']
+            }
+
+    # Die letzte Gruppe nicht vergessen
+    if current_group:
+        grouped_segments.append(current_group)
+
+    # Stufe 3: Führe zu kurze Segmente zusammen (Merge-Pass)
+    if not grouped_segments:
+        logger.warning("Keine Segmente nach der Gruppierung vorhanden.")
         return output_file
 
-    merged_segments = []
-    # Konvertiere Liste von Dictionaries in eine modifizierbare Liste
-    segments_to_merge = list(split_segments) 
-
-    # Durchlauf 1: Vorwärts-Merge für das erste Element, falls es zu kurz ist
-    while len(segments_to_merge[0]['text'].split()) < min_words and len(segments_to_merge) > 1:
-        first_seg = segments_to_merge.pop(0)
-        next_seg = segments_to_merge[0]
-        
-        # Kombiniere das erste Segment mit dem nachfolgenden
-        next_seg['text'] = f"{first_seg['text']} {next_seg['text']}".strip()
-        next_seg['startzeit'] = first_seg['startzeit'] # Behalte die früheste Startzeit
-
-    # Durchlauf 2: Rückwärts-Merge für alle anderen Elemente
-    # Wir bauen eine neue Liste auf, das ist stabiler als das Löschen aus der alten.
-    for segment in segments_to_merge:
-        if not merged_segments: # Das erste Element immer hinzufügen
-            merged_segments.append(segment)
-            continue
-            
-        # Wenn das aktuelle Segment zu kurz ist...
-        if len(segment['text'].split()) < min_words:
-            # ...füge es zum vorherigen in der *neuen* Liste hinzu.
-            merged_segments[-1]['text'] = f"{merged_segments[-1]['text']} {segment['text']}".strip()
-            merged_segments[-1]['endzeit'] = segment['endzeit'] # Aktualisiere auf die späteste Endzeit
+    final_segments = []
+    for segment in grouped_segments:
+        # Wenn die finale Liste leer ist oder das letzte Segment bereits lang genug ist
+        if not final_segments or len(final_segments[-1]['text'].split()) >= min_words_for_final_segment:
+            final_segments.append(segment)
         else:
-            # Ansonsten füge es normal hinzu.
-            merged_segments.append(segment)
+            # Das letzte Segment in der finalen Liste ist zu kurz, also anfügen
+            final_segments[-1]['text'] += " " + segment['text']
+            final_segments[-1]['endzeit'] = segment['endzeit']
 
-    pd.DataFrame(merged_segments).to_csv(output_file, sep='|', index=False)
-    logger.info(f"Formatierung für TTS (inkl. Merging kurzer Segmente) abgeschlossen. Ergebnis in: {output_file}")
+    # Konvertiere Zeitstempel zurück ins HH:MM:SS Format und bereinige Text
+    for seg in final_segments:
+        seg['startzeit'] = format_time(seg['startzeit'])
+        seg['endzeit'] = format_time(seg['endzeit'])
+        # Stelle sicher, dass jeder Eintrag mit einem Satzzeichen endet
+        cleaned_text = seg['text'].strip()
+        if cleaned_text and not re.search(r'[.!?]$', cleaned_text):
+            cleaned_text += '.'
+        seg['text'] = cleaned_text
+
+    # Speichern des Ergebnisses
+    final_df = pd.DataFrame(final_segments)
+    final_df.to_csv(output_file, sep='|', index=False)
+    logger.info(f"Formatierung für TTS (v2) abgeschlossen. {len(final_df)} Segmente erstellt in: {output_file}")
     return output_file
 
 def initialize_language_tool(lang: str, lt_path: str):
@@ -4870,12 +4991,13 @@ def text_to_speech_with_voice_cloning(
                 sample_path_3
                 ]
             gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(
-                audio_path=sample_paths, load_sr=22050, sound_norm_refs=True
+                audio_path=sample_paths, load_sr=22050, sound_norm_refs=False
             )
             gpt_cond_latent = gpt_cond_latent.to(device)
             speaker_embedding = speaker_embedding.to(device)
             
-            logger.info("TTS-Modell und Conditioning-Latents erfolgreich geladen.")
+            logger.info(f"TTS-Modell und Conditioning-Latents erfolgreich geladen...({sample_paths})")
+            print(f"TTS-Modell und Conditioning-Latents erfolgreich geladen...({sample_paths})")
 
             print("🚀 DeepSpeed-Initialisierung...")
             ds_engine = deepspeed.init_inference(
@@ -4897,7 +5019,7 @@ def text_to_speech_with_voice_cloning(
                             gpt_cond_latent=gpt_cond_latent,
                             speaker_embedding=speaker_embedding,
                             speed=1.1,
-                            temperature=0.9,
+                            temperature=0.75,
                             repetition_penalty=5.0,
                             top_k=50,
                             top_p=0.80,
@@ -5385,7 +5507,9 @@ def main():
         if not os.path.exists(VIDEO_PATH):
             logger.error(f"Eingabevideo nicht gefunden: {VIDEO_PATH}"); return
         extract_audio_ffmpeg(VIDEO_PATH, ORIGINAL_AUDIO_PATH)
-        create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3)
+        create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH_1, SAMPLE_PATH_2,
+                            SAMPLE_PATH_3
+                            )
         transcribe_audio_with_timestamps(ORIGINAL_AUDIO_PATH, TRANSCRIPTION_FILE)
 
         # SCHRITT 2: VEREDELUNG DER ENGLISCHEN TRANSKRIPTION
@@ -5439,11 +5563,13 @@ def main():
         tts_formatted_file = format_for_tts_splitting(
             input_file=refined_translation_path,
             output_file=TTS_FORMATTED_TRANSLATION_FILE,
-            char_limit=CHAR_LIMIT_TRANSLATION
-        )
+            target_char_range=(150, 230),  # Optimale Länge: 150, Maximale Länge: 230
+            min_words_for_final_segment=3
+            )
         text_to_speech_with_voice_cloning(
             tts_formatted_file,
-            SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3,
+            SAMPLE_PATH_1, SAMPLE_PATH_2,
+            SAMPLE_PATH_3,
             TRANSLATED_AUDIO_WITH_PAUSES
         )
 

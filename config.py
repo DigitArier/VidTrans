@@ -1,12 +1,12 @@
 # Dateipfade
-VIDEO_PATH = "Scariest Paranormal Videos That'll Shut Up All The Skeptics 100_- Deep Dive _Full-HD.mp4"
-FINAL_VIDEO_PATH = "Forbidden Inventions That Were Erased From History to Fall Asleep to_Full-HD_deutsch.mp4"
+VIDEO_PATH = "its Worse than You think full documentary.mp4"
+FINAL_VIDEO_PATH = "its Worse than You think full documentary_deutsch.mp4"
 ORIGINAL_AUDIO_PATH = "00_original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
-SAMPLE_PATH_1 = "asleep_sample-01.wav"
-SAMPLE_PATH_2 = "asleep_sample-02.wav"
-SAMPLE_PATH_3 = "asleep_sample-03.wav"
+SAMPLE_PATH_1 = "servant_sample-01.wav"
+SAMPLE_PATH_2 = "servant_sample-02.wav"
+SAMPLE_PATH_3 = "servant_sample-03.wav"
 #SAMPLE_PATH_4 = "gibson_sample-04.wav"
 #SAMPLE_PATH_5 = "papa_sample-05.wav"
 SPEECH_TIMESTAMPS = "speech_timestamps.json"
@@ -15,6 +15,7 @@ ONLY_SPEECH = "only_speech.wav"
 SAMPLING_RATE_VAD = 16000   
 #Transkription
 TRANSCRIPTION_FILE = "01_transcription.csv"
+REFINED_TRANSCRIPTION_FILE = "04a_refined_transcription.csv"
 TRANSCRIPTION_CLEANED = "02_transcription_cleaned.csv"
 PUNCTED_TRANSCRIPTION_FILE = "03_puncted_transcription.csv"
 CORRECTED_TRANSCRIPTION_FILE = "corrected_transcription.csv"
@@ -31,6 +32,7 @@ MIN_WORDS = 10 # Minimale Anzahl an Wörtern pro Segment
 ITERATIONS = 3 # Durchläufe
 #Translation
 TRANSLATION_FILE = "05_translation.csv"
+REFINED_TRANSLATION_FILE = "07a_refined_translation.csv"
 MERGED_TRANSLATION_FILE = "06_merged_translation.csv"
 REPAIRED_TRANSLATION_FILE = "repaired_translation_file.csv"
 CLEAN_TRANSLATION_FILE = "clean_translation.csv"
@@ -45,14 +47,15 @@ MAX_CHARS_TRANSLATION = 200 # Maximale Anzahl an Zeichen pro Segment
 MIN_WORDS_TRANSLATION = 7 # Minimale Anzahl an Wörtern pro Segment
 ITERATIONS_TRANSLATION = 3 # Durchläufe
 #Quality_Report
-ST_QUALITY_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+ST_QUALITY_MODEL = "sentence-transformers/multi-qa-mpnet-base-dot-v1"
 TRANSLATION_QUALITY_REPORT = "07_translation_quality_report.csv"
+TRANSLATION_QUALITY_SUMMARY = "translation_quality_summary.txt"
 CLEANED_SOURCE_FOR_QUALITY_CHECK = "04_cleaned_source_for_quality_check.csv"
 ST_EMBEDDING_MODEL_DE = 'sentence-transformers/distiluse-base-multilingual-cased-v2'
 EMBEDDINGS_FILE_NPZ = "08_german_text_embeddings.npz"
 TRANSLATION_WITH_EMBEDDINGS_CSV = "08_german_text_embeddings.csv"
 # Schwellenwert für die Kosinus-Ähnlichkeit (experimentell bestimmen, z.B. 0.6 - 0.8)
-SIMILARITY_THRESHOLD = 0.7
+SIMILARITY_THRESHOLD = 0.75
 #TTS
 TTS_TEMP_CHUNKS_DIR = "tts_temp_chunks"
 TTS_PROGRESS_MANIFEST = "tts_progress_manifest.csv"
@@ -64,21 +67,41 @@ USE_ONNX_VAD = True
 BOS_TOKEN_ID = 0
 EOS_TOKEN_ID = 1
 PAD_TOKEN_ID = 2
+# ---------------------------------
+# NLLB-200 Einstellungen
+# ---------------------------------
+NLLB_MODEL_DIR = "nllb-200-1.3B-bfloat16"   # Pfad zum konvertierten CT2-Modell
+NLLB_BATCH_MAX_TOKENS = 2048               # konservativ für RTX-40-Laptop-8 GB
+# ---------- OpenVoice Settings ----------
+OV_BASE_SPEAKER_CFG = "openvoice/checkpoints/base_speakers/EN/config.json"
+OV_BASE_SPEAKER_CKPT = "openvoice/checkpoints/base_speakers/EN/checkpoint.pth"
+OV_CONVERTER_CFG     = "openvoice/checkpoints/converter/config.json"
+OV_CONVERTER_CKPT    = "openvoice/checkpoints/converter/checkpoint.pth"
+# Liste zulässiger Emotionen laut OpenVoice-Demo[19]
+OV_ALLOWED_EMOTIONS = [
+    "default", "whispering", "shouting", "excited",
+    "cheerful", "terrified", "angry", "sad", "friendly"
+]
+
+# Vocoderpfade für XTTS
 vocoder_pth = r"D:\Modelle\Vocoder\bigvgan_v2_24khz_100band_256x\bigvgan_generator.pt"
 vocoder_cfg = r"D:\Modelle\Vocoder\bigvgan_v2_24khz_100band_256x\config.json"
+
 # Sentence Transformer Modell-Konfiguration
 SENTENCE_TRANSFORMER_MODELS = {
     "quality": "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+    "quality_neu": "sentence-transformers/multi-qa-mpnet-base-dot-v1",
+    "quality_big": "intfloat/multilingual-e5-large",
     "embedding": "sentence-transformers/distiluse-base-multilingual-cased-v2", 
     "speed": "sentence-transformers/all-MiniLM-L6-v2",
     "latest": "Alibaba-NLP/gte-large-en-v1.5"
 }
 
-# Globale 2-Wort-Grenze gegen Ein-Wort-Segmente
-MIN_WORDS_GLOBAL = 2
+# Globale 4-Wort-Grenze gegen Ein-Wort-Segmente
+MIN_WORDS_GLOBAL = 4
 
 # Standard-Modelle für verschiedene Aufgaben
-ST_QUALITY_MODEL = SENTENCE_TRANSFORMER_MODELS["quality"]
+ST_QUALITY_MODEL = SENTENCE_TRANSFORMER_MODELS["quality_neu"]
 ST_EMBEDDING_MODEL_DE = SENTENCE_TRANSFORMER_MODELS["embedding"]
 ST_SPEED_MODEL = SENTENCE_TRANSFORMER_MODELS["speed"]
 
