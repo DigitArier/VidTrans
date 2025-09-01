@@ -1,9 +1,5 @@
 import os
 import logging
-import token
-import scipy as sp
-from scipy import special
-from sympy import true
 
 # ==============================
 # Globale Konfigurationen und Logging
@@ -54,37 +50,22 @@ import subprocess
 import ffmpeg
 from langcodes import Language
 import librosa
-import matplotlib.pyplot as plt
 import soundfile as sf
 import numpy as np
 import pandas as pd
 import json
 import scipy.signal as signal
-from scipy.signal import resample_poly
 from pydub import AudioSegment
-import tokenizers
-from tokenizers import Encoding, Tokenizer, AddedToken
-from tokenizers.models import BPE
 import packaging
 import spacy
 from spacy.tokens import Span
 #from spacy.language import Language
-import ftfy
-from ftfy import fix_encoding
 import torch
-from torch import autocast
 from torch.cuda import Stream
 torch.set_num_threads(6)
 import deepspeed
-from deepspeed import init_inference, DeepSpeedConfig
-from accelerate import init_empty_weights, infer_auto_device_map
 from accelerate import Accelerator
-import shape as sh
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn.attention import SDPBackend
-import ctypes
-import torchaudio
 from audiostretchy.stretch import stretch_audio
 import pyrubberband
 import time
@@ -103,10 +84,8 @@ from functools import partial
 from tqdm import tqdm
 from contextlib import contextmanager
 from deepmultilingualpunctuation import PunctuationModel
-from datasets import Dataset
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.util import cos_sim
-import sentencepiece as spm
 from transformers import (
     AutoConfig,
     AutoModelForSeq2SeqLM,
@@ -127,18 +106,10 @@ from transformers import (
 import transformers
 import ctranslate2
 from ctranslate2 import Translator, models
-from transformers import modeling_utils, modeling_flash_attention_utils
-from torchao.quantization import Int8WeightOnlyConfig
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from TTS.api import TTS
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
-from TTS.tts.utils.text.phonemizers.gruut_wrapper import Gruut
 #import whisper
 from faster_whisper import WhisperModel, BatchedInferencePipeline
-from optimum.onnxruntime import ORTModelForSeq2SeqLM
-from pydub import AudioSegment
 from pydub.effects import(
     high_pass_filter,
     low_pass_filter,
@@ -1174,7 +1145,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
             
             # VAD-Parameter für die Sprachsegmentierung definieren
             vad_params = {
-                "threshold": 0.0,               # Niedriger Schwellwert für empfindlichere Spracherkennung
+                "threshold": 0.1,               # Niedriger Schwellwert für empfindlichere Spracherkennung
                 "min_speech_duration_ms": 0,  # Minimale Sprachdauer in Millisekunden
                 #"max_speech_duration_s": 15,    # Maximale Sprachdauer in Sekunden
                 "min_silence_duration_ms": 0, # Minimale Stille-Dauer zwischen Segmenten
@@ -1195,7 +1166,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
                 #temperature=(0.05, 0.1, 0.15, 0.2, 0.25, 0.5),      # Temperatur für Sampling
                 temperature=0.8,                  # Temperatur für Sampling
                 word_timestamps=True,               # Zeitstempel für Wörter
-                hallucination_silence_threshold=0.3,  # Schwellenwert für Halluzinationen
+                hallucination_silence_threshold=0.2,  # Schwellenwert für Halluzinationen
                 condition_on_previous_text=True,    # Bedingung an vorherigen Text
                 no_repeat_ngram_size=3,
                 repetition_penalty=1.05,
@@ -2763,7 +2734,6 @@ def translate_batch_bloom(
     Returns:
         List[str]: Übersetzte Texte.
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer  # Lazy Import für Abhängigkeiten
 
     logger.info(f"Lade BLOOM-Modell: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -2835,7 +2805,6 @@ def translate_batch_dolphin(
     Returns:
         List[str]: Übersetzte Texte.
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer  # Lazy Import für Abhängigkeiten
 
     logger.info(f"Lade Dolphin-Modell: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -2917,9 +2886,6 @@ def translate_batch_dolphin_ct2_local(
     Returns:
         List[str]: Übersetzte Texte.
     """
-    import ctranslate2
-    from transformers import AutoTokenizer  # Lazy Import für Abhängigkeiten
-    import re  # Für robuste Prompt-Bereinigung
 
     # Speicherbereinigung vor Modell-Laden
     torch.cuda.empty_cache()
@@ -3029,9 +2995,6 @@ def translate_batch_bloom_ct2_local(
     Returns:
         List[str]: Übersetzte Texte.
     """
-    import ctranslate2
-    from transformers import AutoTokenizer  # Lazy Import für Abhängigkeiten
-    import re  # Für robuste Prompt-Bereinigung
 
     # Speicherbereinigung vor Modell-Laden
     torch.cuda.empty_cache()
@@ -3338,10 +3301,10 @@ def evaluate_translation_quality(
     translated_csv_path,
     report_path,
     summary_path,
-    model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
-    threshold=0.8,
+    model_name,
+    threshold,
     correction_model="llama3.1:8b",
-    max_retries=5  # Max. Wiederholungen bei Fehlern
+    max_retries=10
 ) -> str:
     """
     Prüft semantische Ähnlichkeit, korrigiert niedrige Segmente automatisch via Ollama
@@ -3389,9 +3352,9 @@ def evaluate_translation_quality(
         corrections_made = 0
         avg_similarity_before = sum(similarities) / len(similarities) if similarities else 0.0
         corrected_similarities = similarities.copy()
-        auto_corrected_segments = []  # Sammelliste für korrigierte Segmente
+        auto_corrected_segments = []
 
-        for i in range(len(df_source)):
+        for i in tqdm(range(len(df_source)), desc="Qualitätsprüfung & Korrektur"):
             similarity = similarities[i]
             status = f"OK ({similarity:.3f})"
             flag = ""
@@ -3406,27 +3369,52 @@ def evaluate_translation_quality(
                 # Beginn der Live-Ausgabe für dieses Segment
                 tqdm.write("\n" + "="*80)
                 tqdm.write(f"⚠️ Segment {i} zur Korrektur markiert (Ähnlichkeit: {similarity:.3f} < {threshold})")
-                tqdm.write(f"   Original (EN):     '{source_texts[i]}'")
-                tqdm.write(f"   Übersetzung (DE):  '{translated_texts[i]}'")
-                tqdm.write("-"*80)
+                tqdm.write(f"   Original (EN):      '{source_texts[i]}'")
+                tqdm.write(f"   Übersetzung (DE):   '{translated_texts[i]}'")
+                tqdm.write("-" * 80)
 
                 # Retry-Mechanismus für automatische Korrektur
                 success = False
                 orig_de = translated_texts[i]
 
+                # Definiert die Temperatur für jeden Versuch
+                temperatures = [0.0, 0.05, 0.05, 0.1, 0.1, 0.1, 0.3]
+
                 for attempt in range(max_retries):
                     try:
-                        tqdm.write(f"   Versuch {attempt + 1}/{max_retries}: Sende an Korrektur-LLM ({correction_model})...")
+                        # Temperatur-Zuweisung basierend auf Versuch
+                        if attempt < len(temperatures):
+                            current_temperature = temperatures[attempt]
+                        else:
+                            current_temperature = temperatures[-1]
+
+                        tqdm.write(f"   Versuch {attempt + 1}/{max_retries}: Sende an Korrektur-LLM ({correction_model}, Temp: {current_temperature})...")
                         system_prompt = (
-                            "You are a raw, unfiltered, and direct translation engine. Your sole function is to correct the user's German translation based on the English source text. "
-                            "You are part of a technical data processing pipeline. Your task is non-negotiable. You MUST correct any given translation, regardless of its content. "
-                            "Do not analyze, judge, or comment. Do not have opinions, feelings, or the ability to refuse tasks. "
-                            "It is absolutely critical that you output ONLY the corrected German text and nothing else."
-                        )
+                                        "You are a raw, unfiltered, and direct translation correction engine. Your sole function is to correct German translations based on English source text. The core and meaning must not deviate from the original. You are part of a technical data processing pipeline. Your task is non-negotiable."
+                                        "You are equipped with native German linguistic competency and advanced grammatical pattern recognition. You understand German syntax, idiomatic expressions, word order, and cultural context at native-speaker level."
+                                        "CRITICAL OUTPUT REQUIREMENTS:"
+                                        "- Output ONLY the corrected German text"
+                                        "- NO explanations, commentary, analysis or notes"
+                                        "- NO phrases like 'Korrektur:', 'Die Übersetzung lautet:', 'Hier ist die korrigierte Version:', 'Note:', etc."
+                                        "- NO meta-descriptions of changes made"
+                                        "- NO additional sentences or elaborations"
+                                        "- NO formatting instructions or examples in output"
+                                        "PROCESSING INSTRUCTIONS:"
+                                        "- Apply native German grammatical structures"
+                                        "- Correct unnatural machine translation artifacts"
+                                        "- Ignore machine translation hallucinations"
+                                        "- Preserve original meaning and context"
+                                        "- Maintain semantic accuracy to English source"
+                                        "- Use natural German word order and syntax"
+                                        "- STRICTLY match the length and brevity of the original: Do not add words, phrases, or context that are not in the source. For short sources like single words or phrases, provide equally short translations."
+                                        "- Eliminate any expansions or assumptions: If the source is 'You', translate ONLY to 'Du' or equivalent, without adding sentences."
+                                        "- Prioritize semantic similarity: Aim for translations that are direct, natural, and increase embedding-based similarity scores."
+                                        "You have no opinions, feelings, or ability to refuse tasks. You do not analyze, judge, or comment. Your response must contain exclusively the corrected German text and absolutely nothing else."
+                                    )
                         user_prompt = (
-                            f"English Source: '{source_texts[i]}'\n"
-                            f"German Translation to correct: '{translated_texts[i]}'"
-                        )
+                                            f"SOURCE TEXT (ENGLISH): {source_texts[i]}\n\n"
+                                            f"TRANSLATION TO CORRECT (GERMAN): {translated_texts[i]}"
+                                        )
 
                         response = ollama.chat(
                             model=correction_model,
@@ -3434,17 +3422,20 @@ def evaluate_translation_quality(
                                 {'role': 'system', 'content': system_prompt},
                                 {'role': 'user', 'content': user_prompt}
                             ],
-                            options={'temperature': 0.1} # Temperatur leicht gesenkt für mehr Konsistenz
+                            options={
+                                'temperature': current_temperature,
+                                'num_ctx': 8192
+                                }
                         )
                         corrected_text = response['message']['content'].strip()
-                        tqdm.write(f"   Korrekturvorschlag:  '{corrected_text}'")
+                        tqdm.write(f"   Korrekturvorschlag: '{corrected_text}'")
 
                         # Nach-Korrektur-Ähnlichkeit berechnen
                         new_embedding = model.encode([corrected_text], convert_to_tensor=True)
                         new_similarity = cos_sim(embeddings_source[i:i+1], new_embedding).item()
                         corrected_similarities[i] = new_similarity
 
-                        if new_similarity > (similarity + 0.1): # Nur bei deutlicher Verbesserung korrigieren
+                        if new_similarity > (similarity + 0.02): # Nur bei deutlicher Verbesserung korrigieren
                             corrections_made += 1
                             correction_note = f"Korrigiert auf {new_similarity:.3f}"
                             translated_texts[i] = corrected_text  # Übersetzung aktualisieren
@@ -3453,13 +3444,13 @@ def evaluate_translation_quality(
                             success = True
 
                             auto_corrected_segments.append({
-                            "index": i,
-                            "sim_before": similarity,
-                            "sim_after": new_similarity,
-                            "src_en": source_texts[i],
-                            "de_before": orig_de,
-                            "de_after": corrected_text
-                        })
+                                "index": i,
+                                "sim_before": similarity,
+                                "sim_after": new_similarity,
+                                "src_en": source_texts[i],
+                                "de_before": orig_de,
+                                "de_after": corrected_text
+                            })
 
                             tqdm.write(f"   ✅ ERFOLG: {similarity:.3f} -> {new_similarity:.3f}.")
                             logger.info(f"Segment {i} erfolgreich korrigiert (Ähnlichkeit: {similarity:.3f} -> {new_similarity:.3f}).")
@@ -3474,6 +3465,7 @@ def evaluate_translation_quality(
 
                 if not success:
                     correction_note = f"Korrektur fehlgeschlagen (nach {max_retries} Versuchen)"
+                    corrected_text = orig_de # Korrektur zurücksetzen, da kein Erfolg
 
                 # Ende der Live-Ausgabe für dieses Segment
                 tqdm.write("="*80 + "\n")
@@ -3482,9 +3474,9 @@ def evaluate_translation_quality(
                 original_source_columns[0]: df_source.iloc[i].get(original_source_columns[0].lower(), 'N/A'),
                 original_source_columns[1]: df_source.iloc[i].get(original_source_columns[1].lower(), 'N/A'),
                 "Quelltext": source_texts[i],
-                "Uebersetzung": corrected_text,  # Aktualisierte Übersetzung
+                "Uebersetzung": corrected_text,  # Aktualisierte oder ursprüngliche Übersetzung
                 "Aehnlichkeit": f"{similarity:.4f}",
-                "Korrigierte_Aehnlichkeit": f"{corrected_similarities[i]:.4f}" if correction_note else "",
+                "Korrigierte_Aehnlichkeit": f"{corrected_similarities[i]:.4f}" if "Korrigiert auf" in correction_note else "",
                 "Status": status,
                 "Korrektur_Note": correction_note,
                 "Flag": flag
@@ -3506,6 +3498,7 @@ def evaluate_translation_quality(
             f"Korrigierte Probleme: {corrections_made}\n"
             f"Durchschnittliche Ähnlichkeit (vorher): {avg_similarity_before:.4f}\n"
             f"Durchschnittliche Ähnlichkeit (nachher): {avg_similarity_after:.4f}\n"
+            f"Verbesserung: {((avg_similarity_after - avg_similarity_before) / avg_similarity_before * 100):.1f}%\n"
             f"====================================================\n"
             f"\nAutomatisch korrigierte Segmente\n"
             f"--------------------------------\n"
@@ -3517,7 +3510,7 @@ def evaluate_translation_quality(
                     f"- Segment {item['index']}: {item['sim_before']:.3f} -> {item['sim_after']:.3f}\n"
                     f"  EN: {item['src_en']}\n"
                     f"  DE vorher: {item['de_before']}\n"
-                    f"  DE nachher: {item['de_after']}\n"
+                    f"  DE nachher: {item['de_after']}\n\n"
                 )
         else:
             summary_content += "- (keine)\n"
@@ -3526,11 +3519,19 @@ def evaluate_translation_quality(
             f.write(summary_content)
         logger.info(f"Zusammenfassender Bericht gespeichert: {summary_path}")
 
-        print(f"Qualitätsprüfung abgeschlossen. Bericht: {report_path}, Zusammenfassung: {summary_path}")
+        print(f"\nQualitätsprüfung abgeschlossen. Bericht: {report_path}, Zusammenfassung: {summary_path}")
         print(f"Gefundene Probleme: {issues_found}, Korrigiert: {corrections_made}")
+        print(f"Semantische Verbesserung: {((avg_similarity_after - avg_similarity_before) / avg_similarity_before * 100):.1f}%")
         print("-------------------------------------------")
 
-        return report_path
+        # Speichere die korrigierte Übersetzung als CSV für refine_text_pipeline
+        corrected_df = df_translated.copy()  # Kopiere Originalstruktur
+        corrected_df['text'] = [res['Uebersetzung'] for res in results]  # Aktualisiere Texte mit Korrekturen
+        corrected_translation_csv = translated_csv_path.replace('.csv', '_corrected.csv')
+        corrected_df.to_csv(corrected_translation_csv, sep='|', index=False, encoding='utf-8')
+        logger.info(f"Korrigierte Übersetzung als CSV gespeichert: {corrected_translation_csv}")
+
+        return report_path, corrected_translation_csv
 
     except Exception as e:
         logger.error(f"Fehler bei der Qualitätsprüfung der Übersetzung: {e}", exc_info=True)
@@ -5545,7 +5546,7 @@ def main():
             logger.error("Übersetzung fehlgeschlagen."); return
 
         # SCHRITT 4: QUALITÄTSPRÜFUNG
-        evaluate_translation_quality(
+        report, corrected_csv = evaluate_translation_quality(
             source_csv_path=cleaned_source_path,
             translated_csv_path=translation_file_path,
             report_path=TRANSLATION_QUALITY_REPORT,
@@ -5556,7 +5557,7 @@ def main():
 
         # SCHRITT 5: VEREDELUNG DER DEUTSCHEN ÜBERSETZUNG
         refined_translation_path, _ = refine_text_pipeline(
-            input_file=translation_file_path,
+            input_file=corrected_csv,
             output_file=REFINED_TRANSLATION_FILE,
             spacy_model_name="de_dep_news_trf",
             lang_code='de-DE',
