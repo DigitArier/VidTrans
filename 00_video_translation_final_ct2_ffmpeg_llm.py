@@ -561,14 +561,14 @@ def ask_overwrite(file_path):
             return False
         print("Ungültige Eingabe. Bitte 'j' oder 'n' antworten.")
 
-def extract_audio_ffmpeg(video_path, audio_output):
+def extract_audio_ffmpeg(audio_path, audio_output):
     """Extrahiert die Audiospur aus dem Video (Mono, 44.100 Hz)."""
     if os.path.exists(audio_output):
         if not ask_overwrite(audio_output):
             logger.info(f"Verwende vorhandene Datei: {audio_output}")
             return
     try:
-        ffmpeg.input(video_path, hwaccel="cuda", hwaccel_output_format="cuda").output(
+        ffmpeg.input(audio_path, hwaccel="cuda", hwaccel_output_format="cuda").output(
             audio_output,
             threads=0,      # Verwendet alle verfügbaren Threads
             f="wav",
@@ -5512,7 +5512,7 @@ def main():
         # SCHRITT 1: VORBEREITUNG & TRANSKRIPTION
         if not os.path.exists(VIDEO_PATH):
             logger.error(f"Eingabevideo nicht gefunden: {VIDEO_PATH}"); return
-        extract_audio_ffmpeg(VIDEO_PATH, ORIGINAL_AUDIO_PATH)
+        extract_audio_ffmpeg(AUDIO_PATH, ORIGINAL_AUDIO_PATH)
         create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH_1, SAMPLE_PATH_2,
                             SAMPLE_PATH_3
                             )

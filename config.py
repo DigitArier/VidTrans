@@ -1,6 +1,7 @@
 # Dateipfade
-VIDEO_PATH = "its Worse than You think full documentary.mp4"
-FINAL_VIDEO_PATH = "its Worse than You think full documentary_deutsch.mp4"
+AUDIO_PATH = "1_EUROPA (13) The Last Battle (Part 10 of 10) (2017) (Documentary) [720p]_(Vocals).wav"
+VIDEO_PATH = "EUROPA (13) The Last Battle (Part 10 of 10) (2017) (Documentary) [720p].mp4"
+FINAL_VIDEO_PATH = "EUROPA (13) The Last Battle (Part 10 of 10) (2017) (Documentary) [720p]_deutsch.mp4"
 ORIGINAL_AUDIO_PATH = "00_original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
@@ -47,15 +48,13 @@ MAX_CHARS_TRANSLATION = 200 # Maximale Anzahl an Zeichen pro Segment
 MIN_WORDS_TRANSLATION = 7 # Minimale Anzahl an Wörtern pro Segment
 ITERATIONS_TRANSLATION = 3 # Durchläufe
 #Quality_Report
-ST_QUALITY_MODEL = "sentence-transformers/multi-qa-mpnet-base-dot-v1"
 TRANSLATION_QUALITY_REPORT = "07_translation_quality_report.csv"
 TRANSLATION_QUALITY_SUMMARY = "translation_quality_summary.txt"
 CLEANED_SOURCE_FOR_QUALITY_CHECK = "04_cleaned_source_for_quality_check.csv"
-ST_EMBEDDING_MODEL_DE = 'sentence-transformers/distiluse-base-multilingual-cased-v2'
 EMBEDDINGS_FILE_NPZ = "08_german_text_embeddings.npz"
 TRANSLATION_WITH_EMBEDDINGS_CSV = "08_german_text_embeddings.csv"
 # Schwellenwert für die Kosinus-Ähnlichkeit (experimentell bestimmen, z.B. 0.6 - 0.8)
-SIMILARITY_THRESHOLD = 0.75
+SIMILARITY_THRESHOLD = 0.85
 #TTS
 TTS_TEMP_CHUNKS_DIR = "tts_temp_chunks"
 TTS_PROGRESS_MANIFEST = "tts_progress_manifest.csv"
@@ -93,6 +92,7 @@ SENTENCE_TRANSFORMER_MODELS = {
     "quality_neu": "sentence-transformers/multi-qa-mpnet-base-dot-v1",
     "quality_big": "intfloat/multilingual-e5-large",
     "embedding": "sentence-transformers/distiluse-base-multilingual-cased-v2", 
+    "embedding_big": "intfloat/multilingual-e5-large-instruct",
     "speed": "sentence-transformers/all-MiniLM-L6-v2",
     "latest": "Alibaba-NLP/gte-large-en-v1.5"
 }
@@ -101,8 +101,8 @@ SENTENCE_TRANSFORMER_MODELS = {
 MIN_WORDS_GLOBAL = 4
 
 # Standard-Modelle für verschiedene Aufgaben
-ST_QUALITY_MODEL = SENTENCE_TRANSFORMER_MODELS["quality_neu"]
-ST_EMBEDDING_MODEL_DE = SENTENCE_TRANSFORMER_MODELS["embedding"]
+ST_QUALITY_MODEL = SENTENCE_TRANSFORMER_MODELS["quality_big"]
+ST_EMBEDDING_MODEL_DE = SENTENCE_TRANSFORMER_MODELS["embedding_big"]
 ST_SPEED_MODEL = SENTENCE_TRANSFORMER_MODELS["speed"]
 
 # TTS Text-Validierung
