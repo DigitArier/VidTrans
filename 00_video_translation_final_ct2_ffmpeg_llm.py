@@ -2386,7 +2386,7 @@ def translate_batch_madlad(
     results = translator.translate_batch(
         tokenized_texts,
         batch_type="tokens",
-        max_batch_size=2048,
+        max_batch_size=1536,
         beam_size=10,
         patience=1.5,
         repetition_penalty=1.5,
@@ -3303,16 +3303,20 @@ def evaluate_translation_quality(
     summary_path,
     model_name,
     threshold,
-    correction_model="llama3.1:8b",
-    max_retries=10
-) -> str:
+    correction_model="qwen3:8b",
+    max_retries=5
+) -> Tuple[str, str]:
     """
     Prüft semantische Ähnlichkeit, korrigiert niedrige Segmente automatisch via Ollama
     und erzeugt detaillierten Bericht + Zusammenfassung.
+    
+    Returns:
+        Tuple[str, str]: (report_path, corrected_csv_path)
     """
     if os.path.exists(report_path) and not ask_overwrite(report_path):
         logger.info(f"Verwende vorhandenen Qualitätsbericht: {report_path}")
-        return report_path
+        corrected_translation_csv = translated_csv_path.replace('.csv', '_corrected.csv')
+        return report_path, corrected_translation_csv
 
     logger.info(f"Starte erweiterte Qualitätsprüfung mit Modell: {model_name}")
 
@@ -3359,7 +3363,7 @@ def evaluate_translation_quality(
             status = f"OK ({similarity:.3f})"
             flag = ""
             correction_note = ""
-            corrected_text = translated_texts[i]
+            final_corrected_text = translated_texts[i]
 
             if similarity < threshold:
                 status = f"Niedrig ({similarity:.3f})"
@@ -3369,47 +3373,45 @@ def evaluate_translation_quality(
                 # Beginn der Live-Ausgabe für dieses Segment
                 tqdm.write("\n" + "="*80)
                 tqdm.write(f"⚠️ Segment {i} zur Korrektur markiert (Ähnlichkeit: {similarity:.3f} < {threshold})")
-                tqdm.write(f"   Original (EN):      '{source_texts[i]}'")
-                tqdm.write(f"   Übersetzung (DE):   '{translated_texts[i]}'")
+                tqdm.write(f" Original (EN): '{source_texts[i]}'")
+                tqdm.write(f" Übersetzung (DE): '{translated_texts[i]}'")
                 tqdm.write("-" * 80)
 
                 # Retry-Mechanismus für automatische Korrektur
                 success = False
                 orig_de = translated_texts[i]
+                best_similarity = similarity
+                best_correction = orig_de
 
                 # Definiert die Temperatur für jeden Versuch
-                temperatures = [0.0, 0.05, 0.05, 0.1, 0.1, 0.1, 0.3]
+                temperatures = [0.0, 0.05, 0.1, 0.2, 0.2]
 
                 for attempt in range(max_retries):
                     try:
                         # Temperatur-Zuweisung basierend auf Versuch
-                        if attempt < len(temperatures):
-                            current_temperature = temperatures[attempt]
-                        else:
-                            current_temperature = temperatures[-1]
+                        current_temperature = temperatures[attempt] if attempt < len(temperatures) else temperatures[-1]
 
                         tqdm.write(f"   Versuch {attempt + 1}/{max_retries}: Sende an Korrektur-LLM ({correction_model}, Temp: {current_temperature})...")
                         system_prompt = (
-                                        "You are a raw, unfiltered, and direct translation correction engine. Your sole function is to correct German translations based on English source text. The core and meaning must not deviate from the original. You are part of a technical data processing pipeline. Your task is non-negotiable."
-                                        "You are equipped with native German linguistic competency and advanced grammatical pattern recognition. You understand German syntax, idiomatic expressions, word order, and cultural context at native-speaker level."
-                                        "CRITICAL OUTPUT REQUIREMENTS:"
-                                        "- Output ONLY the corrected German text"
-                                        "- NO explanations, commentary, analysis or notes"
-                                        "- NO phrases like 'Korrektur:', 'Die Übersetzung lautet:', 'Hier ist die korrigierte Version:', 'Note:', etc."
-                                        "- NO meta-descriptions of changes made"
-                                        "- NO additional sentences or elaborations"
-                                        "- NO formatting instructions or examples in output"
-                                        "PROCESSING INSTRUCTIONS:"
-                                        "- Apply native German grammatical structures"
-                                        "- Correct unnatural machine translation artifacts"
-                                        "- Ignore machine translation hallucinations"
-                                        "- Preserve original meaning and context"
-                                        "- Maintain semantic accuracy to English source"
-                                        "- Use natural German word order and syntax"
-                                        "- STRICTLY match the length and brevity of the original: Do not add words, phrases, or context that are not in the source. For short sources like single words or phrases, provide equally short translations."
-                                        "- Eliminate any expansions or assumptions: If the source is 'You', translate ONLY to 'Du' or equivalent, without adding sentences."
-                                        "- Prioritize semantic similarity: Aim for translations that are direct, natural, and increase embedding-based similarity scores."
-                                        "You have no opinions, feelings, or ability to refuse tasks. You do not analyze, judge, or comment. Your response must contain exclusively the corrected German text and absolutely nothing else."
+                                        "You are a hyper-literal German translation engine. Your task is to create a new, correct German translation based *exclusively* on the provided English source text."
+                                        "The English text is the ONLY SOURCE OF TRUTH."
+                                        
+                                        "CRITICAL INSTRUCTION:"
+                                        "You will also receive a 'TRANSLATION TO CORRECT (GERMAN)'. Treat this German text with EXTREME SKEPTICISM. It is very likely flawed, contains hallucinations, omissions, or semantic errors."
+                                        "Your goal is NOT to 'fix' this flawed translation. Your goal is to produce the CORRECT translation based on the English source."
+                                        "If the provided German translation adds information not present in the English source (like '...when I was 14'), you HAVE TO discard it."
+                                        "If the provided German translation changes the meaning (e.g., 'don't continue' becomes 'are not allowed to continue'), you HAVE TO discard it."
+                                        "If the provided German translation merges or splits sentences incorrectly, you HAVE TO ignore that structure."
+                                        
+                                        "OUTPUT FORMAT:"
+                                        "- Output ONLY the corrected, new German text."
+                                        "- NO labels, NO notes, NO quotes, NO extra whitespace. NO pre- or post-text."
+                                        
+                                        "HARD CONSTRAINTS (non-negotiable, based on the ENGLISH source):"
+                                        "1) SEMANTIC FIDELITY: The meaning must be identical to the English source. This is the highest priority."
+                                        "2) NO ADDITIONS/OMISSIONS: Do not add or remove any information. If the source is a fragment or just a few words, the translation must be a fragment or those words correctly translated."
+                                        "3) STRUCTURE & PUNCTUATION: Mirror the sentence count and punctuation of the English source as closely as German grammar allows."
+                                        "4) ENTITIES: Never alter numbers, dates, or proper names."
                                     )
                         user_prompt = (
                                             f"SOURCE TEXT (ENGLISH): {source_texts[i]}\n\n"
@@ -3425,47 +3427,55 @@ def evaluate_translation_quality(
                             options={
                                 'temperature': current_temperature,
                                 'num_ctx': 8192
-                                }
+                            },
+                            think=False
                         )
-                        corrected_text = response['message']['content'].strip()
-                        tqdm.write(f"   Korrekturvorschlag: '{corrected_text}'")
+                        correction_candidate = response['message']['content'].strip()
+                        tqdm.write(f"   Korrekturvorschlag: '{correction_candidate}'")
+
 
                         # Nach-Korrektur-Ähnlichkeit berechnen
-                        new_embedding = model.encode([corrected_text], convert_to_tensor=True)
+                        new_embedding = model.encode([correction_candidate], convert_to_tensor=True)
                         new_similarity = cos_sim(embeddings_source[i:i+1], new_embedding).item()
-                        corrected_similarities[i] = new_similarity
 
-                        if new_similarity > (similarity + 0.02): # Nur bei deutlicher Verbesserung korrigieren
-                            corrections_made += 1
-                            correction_note = f"Korrigiert auf {new_similarity:.3f}"
-                            translated_texts[i] = corrected_text  # Übersetzung aktualisieren
-                            status = f"Korrigiert ({new_similarity:.3f})"
-                            flag = "AUTO-CORRECTED"
-                            success = True
-
-                            auto_corrected_segments.append({
-                                "index": i,
-                                "sim_before": similarity,
-                                "sim_after": new_similarity,
-                                "src_en": source_texts[i],
-                                "de_before": orig_de,
-                                "de_after": corrected_text
-                            })
-
-                            tqdm.write(f"   ✅ ERFOLG: {similarity:.3f} -> {new_similarity:.3f}.")
-                            logger.info(f"Segment {i} erfolgreich korrigiert (Ähnlichkeit: {similarity:.3f} -> {new_similarity:.3f}).")
-                            break  # Erfolg: Schleife beenden
+                        if new_similarity > (best_similarity + 0.002):
+                            tqdm.write(f"   ✨ Bessere Version gefunden: {best_similarity:.3f} -> {new_similarity:.3f}")
+                            best_similarity = new_similarity
+                            best_correction = correction_candidate
                         else:
-                            correction_note = f"Versuch {attempt+1} fehlgeschlagen (Ähnlichkeit: {new_similarity:.3f})"
-                            tqdm.write(f"   ❌ KEINE VERBESSERUNG: {similarity:.3f} -> {new_similarity:.3f}).")
-                            logger.warning(f"Korrekturversuch {attempt+1} für Segment {i} brachte keine Verbesserung.")
+                            tqdm.write(f"   ❌ Keine signifikante Verbesserung: {similarity:.3f} -> {new_similarity:.3f}")
+
 
                     except Exception as e:
                         logger.warning(f"Korrektur-Versuch {attempt+1} für Segment {i} fehlgeschlagen: {e}")
 
-                if not success:
-                    correction_note = f"Korrektur fehlgeschlagen (nach {max_retries} Versuchen)"
-                    corrected_text = orig_de # Korrektur zurücksetzen, da kein Erfolg
+
+                # Nach allen Versuchen wird die finale Entscheidung getroffen.
+                if best_similarity > similarity:
+                    corrections_made += 1
+                    final_corrected_text = best_correction
+                    status = f"Korrigiert ({best_similarity:.3f})"
+                    flag = "AUTO-CORRECTED"
+                    correction_note = f"Beste Korrektur nach {max_retries} Versuchen: {best_similarity:.3f}"
+                    corrected_similarities[i] = best_similarity
+                    
+                    auto_corrected_segments.append({
+                        "index": i,
+                        "sim_before": similarity,
+                        "sim_after": best_similarity,
+                        "src_en": source_texts[i],
+                        "de_before": orig_de,
+                        "de_after": best_correction
+                    })
+
+
+                    tqdm.write(f"   ✅ BESTE VERSION ÜBERNOMMEN: {similarity:.3f} -> {best_similarity:.3f}.")
+                    logger.info(f"Segment {i} erfolgreich korrigiert (Ähnlichkeit: {similarity:.3f} -> {best_similarity:.3f}).")
+                else:
+                    # Wenn keine Verbesserung gefunden wurde, bleibt der Originaltext.
+                    final_corrected_text = orig_de
+                    correction_note = f"Keine Verbesserung nach {max_retries} Versuchen gefunden."
+                    tqdm.write(f"   ⚠️ KEINE VERBESSERUNG, Original wird beibehalten.")
 
                 # Ende der Live-Ausgabe für dieses Segment
                 tqdm.write("="*80 + "\n")
@@ -3474,9 +3484,9 @@ def evaluate_translation_quality(
                 original_source_columns[0]: df_source.iloc[i].get(original_source_columns[0].lower(), 'N/A'),
                 original_source_columns[1]: df_source.iloc[i].get(original_source_columns[1].lower(), 'N/A'),
                 "Quelltext": source_texts[i],
-                "Uebersetzung": corrected_text,  # Aktualisierte oder ursprüngliche Übersetzung
+                "Uebersetzung": final_corrected_text,
                 "Aehnlichkeit": f"{similarity:.4f}",
-                "Korrigierte_Aehnlichkeit": f"{corrected_similarities[i]:.4f}" if "Korrigiert auf" in correction_note else "",
+                "Korrigierte_Aehnlichkeit": f"{corrected_similarities[i]:.4f}" if flag == "AUTO-CORRECTED" else "",
                 "Status": status,
                 "Korrektur_Note": correction_note,
                 "Flag": flag
@@ -3508,9 +3518,9 @@ def evaluate_translation_quality(
             for item in auto_corrected_segments:
                 summary_content += (
                     f"- Segment {item['index']}: {item['sim_before']:.3f} -> {item['sim_after']:.3f}\n"
-                    f"  EN: {item['src_en']}\n"
-                    f"  DE vorher: {item['de_before']}\n"
-                    f"  DE nachher: {item['de_after']}\n\n"
+                    f"  EN Original : {item['src_en']}\n"
+                    f"  DE vorher   : {item['de_before']}\n"
+                    f"  DE nachher  : {item['de_after']}\n\n"
                 )
         else:
             summary_content += "- (keine)\n"
@@ -3776,8 +3786,12 @@ TARGET_ENTITY_LABELS: Set[str] = {
     "GPE",           # Geopolitische Entitäten
     "FACILITY",      # Gebäude, Orte
     "LANGUAGE",      # Sprachen
-    "NORP", "NOR"    # Nationalitäten, religiöse/politische Gruppen
-    
+    "NORP",           # Nationalitäten, religiöse/politische Gruppen
+    "TIME",           # Zeitangaben
+    "DATE",           # Datumsangaben
+    "NUM",            # Zahlen
+    "CARDINAL"       # Kardinalzahlen
+
 }
 
 # Zusätzliche Patterns für Social Media Handles und spezielle Namen
@@ -3857,7 +3871,7 @@ def entity_protection_final(
     text: str,
     nlp_model,
     tokenizer: T5Tokenizer,
-    custom_words: List[str] = ["Datura", "Acid"]  # Optionale Liste benutzerdefinierter Wörter zum Schützen
+    custom_words: List[str] = ["Datura", "Acid", "Langan"]  # Optionale Liste benutzerdefinierter Wörter zum Schützen
 ) -> Tuple[str, Dict[str, EntityInfo]]:
     """
     Stellt sicher, dass T5-native Sentinel-Tokens (<extra_id_0>) verwendet werden,
@@ -4085,102 +4099,103 @@ def refine_text_pipeline(
             protected_texts.append(protected_text)
             master_entity_map[i] = entity_map
 
-    # Stufe 3: Grammatikkorrektur im BATCH (CPU-parallelisiert)
-    logger.info("Stufe 3/4: Grammatik im Batch korrigieren (parallelisiert)...")
-    corrected_texts = correct_texts_in_parallel(protected_texts, lang_code, LT_PORT)
+        # Stufe 3: Grammatikkorrektur im BATCH (CPU-parallelisiert)
+        logger.info("Stufe 3/4: Grammatik im Batch korrigieren (parallelisiert)...")
+        corrected_texts = correct_texts_in_parallel(protected_texts, lang_code, LT_PORT)
 
-    # Stufe 4: Entitäten wiederherstellen und Daten finalisieren
-    logger.info("Stufe 4/4: Entitäten wiederherstellen und Daten finalisieren...")
-    processed_rows = []
-    for i in range(len(df)):
-        restored_text = restore_entities_final(corrected_texts[i], master_entity_map[i])
-        processed_rows.append({
-            'startzeit': df.iloc[i]['startzeit'],
-            'endzeit': df.iloc[i]['endzeit'],
-            'text': restored_text,
-            'entity_map': _entity_map_to_json_str(master_entity_map[i])
-        })
-
-    final_df = pd.DataFrame(processed_rows)
-    final_df = ensure_context_closure(final_df)
-    final_df['text'] = final_df['text'].apply(lambda x: (sanitize_for_csv_and_tts_preserve_placeholders(x)))
-
-    # Stufe 5: Ein-Satz-Splitting mit proportionalen Zeitstempeln, Entity-Übertragung und Mindestwort-Merge
-    logger.info(f"Stufe 5/5: Teile Segmente in Ein-Satz-Segmente (mind. {min_words} Wörter) mit proportionalen Zeiten...")
-    split_rows = []
-    for idx, row in final_df.iterrows():
-        # Hole Original-Zeiten und Entity-Map
-        orig_start = parse_time(row['startzeit'])
-        orig_end = parse_time(row['endzeit'])
-        orig_duration = orig_end - orig_start
-        orig_text = row['text']
-        orig_entity_map = _json_str_to_entity_map(row['entity_map'])
-
-        # Splitte in Sätze (verwende englische Variante von split_sentences_german)
-        sentences = split_sentences_german(orig_text)  # Annahme: Funktion arbeitet auch für Englisch
-
-        if len(sentences) == 0:
-            split_rows.append(row.to_dict())  # Leeres Segment: Behalte original
-            continue
-
-        # Proportionale Verteilung: Basierend auf Zeichenlänge
-        total_chars = sum(len(s) for s in sentences)
-        current_time = orig_start
-        temp_segments = []  # Temporäre Liste für Split-Segmente (vor Merge)
-        for j, sentence in enumerate(sentences):
-            sentence_chars = len(sentence)
-            proportion = sentence_chars / total_chars if total_chars > 0 else 1 / len(sentences)
-            sentence_duration = orig_duration * proportion
-            sentence_end = current_time + sentence_duration
-            if j == len(sentences) - 1:
-                sentence_end = orig_end  # Letztes Segment: Exakt zum Original-Ende
-
-            # Entities auf neues Segment übertragen (relative Positionen anpassen)
-            new_entity_map = {}
-            for placeholder, entity_info in orig_entity_map.items():
-                # Passe Start/End relativ zum neuen Satz an
-                rel_start = max(0, entity_info.start - sum(len(s) for s in sentences[:j]))
-                rel_end = rel_start + (entity_info.end - entity_info.start)
-                if rel_start < len(sentence):  # Nur wenn Entity im neuen Satz liegt
-                    new_entity_map[placeholder] = EntityInfo(
-                        text=entity_info.text,
-                        label=entity_info.label,
-                        start=rel_start,
-                        end=rel_end,
-                        language=entity_info.language
-                    )
-
-            temp_segments.append({
-                'startzeit': format_time(current_time),
-                'endzeit': format_time(sentence_end),
-                'text': sentence.strip(),
-                'entity_map': _entity_map_to_json_str(new_entity_map)
+        # Stufe 4: Entitäten wiederherstellen und Daten finalisieren
+        logger.info("Stufe 4/4: Entitäten wiederherstellen und Daten finalisieren...")
+        processed_rows = []
+        for i in range(len(df)):
+            restored_text = restore_entities_final(corrected_texts[i], master_entity_map[i])
+            processed_rows.append({
+                'startzeit': df.iloc[i]['startzeit'],
+                'endzeit': df.iloc[i]['endzeit'],
+                'text': restored_text,
+                'entity_map': _entity_map_to_json_str(master_entity_map[i])
             })
-            current_time = sentence_end
 
-        # Post-Splitting-Merge: Kombiniere zu kurze Segmente (< min_words)
-        merged_segments = []
-        current_merged = None
-        for seg in temp_segments:
-            seg_text = seg['text']
-            seg_words = len(seg_text.split())  # Wortanzahl zählen
-            if current_merged is None:
-                current_merged = seg.copy()  # Starte neuen Merge
-            else:
-                if seg_words < min_words:  # Zu kurz: Merge mit aktuellem
-                    # Text und Entity-Map kombinieren
-                    current_merged['text'] += " " + seg_text
-                    current_merged['entity_map'] = _entity_map_to_json_str({**_json_str_to_entity_map(current_merged['entity_map']), **_json_str_to_entity_map(seg['entity_map'])})
-                    current_merged['endzeit'] = seg['endzeit']  # Endzeit aktualisieren
+        final_df = pd.DataFrame(processed_rows)
+        final_df = ensure_context_closure(final_df)
+        final_df['text'] = final_df['text'].apply(lambda x: (sanitize_for_csv_and_tts_preserve_placeholders(x)))
+        final_df['text'] = [safe_punctuate(text, punctuation_model, logger) for text in tqdm(final_df['text'], desc="Interpunktion")]
+
+        # Stufe 5: Ein-Satz-Splitting mit proportionalen Zeitstempeln, Entity-Übertragung und Mindestwort-Merge
+        logger.info(f"Stufe 5/5: Teile Segmente in Ein-Satz-Segmente (mind. {min_words} Wörter) mit proportionalen Zeiten...")
+        split_rows = []
+        for idx, row in final_df.iterrows():
+            # Hole Original-Zeiten und Entity-Map
+            orig_start = parse_time(row['startzeit'])
+            orig_end = parse_time(row['endzeit'])
+            orig_duration = orig_end - orig_start
+            orig_text = row['text']
+            orig_entity_map = _json_str_to_entity_map(row['entity_map'])
+
+            # Splitte in Sätze (verwende englische Variante von split_sentences_german)
+            sentences = split_sentences_german(orig_text)  # Annahme: Funktion arbeitet auch für Englisch
+
+            if len(sentences) == 0:
+                split_rows.append(row.to_dict())  # Leeres Segment: Behalte original
+                continue
+
+            # Proportionale Verteilung: Basierend auf Zeichenlänge
+            total_chars = sum(len(s) for s in sentences)
+            current_time = orig_start
+            temp_segments = []  # Temporäre Liste für Split-Segmente (vor Merge)
+            for j, sentence in enumerate(sentences):
+                sentence_chars = len(sentence)
+                proportion = sentence_chars / total_chars if total_chars > 0 else 1 / len(sentences)
+                sentence_duration = orig_duration * proportion
+                sentence_end = current_time + sentence_duration
+                if j == len(sentences) - 1:
+                    sentence_end = orig_end  # Letztes Segment: Exakt zum Original-Ende
+
+                # Entities auf neues Segment übertragen (relative Positionen anpassen)
+                new_entity_map = {}
+                for placeholder, entity_info in orig_entity_map.items():
+                    # Passe Start/End relativ zum neuen Satz an
+                    rel_start = max(0, entity_info.start - sum(len(s) for s in sentences[:j]))
+                    rel_end = rel_start + (entity_info.end - entity_info.start)
+                    if rel_start < len(sentence):  # Nur wenn Entity im neuen Satz liegt
+                        new_entity_map[placeholder] = EntityInfo(
+                            text=entity_info.text,
+                            label=entity_info.label,
+                            start=rel_start,
+                            end=rel_end,
+                            language=entity_info.language
+                        )
+
+                temp_segments.append({
+                    'startzeit': format_time(current_time),
+                    'endzeit': format_time(sentence_end),
+                    'text': sentence.strip(),
+                    'entity_map': _entity_map_to_json_str(new_entity_map)
+                })
+                current_time = sentence_end
+
+            # Post-Splitting-Merge: Kombiniere zu kurze Segmente (< min_words)
+            merged_segments = []
+            current_merged = None
+            for seg in temp_segments:
+                seg_text = seg['text']
+                seg_words = len(seg_text.split())  # Wortanzahl zählen
+                if current_merged is None:
+                    current_merged = seg.copy()  # Starte neuen Merge
                 else:
-                    merged_segments.append(current_merged)  # Speichere abgeschlossenen Merge
-                    current_merged = seg.copy()  # Starte neuen
+                    if seg_words < min_words:  # Zu kurz: Merge mit aktuellem
+                        # Text und Entity-Map kombinieren
+                        current_merged['text'] += " " + seg_text
+                        current_merged['entity_map'] = _entity_map_to_json_str({**_json_str_to_entity_map(current_merged['entity_map']), **_json_str_to_entity_map(seg['entity_map'])})
+                        current_merged['endzeit'] = seg['endzeit']  # Endzeit aktualisieren
+                    else:
+                        merged_segments.append(current_merged)  # Speichere abgeschlossenen Merge
+                        current_merged = seg.copy()  # Starte neuen
 
-        if current_merged:  # Letzten Merge hinzufügen
-            merged_segments.append(current_merged)
+            if current_merged:  # Letzten Merge hinzufügen
+                merged_segments.append(current_merged)
 
-        split_rows.extend(merged_segments)  # Zu finaler Liste hinzufügen
-        logger.debug(f"Segment {idx} in {len(sentences)} Sätze gesplittet, nach Merge: {len(merged_segments)} Segmente (mind. {min_words} Wörter).")
+            split_rows.extend(merged_segments)  # Zu finaler Liste hinzufügen
+            logger.debug(f"Segment {idx} in {len(sentences)} Sätze gesplittet, nach Merge: {len(merged_segments)} Segmente (mind. {min_words} Wörter).")
 
     final_df = pd.DataFrame(split_rows)
     final_df.to_csv(output_file, sep='|', index=False, encoding='utf-8')
@@ -4378,10 +4393,12 @@ def format_for_tts_splitting(
 
     df = pd.read_csv(input_file, sep='|', dtype=str).fillna('')
     all_sentences_with_timing = []
+    punctuation_model = PunctuationModel()
 
     # Stufe 1: Zerlege alle Segmente in einzelne Sätze mit proportionaler Zeitberechnung
-    for _, row in df.iterrows():
+    for _, row in tqdm(df.iterrows(), total=df.shape[0], desc="Zerlegen in Sätze"):
         text = row['text']
+        text = safe_punctuate(text, punctuation_model, logger)
         start_sec = parse_time(row['startzeit'])
         end_sec = parse_time(row['endzeit'])
         duration = end_sec - start_sec if end_sec > start_sec else 0
@@ -5513,9 +5530,11 @@ def main():
         if not os.path.exists(VIDEO_PATH):
             logger.error(f"Eingabevideo nicht gefunden: {VIDEO_PATH}"); return
         extract_audio_ffmpeg(AUDIO_PATH, ORIGINAL_AUDIO_PATH)
+        """
         create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH_1, SAMPLE_PATH_2,
                             SAMPLE_PATH_3
                             )
+        """
         transcribe_audio_with_timestamps(ORIGINAL_AUDIO_PATH, TRANSCRIPTION_FILE)
 
         # SCHRITT 2: VEREDELUNG DER ENGLISCHEN TRANSKRIPTION
@@ -5531,7 +5550,7 @@ def main():
         comprehensive_gpu_cleanup()
         time.sleep(2)
 
-        # SCHRITT 3: ÜBERSETZUNG MIT OLLAMA
+        # SCHRITT 3: ÜBERSETZUNG
         translation_file_path, cleaned_source_path = translate_segments_optimized_safe(
             refined_transcription_path=refined_transcription_path,
             master_entity_map=master_entity_map_en,
@@ -5546,7 +5565,7 @@ def main():
             logger.error("Übersetzung fehlgeschlagen."); return
 
         # SCHRITT 4: QUALITÄTSPRÜFUNG
-        report, corrected_csv = evaluate_translation_quality(
+        report_path, corrected_csv = evaluate_translation_quality(
             source_csv_path=cleaned_source_path,
             translated_csv_path=translation_file_path,
             report_path=TRANSLATION_QUALITY_REPORT,
