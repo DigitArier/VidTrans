@@ -154,7 +154,7 @@ def setup_global_torch_optimizations():
     # Konfiguriert den PyTorch CUDA Memory Allocator, um Speicherfragmentierung bei großen Modellen zu reduzieren.
     os.environ['TRITON_DISABLE_AUTOTUNE'] = '1'
     os.environ['TRITON_DISABLE_CACHE'] = '1'
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:256,expandable_segments:True'
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
     # Setzt CTranslate2-spezifische Caching-Parameter für den Speicher, optimiert für Inferenz.
     os.environ['CT2_CUDA_CACHING_ALLOCATOR_CONFIG'] = '4,3,10,104857600'
     os.environ['CT2_CUDA_ALLOW_FP16'] = '1' # Erlaubt CTranslate2 die Nutzung von FP16 für schnellere Berechnungen.
@@ -1154,9 +1154,9 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
             
             segments_generator, info = pipeline.transcribe(
                 audio_file,
-                batch_size=3,
-                beam_size=15,
-                patience=1.5,
+                batch_size=2,
+                beam_size=20,
+                patience=2.0,
                 vad_filter=True,
                 vad_parameters=vad_params,
                 #chunk_length=45,
@@ -1164,11 +1164,11 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
                 #log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
                 #no_speech_threshold=1.0,            # Schwellenwert für Stille
                 #temperature=(0.05, 0.1, 0.15, 0.2, 0.25, 0.5),      # Temperatur für Sampling
-                temperature=0.8,                  # Temperatur für Sampling
+                temperature=0.4,                  # Temperatur für Sampling
                 word_timestamps=True,               # Zeitstempel für Wörter
                 hallucination_silence_threshold=0.2,  # Schwellenwert für Halluzinationen
                 condition_on_previous_text=True,    # Bedingung an vorherigen Text
-                no_repeat_ngram_size=3,
+                no_repeat_ngram_size=5,
                 repetition_penalty=1.05,
                 language="en",
                 #task="translate"
@@ -2177,6 +2177,47 @@ def _is_refusal(text: str) -> bool:
         return True
     return any(pattern in text_lower for pattern in refusal_patterns)
 
+def save_all_hypotheses_csv(all_hypotheses: List[Dict], output_file: str):
+    """
+    Speichert alle Hypothesen in einer flachen CSV-Datei.
+    KORRIGIERTE VERSION: Öffnet die Datei im Append-Modus ('a'), um Daten
+    über mehrere Batches hinweg zu sammeln, ohne sie zu überschreiben.
+    Schreibt den Header nur, wenn die Datei neu erstellt wird oder leer ist.
+    """
+    if not all_hypotheses:
+        logger.warning("Es wurden keine Hypothesen zum Speichern übergeben.")
+        return
+
+    # Prüfen, ob die Datei bereits existiert UND nicht leer ist.
+    file_exists_and_has_content = os.path.exists(output_file) and os.path.getsize(output_file) > 0
+
+    try:
+        # IMMER im Append-Modus ('a') öffnen, um Daten sicher hinzuzufügen.
+        with open(output_file, mode='a', encoding='utf-8', newline='') as csvfile:
+            fieldnames = ['segment_id', 'source_text', 'hypothesis_id', 'text', 'score']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, delimiter='|')
+
+            # Schreibe den Header nur, wenn die Datei noch nicht existiert oder leer ist.
+            if not file_exists_and_has_content:
+                writer.writeheader()
+
+            # Iteriert durch jedes Segment und schreibt für jede Hypothese eine Zeile.
+            for segment_data in all_hypotheses:
+                segment_id = segment_data.get('segment_id')
+                source_text = segment_data.get('source_text', '')
+                for hyp_data in segment_data.get('hypotheses', []):
+                    writer.writerow({
+                        'segment_id': segment_id,
+                        'source_text': source_text,
+                        'hypothesis_id': hyp_data.get('hypothesis_id'),
+                        'text': hyp_data.get('text'),
+                        'score': hyp_data.get('score')
+                    })
+        
+        logger.debug(f"Hypothesen-Batch erfolgreich in {output_file} gespeichert/angehängt.")
+    except Exception as e:
+        logger.error(f"Fehler beim Speichern der Hypothesen-CSV: {e}", exc_info=True)
+
 # Übersetzen
 def translate_segments_optimized_safe(
     refined_transcription_path: str,
@@ -2187,10 +2228,11 @@ def translate_segments_optimized_safe(
     target_lang: str = "de",
     src_lang: str = "eng_Latn",
     tgt_lang: str = "deu_Latn",
-    batch_size: int = 1
+    batch_size: int = 2,
+    num_hypotheses: int = None
 ) -> Tuple[str, str]:
     """
-    KORRIGIERTE VERSION: Übersetzt Segmente mit verbesserter Entity-Behandlung.
+    Übersetzt Segmente mit verbesserter Entity-Behandlung und Multi-Hypothesis-Unterstützung.
     
     Args:
         refined_transcription_path (str): Pfad zur veredelten Quell-CSV.
@@ -2213,6 +2255,7 @@ def translate_segments_optimized_safe(
         logger.info(f"Benutzer hat dem Überschreiben von '{translation_output_file}' zugestimmt. Alte temporäre Dateien werden entfernt.")
         if os.path.exists(cleaned_source_output_file): os.remove(cleaned_source_output_file)
         if os.path.exists(translation_output_file): os.remove(translation_output_file)
+        if os.path.exists(HYPOTHESES_CSV): os.remove(HYPOTHESES_CSV)
 
     should_continue_translation, processed_keys = handle_key_based_continuation(
         translation_output_file, refined_transcription_path, key_column_index=0
@@ -2224,17 +2267,24 @@ def translate_segments_optimized_safe(
         return translation_output_file, cleaned_source_output_file
 
     df_source = pd.read_csv(refined_transcription_path, sep='|', dtype=str).fillna('')
+
     segments_to_process = []
+
     for i, row in df_source.iterrows():
         if row['startzeit'] not in processed_keys:
             entity_map_str = row.get('entity_map', '{}')
             current_entity_map = _json_str_to_entity_map(entity_map_str)
             # Der Text aus der Veredelungs-Pipeline enthält bereits die Platzhalter.
             protected_text = row['text']
+            clean_source = restore_entities_final(protected_text, current_entity_map)
             segments_to_process.append({
-                "id": i, "startzeit": row['startzeit'], "endzeit": row['endzeit'],
-                "original_text": row['text'], "protected_text": protected_text,
-                "entity_mapping": current_entity_map
+                "id": i,
+                "startzeit": row['startzeit'],
+                "endzeit": row['endzeit'],
+                "original_text": row['text'],
+                "protected_text": protected_text,
+                "entity_mapping": current_entity_map,
+                "clean_source_text": clean_source
             })
 
     if not segments_to_process:
@@ -2308,17 +2358,22 @@ def translate_segments_optimized_safe(
         # --- OPTION 3: MADLAD (mit CTranslate2) ---
         logger.info("Verwende MADLAD CTranslate2 für die Übersetzung.")
         translator_madlad, tokenizer_madlad = load_madlad400_translator_ct2(device=device)
-        for i in tqdm(range(0, len(segments_to_process), batch_size), desc="Übersetze geschützte Batches"):
+
+        for i in tqdm(range(0, len(segments_to_process), batch_size), desc="Übersetze geschützte Batches mit Multi-Hypothesis"):
             batch_data = segments_to_process[i:i + batch_size]
             texts_to_translate = [item['protected_text'] for item in batch_data]
-            # Aufruf der neuen MADLAD-Übersetzungsfunktion
-            translated_protected_texts = translate_batch_madlad(
+
+            # Aufruf der MADLAD-Übersetzungsfunktion
+            provisional_translations, hypotheses_csv_path = translate_batch_madlad(
                 texts=texts_to_translate,
                 translator=translator_madlad,
                 tokenizer=tokenizer_madlad,
-                target_lang=target_lang
+                target_lang=target_lang,
+                num_hypotheses=num_hypotheses,
+                batch_data=batch_data
             )
-            for j, translated_protected in enumerate(translated_protected_texts):
+            
+            for j, translated_text in enumerate(provisional_translations):
                 segment_data = batch_data[j]
                 # Entity-Wiederherstellung
                 current_entity_map = segment_data.get('entity_mapping', {})
@@ -2327,27 +2382,47 @@ def translate_segments_optimized_safe(
                     current_entity_map = {}
                 # Verwende robuste Wiederherstellung
                 final_translated_text = restore_entities_final(
-                    translated_protected,
+                    translated_text,
                     current_entity_map
                 )
+
                 # Debug-Logging für Entity-Pipeline
-                logger.debug(f"Segment {segment_data['id']}: {len(current_entity_map)} Entities, "
-                            f"Übersetzung: {final_translated_text[:100]}...")
-                print(f"\n[{segment_data['startzeit']} --> {segment_data['endzeit']}]:\n{final_translated_text}\n")
+                logger.debug(f"Segment {segment_data['id']}: {len(current_entity_map)} Entities")
+                print(f"\n[{segment_data['startzeit']} --> {segment_data['endzeit']}]:")
+                print(f"{final_translated_text}")
                 print(f"Entities: {len(current_entity_map)} gefunden\n")
+
                 all_translations.append({
                     'startzeit': segment_data["startzeit"],
                     'endzeit': segment_data["endzeit"],
                     'text': sanitize_for_csv_and_tts(final_translated_text)
                 })
+
                 all_cleaned_sources.append({
                     'startzeit': segment_data["startzeit"],
                     'endzeit': segment_data["endzeit"],
-                    'text': sanitize_for_csv_and_tts(segment_data['original_text'])
+                    'text': sanitize_for_csv_and_tts(segment_data['clean_source_text'])
                 })
 
-    save_progress_csv(all_translations, translation_output_file)
-    save_progress_csv(all_cleaned_sources, cleaned_source_output_file)
+            save_progress_csv(all_translations, translation_output_file)
+            save_progress_csv(all_cleaned_sources, cleaned_source_output_file)
+
+        # Models explizit entladen um VRAM zu befreien
+        del translator_madlad
+        del tokenizer_madlad
+    
+    # WICHTIG: GPU-Memory komplett leeren vor Similarity-Auswahl
+    comprehensive_gpu_cleanup()
+    time.sleep(3)
+    
+    # Semantische Hypothesen-Auswahl (nach Entladen der Translation-Models)
+    logger.info("Phase 2: Wähle semantisch beste Hypothesen aus...")
+    semantic_optimized_file = select_best_hypotheses_post_translation(
+        hypotheses_csv_path=HYPOTHESES_CSV,
+        translation_output_file=translation_output_file,
+        report_output_path="hypothesis_selection_report.txt",
+        similarity_model_name=ST_QUALITY_MODEL
+    )
 
     logger.info(f"Übersetzung abgeschlossen: {len(all_translations)} gültige Segmente.")
     print("\n---------------------------------")
@@ -2358,50 +2433,90 @@ def translate_segments_optimized_safe(
     logger.info(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden")
     print(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden -> {(translate_end_time / 60):.2f} Minuten")
 
-    return translation_output_file, cleaned_source_output_file
+    return semantic_optimized_file, cleaned_source_output_file
 
 def translate_batch_madlad(
     texts: List[str],
     translator: ctranslate2.Translator,
     tokenizer: T5TokenizerFast,
-    target_lang: str = "de"
-) -> List[str]:
+    target_lang: str = "de",
+    num_hypotheses: int = None,
+    source_texts: List[str] = None, # Hinzugefügt für Konsistenz
+    batch_data: List[Dict] = None
+) -> Tuple[List[str], str]:
     """
-    Führt eine Batch-Übersetzung mit dem MADLAD-CT2-Modell durch, basierend auf sentencepiece Tokenizer.
+    Führt eine Batch-Übersetzung mit dem MADLAD-CT2-Modell durch und verarbeitet die Hypothesen korrekt.
+
     Args:
-        texts (List[str]): Liste der Rohtexte zum Übersetzen.
+        texts (List[str]): Liste der Rohtexte zum Übersetzen (mit Platzhaltern).
         translator (ctranslate2.Translator): Bereits initialisiertes CTranslate2 MADLAD-Modell.
-        tokenizer (T5Tokenizer): T5Tokenizer für MADLAD-Model.
+        tokenizer (T5TokenizerFast): Der für MADLAD passende Tokenizer.
         target_lang (str): Sprach-Code für die Zielsprache, z.B. "de".
+        num_hypotheses (int): Anzahl der Übersetzungsvorschläge pro Segment.
+        source_texts (List[str]): Original-Quelltexte für die Hypothesen-CSV (ohne Platzhalter).
+        batch_data (List[Dict]): Metadaten der Segmente im Batch, insbesondere mit 'startzeit'.
 
     Returns:
-        List[str]: Liste der übersetzten Strings.
+        Tuple[List[str], str]: Eine Liste der besten Übersetzungen und der Pfad zur Hypothesen-CSV.
     """
-    # Quelldaten vorbereiten mit Sprachpräfix
-    prefixed_texts = [f"<2{target_lang}> " + txt for txt in texts]
-    # Tokenisierung (SentencePiece Token Liste als Strings)
+    logger.info(f"Starte Multi-Hypothesis MADLAD-Übersetzung mit {num_hypotheses} Vorschlägen pro Segment.")
+
+    # Quelldaten mit dem erforderlichen Sprachpräfix vorbereiten
+    prefixed_texts = [f"<2{target_lang}> {txt}" for txt in texts]
+
+    # Tokenisierung der vorbereiteten Texte
+    # CTranslate2 erwartet eine Liste von Token-Listen
     tokenized_texts = [tokenizer.tokenize(text) for text in prefixed_texts]
 
-    # Übersetzung mit Token-Listen
+    # Übersetzung mit CTranslate2 durchführen
+    # beam_size sollte >= num_hypotheses sein
     results = translator.translate_batch(
-        tokenized_texts,
+        source=tokenized_texts,
         batch_type="tokens",
         max_batch_size=1536,
-        beam_size=10,
-        patience=1.5,
+        beam_size=15,
+        num_hypotheses=num_hypotheses,
+        patience=2.0,
         repetition_penalty=1.5,
-        no_repeat_ngram_size=3
+        no_repeat_ngram_size=3,
+        return_scores=True
     )
-    # Ergebnisse dekodieren
-    decoded_texts = []
-    for res in results:
-        tokens = res.hypotheses[0]
-        # Tokens in IDs umwandeln
-        token_ids = tokenizer.convert_tokens_to_ids(tokens)
-        # Dekodieren mit Skip-Special
-        decoded = tokenizer.decode(token_ids, skip_special_tokens=True)
-        decoded_texts.append(decoded)
-    return decoded_texts
+
+    all_hypotheses_for_csv = []
+    provisional_best_translations = []
+
+    # Iteriere durch die Ergebnisse für jedes Segment im Batch
+    for i, result_item in enumerate(results):
+        segment_hypotheses = []
+        if result_item.hypotheses and result_item.scores and len(result_item.hypotheses) == len(result_item.scores):
+            for hyp_idx, tokens in enumerate(result_item.hypotheses):
+                score = result_item.scores[hyp_idx]
+                token_ids = tokenizer.convert_tokens_to_ids(tokens)
+                decoded_text = tokenizer.decode(token_ids, skip_special_tokens=True).strip()
+                segment_hypotheses.append({
+                    'hypothesis_id': hyp_idx,
+                    'text': decoded_text,
+                    'score': score
+                })
+        
+        all_hypotheses_for_csv.append({
+            'segment_id': batch_data[i]['id'],
+            'source_text': batch_data[i].get('clean_source_text', ''),
+            'hypotheses': segment_hypotheses
+        })
+
+        if segment_hypotheses:
+            provisional_best_translations.append(segment_hypotheses[0]['text'])
+        else:
+            logger.warning(f"Keine Hypothese für Segment mit ID {batch_data[i]['id']} generiert.")
+            provisional_best_translations.append("")
+
+    # Die globale Variable HYPOTHESES_CSV wird hier verwendet
+    hypotheses_csv_path = HYPOTHESES_CSV
+    save_all_hypotheses_csv(all_hypotheses_for_csv, hypotheses_csv_path)
+
+    logger.info("Multi-Hypothesis-Übersetzung abgeschlossen. Provisorische Auswahl basierend auf Scores.")
+    return provisional_best_translations, hypotheses_csv_path
 
 def translate_batch_nllb200(
     texts: list[str],
@@ -3255,6 +3370,202 @@ def cleanup_translation_artifacts(text: str) -> str:
     
     return ' '.join(words)
 
+def generate_hypothesis_selection_report(
+    hypotheses_csv_path: str,
+    best_translations_details: dict,
+    output_report_path: str
+):
+    """
+    Erstellt einen detaillierten Bericht über die Auswahl der besten Hypothesen.
+
+    Args:
+        hypotheses_csv_path (str): Pfad zur CSV mit allen generierten Hypothesen.
+        best_translations_details (dict): Ein Dictionary, das für jede Segment-ID die Details
+                                          der besten Auswahl enthält (Text, Score, etc.).
+        output_report_path (str): Pfad für den zu erstellenden Text-Bericht.
+    """
+    logger.info(f"Erstelle Hypothesenauswahl-Bericht für: {output_report_path}")
+    try:
+        df_hyp = pd.read_csv(hypotheses_csv_path, sep='|', dtype=str).fillna('')
+        expected_cols = {'segment_id', 'source_text', 'text', 'score'}
+        if not expected_cols.issubset(df_hyp.columns):
+            missing_cols = expected_cols - set(df_hyp.columns)
+            logger.error(f"Hypothesen-CSV fehlen Spalten: {missing_cols}. Bericht wird übersprungen.")
+            return
+
+        # ---- Statistische Auswertung ----
+        total_segments = len(best_translations_details)
+        total_hypotheses = len(df_hyp)
+        avg_hyp_per_segment = total_hypotheses / total_segments if total_segments > 0 else 0
+        
+        # Sammle alle Scores für die statistische Auswertung
+        all_scores = pd.to_numeric(df_hyp['score'], errors='coerce').dropna().tolist()
+        selected_scores = [details['similarity'] for details in best_translations_details.values()]
+
+        # ---- Berichtsinhalt erstellen ----
+        summary_content = (
+            f"Bericht zur semantischen Hypothesenauswahl\n"
+            f"====================================================\n"
+            f"Prüfungsdatum: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Hypothesen-Quelle: {hypotheses_csv_path}\n"
+            f"----------------------------------------------------\n"
+            f"Anzahl verarbeiteter Segmente: {total_segments}\n"
+            f"Anzahl generierter Hypothesen: {total_hypotheses}\n"
+            f"Durchschnittl. Hypothesen pro Segment: {avg_hyp_per_segment:.2f}\n"
+            f"----------------------------------------------------\n"
+            f"Score-Verteilung (alle Hypothesen):\n"
+            f"  - Durchschnitt: {np.mean(all_scores):.4f}\n"
+            f"  - Median:       {np.median(all_scores):.4f}\n"
+            f"  - Std.-Abw.:    {np.std(all_scores):.4f}\n"
+            f"----------------------------------------------------\n"
+            f"Ähnlichkeits-Score der ausgewählten Hypothesen:\n"
+            f"  - Durchschnitt: {np.mean(selected_scores):.4f}\n"
+            f"  - Median:       {np.median(selected_scores):.4f}\n"
+            f"  - Bester Score: {np.max(selected_scores):.4f}\n"
+            f"  - Schlechtester Score: {np.min(selected_scores):.4f}\n"
+            f"====================================================\n\n"
+            f"Details zu ausgewählten Segmenten (Top & Flop):\n\n"
+        )
+        
+        # Sortiere Segmente nach Score, um die interessantesten hervorzuheben
+        sorted_details = sorted(best_translations_details.items(), key=lambda item: item[1]['similarity'], reverse=True)
+        
+        # Top 3 Segmente
+        summary_content += "--- Top 3 Segmente (höchste Ähnlichkeit) ---\n"
+        for seg_id, details in sorted_details[:3]:
+            summary_content += (
+                f"- Segment {seg_id} (Score: {details['similarity']:.4f})\n"
+                f"  EN: {details['source_text']}\n"
+                f"  DE: {details['best_text']}\n\n"
+            )
+            
+        # Flop 3 Segmente
+        summary_content += "--- Flop 3 Segmente (niedrigste Ähnlichkeit) ---\n"
+        for seg_id, details in sorted_details[-3:]:
+             summary_content += (
+                f"- Segment {seg_id} (Score: {details['similarity']:.4f})\n"
+                f"  EN: {details['source_text']}\n"
+                f"  DE: {details['best_text']}\n\n"
+            )
+
+        with open(output_report_path, "w", encoding="utf-8") as f:
+            f.write(summary_content)
+        
+        logger.info(f"Hypothesenauswahl-Bericht erfolgreich gespeichert: {output_report_path}")
+
+    except Exception as e:
+        logger.error(f"Fehler bei der Erstellung des Hypothesen-Berichts: {e}", exc_info=True)
+
+def select_best_hypotheses_post_translation(
+    hypotheses_csv_path: str,
+    translation_output_file: str,
+    report_output_path: str,
+    similarity_model_name: str = ST_QUALITY_MODEL
+) -> str:
+    """
+    NEUE FUNKTION: Wählt die besten Hypothesen NACH der kompletten Übersetzung aus.
+    KORRIGIERTE VERSION: Liest ein "flaches" CSV-Format, bei dem jede Zeile
+    einer Hypothese entspricht, um den KeyError zu beheben.
+    """
+    logger.info("Starte semantische Hypothesen-Auswahl (VRAM-optimiert)...")
+    if not os.path.exists(hypotheses_csv_path):
+        logger.warning(f"Hypothesen-CSV nicht gefunden: {hypotheses_csv_path}. Auswahl wird übersprungen.")
+        return translation_output_file
+
+    df_hyp = pd.read_csv(hypotheses_csv_path, sep='|', dtype=str).fillna('')
+
+    # Überprüfen der Spalten im flachen Format
+    expected_cols = {'segment_id', 'source_text', 'text', 'score'}
+    if not expected_cols.issubset(df_hyp.columns):
+        missing_cols = expected_cols - set(df_hyp.columns)
+        logger.error(f"Hypothesen-CSV fehlen Spalten: {missing_cols}. Auswahl wird übersprungen.")
+        return translation_output_file
+
+    # Gruppiere die flachen Daten nach der Segment-ID
+    segments_with_hypotheses = {}
+    for _, row in df_hyp.iterrows():
+        try:
+            seg_id = int(row['segment_id'])
+        except (ValueError, TypeError):
+            logger.warning(f"Ungültige segment_id '{row['segment_id']}' in Hypothesen-CSV übersprungen.")
+            continue
+        
+        if seg_id not in segments_with_hypotheses:
+            segments_with_hypotheses[seg_id] = {
+                'source_text': row['source_text'],
+                'hypotheses': []
+            }
+        
+        # Füge die Hypothese aus der aktuellen Zeile der Liste hinzu
+        segments_with_hypotheses[seg_id]['hypotheses'].append({
+            'text': row['text'],
+            'score': float(row['score']) if row['score'] else 0.0
+        })
+
+    if not segments_with_hypotheses:
+        logger.warning("Keine gültigen Hypothesen in der CSV-Datei gefunden.")
+        return translation_output_file
+    
+    comprehensive_gpu_cleanup()
+    time.sleep(2)
+    
+    best_translations = {}
+    best_translations_details = {}
+    
+    with gpu_context():
+        logger.info(f"Lade Similarity-Modell: {similarity_model_name}")
+        similarity_model = SentenceTransformer(similarity_model_name, device=device)
+
+        for seg_id, seg_data in tqdm(segments_with_hypotheses.items(), desc="Wähle beste Hypothesen"):
+            source_text = seg_data['source_text']
+            hypotheses = seg_data['hypotheses']
+
+            if not source_text or not hypotheses:
+                best_hyp = max(hypotheses, key=lambda h: h['score']) if hypotheses else {'text': ''}
+                best_translations[seg_id] = best_hyp['text']
+                best_translations_details[seg_id] = {
+                    'best_text': best_hyp['text'],
+                    'similarity': 0.0,
+                    'source_text': source_text
+                }
+                continue
+
+            source_embedding = similarity_model.encode([source_text], convert_to_tensor=True)
+            hypothesis_texts = [h['text'] for h in hypotheses]
+            hypothesis_embeddings = similarity_model.encode(hypothesis_texts, convert_to_tensor=True)
+            
+            # Zugriff auf das erste Element, da cos_sim einen 2D-Tensor zurückgibt
+            similarities = cos_sim(source_embedding, hypothesis_embeddings)[0].cpu().numpy()
+            
+            best_idx = np.argmax(similarities)
+            best_translations[seg_id] = hypotheses[best_idx]['text']
+            best_translations_details[seg_id] = {
+                'best_text': hypotheses[best_idx]['text'],
+                'similarity': similarities[best_idx],
+                'source_text': source_text,
+                'all_hypotheses_with_scores': sorted(zip(hypothesis_texts, similarities), key=lambda x: x[1], reverse=True)
+            }
+
+    if os.path.exists(translation_output_file):
+        df_trans = pd.read_csv(translation_output_file, sep='|', dtype=str).fillna('')
+        
+        # Der Index des DataFrames 'df_trans' sollte der 'seg_id' entsprechen.
+        for i, row in df_trans.iterrows():
+            if i in best_translations:
+                df_trans.at[i, 'text'] = best_translations[i]
+
+        updated_path = translation_output_file.replace('.csv', '_semantic_best.csv')
+        df_trans.to_csv(updated_path, sep='|', index=False, encoding='utf-8')
+        logger.info(f"Semantisch optimierte Übersetzung gespeichert: {updated_path}")
+        generate_hypothesis_selection_report(
+            hypotheses_csv_path=hypotheses_csv_path,
+            best_translations_details=best_translations_details,
+            output_report_path=report_output_path
+        )
+        return updated_path
+        
+    return translation_output_file
+
 def is_valid_segment(segment, check_text_content=True):
     """
     Erweiterte Hilfsfunktion zur Segmentvalidierung mit detailliertem Logging.
@@ -3358,7 +3669,14 @@ def evaluate_translation_quality(
         corrected_similarities = similarities.copy()
         auto_corrected_segments = []
 
-        for i in tqdm(range(len(df_source)), desc="Qualitätsprüfung & Korrektur"):
+        # Dies wird der "total"-Wert für unseren neuen Fortschrittsbalken.
+        segments_to_correct_count = sum(1 for sim in similarities if sim < threshold)
+
+        # Manuelle Initialisierung des tqdm-Fortschrittsbalkens.
+        # Er wird nur die tatsächlichen Korrekturvorgänge zählen.
+        correction_pbar = tqdm(total=segments_to_correct_count, desc="Korrektur markierter Segmente")
+
+        for i in range(len(df_source)):
             similarity = similarities[i]
             status = f"OK ({similarity:.3f})"
             flag = ""
@@ -3480,6 +3798,9 @@ def evaluate_translation_quality(
                 # Ende der Live-Ausgabe für dieses Segment
                 tqdm.write("="*80 + "\n")
 
+                # Fortschrittsbalken aktualisieren, da ein Korrektur-Block abgeschlossen ist.
+                correction_pbar.update(1)
+
             results.append({
                 original_source_columns[0]: df_source.iloc[i].get(original_source_columns[0].lower(), 'N/A'),
                 original_source_columns[1]: df_source.iloc[i].get(original_source_columns[1].lower(), 'N/A'),
@@ -3491,6 +3812,9 @@ def evaluate_translation_quality(
                 "Korrektur_Note": correction_note,
                 "Flag": flag
             })
+
+        # Nach der Schleife: Den manuell erstellten Fortschrittsbalken schließen.
+        correction_pbar.close()
 
         # Detaillierten Bericht speichern
         df_report = pd.DataFrame(results)
@@ -5020,6 +5344,7 @@ def text_to_speech_with_voice_cloning(
             logger.info(f"TTS-Modell und Conditioning-Latents erfolgreich geladen...({sample_paths})")
             print(f"TTS-Modell und Conditioning-Latents erfolgreich geladen...({sample_paths})")
 
+            
             print("🚀 DeepSpeed-Initialisierung...")
             ds_engine = deepspeed.init_inference(
                 model=xtts_model,
@@ -5031,12 +5356,14 @@ def text_to_speech_with_voice_cloning(
             )
             optimized_tts_model = ds_engine.module
             logger.info("✅ DeepSpeed erfolgreich initialisiert")
+            
 
             for segment_info in tqdm(segments_to_process, desc="Synthetisiere Audio-Chunks"):
                 try:
                     with torch.inference_mode():
                         # Die Inferenz wird nun auf dem vom StreamManager verwalteten Stream ausgeführt.
                         result = optimized_tts_model.inference(
+                        #result = xtts_model.inference(
                             text=segment_info['text'],
                             language="de",
                             gpt_cond_latent=gpt_cond_latent,
@@ -5044,8 +5371,8 @@ def text_to_speech_with_voice_cloning(
                             speed=1.1,
                             temperature=0.75,
                             repetition_penalty=5.0,
-                            top_k=50,
-                            top_p=0.80,
+                            top_k=55,
+                            top_p=0.85,
                             enable_text_splitting=False
                         )
                         print(f"\n[{segment_info['start']} --> {segment_info['end']}]:\n{segment_info['text']}\n")
@@ -5559,7 +5886,8 @@ def main():
             source_lang=source_lang,
             target_lang=target_lang,
             src_lang=src_lang,
-            tgt_lang=tgt_lang
+            tgt_lang=tgt_lang,
+            num_hypotheses=5
         )
         if not translation_file_path:
             logger.error("Übersetzung fehlgeschlagen."); return
