@@ -108,6 +108,7 @@ import ctranslate2
 from ctranslate2 import Translator, models
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
+from TTS.api import TTS
 #import whisper
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from pydub.effects import(
@@ -156,7 +157,7 @@ def setup_global_torch_optimizations():
     os.environ['TRITON_DISABLE_CACHE'] = '1'
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
     # Setzt CTranslate2-spezifische Caching-Parameter für den Speicher, optimiert für Inferenz.
-    os.environ['CT2_CUDA_CACHING_ALLOCATOR_CONFIG'] = '4,3,10,104857600'
+    os.environ['CT2_CUDA_CACHING_ALLOCATOR_CONFIG'] = '4,3,10,209715200'
     os.environ['CT2_CUDA_ALLOW_FP16'] = '1' # Erlaubt CTranslate2 die Nutzung von FP16 für schnellere Berechnungen.
     os.environ['CT2_USE_EXPERIMENTAL_PACKED_GEMM'] = '1' # Aktiviert einen experimentellen, schnelleren Algorithmus für Matrixmultiplikationen.
     logger.info("Umgebungsvariablen für GPU-Speicheroptimierung gesetzt.") # Bestätigungs-Log.
@@ -377,6 +378,51 @@ def stop_language_tool_server(process: subprocess.Popen):
             process.wait()
             logger.info("✅ LanguageTool-Server wurde beendet (kill).")
 
+# Context Manager für GPU-Operationen
+@contextmanager
+def gpu_context():
+    """Stellt sicher, dass der GPU-Speicher nach einer Operation freigegeben wird."""
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            logger.info("GPU-Speicher durch gpu_context bereinigt.")
+
+@contextmanager
+def synchronized_cuda_stream(stream, wait_for_streams=None):
+    """Context-Manager für sichere CUDA-Stream-Synchronisation."""
+    if not torch.cuda.is_available():
+        yield
+        return
+
+    # Vorab-Synchronisation mit anderen Streams (falls angegeben)
+    if wait_for_streams:
+        for wait_stream in wait_for_streams:
+            if wait_stream != stream:
+                stream.wait_stream(wait_stream)
+
+    # Code im Stream ausführen
+    with torch.cuda.stream(stream):
+        yield
+
+    # Nach Ausführung synchronisieren
+    stream.synchronize()
+
+def create_cuda_stream():
+    """Sichere Erstellung eines CUDA-Streams mit Fallback für ältere PyTorch-Versionen."""
+    try:
+        _, high_priority = torch.cuda.stream_priority_range()
+        stream = torch.cuda.Stream(priority=high_priority)
+        logger.info("CUDA-Stream mit hoher Priorität erstellt.")
+    except AttributeError:
+        # Fallback: Stream ohne Priorität (für ältere PyTorch-Versionen)
+        stream = torch.cuda.Stream()
+        logger.warning("Fallback: CUDA-Stream ohne Priorität erstellt (PyTorch-Version unterstützt stream_priority_range nicht).")
+    return stream
+
 # Konfigurationen für die Verwendung von CUDA
 cuda_options = {
     "hwaccel": "cuda",
@@ -431,6 +477,32 @@ def comprehensive_gpu_cleanup():
     
     logger.info("GPU-Speicherbereinigung abgeschlossen.")
 
+def clear_spacy_cache_and_free_vram():
+    """
+    NEU: Entfernt explizit Modelle aus dem globalen spaCy-Cache und führt
+    anschließend eine umfassende GPU-Speicherbereinigung durch.
+    Dies ist entscheidend, um den VRAM vor dem Laden des nächsten großen Modells (z.B. Translator) freizugeben.
+    """
+    global _SPACY_MODELS_CACHE
+    logger.info("Starte explizite Entleerung des spaCy-Modell-Caches und VRAM-Freigabe.")
+
+    # Überprüfen, ob der Cache existiert und nicht leer ist
+    if _SPACY_MODELS_CACHE and isinstance(_SPACY_MODELS_CACHE, dict):
+        # Alle Modelle im Cache explizit aus dem Speicher entfernen
+        for model_name, model_instance in list(_SPACY_MODELS_CACHE.items()):
+            logger.info(f"Entferne spaCy-Modell '{model_name}' aus dem globalen Cache.")
+            # Entferne die Referenz aus dem Cache
+            del _SPACY_MODELS_CACHE[model_name]
+            # Entferne die Instanz selbst
+            del model_instance
+    
+    # Setze den Cache auf ein leeres Dictionary zurück, um sicherzugehen
+    _SPACY_MODELS_CACHE = {}
+    
+    # Führe nun die bereits existierende, gründliche Bereinigung durch
+    logger.info("spaCy-Cache geleert. Führe jetzt comprehensive_gpu_cleanup durch.")
+    comprehensive_gpu_cleanup()
+
 def run_command(command):
     """Führt einen Shell-Befehl aus und gibt ihn vorher aus."""
     print(f"Ausführung des Befehls: {command}")
@@ -454,7 +526,7 @@ def load_whisper_model():
     pipeline = BatchedInferencePipeline(model=fw_model)
     return pipeline
 
-def load_madlad400_translator_ct2(model_path: str = "madlad400-3b-mt-int8_bfloat16", device: str = "cuda") -> Tuple[ctranslate2.Translator, transformers.T5Tokenizer]:
+def load_madlad400_translator_ct2(model_path: str = MADLAD400_MODEL_DIR, device: str = "cuda") -> Tuple[ctranslate2.Translator, transformers.T5Tokenizer]:
     """
     LÄDT DEN KONVERTIERTEN CTranslate2-Übersetzer und den originalen Tokenizer.
     
@@ -529,19 +601,6 @@ def load_xtts_v2():
     xtts_model.eval()
 
     return xtts_model
-
-# Context Manager für GPU-Operationen
-@contextmanager
-def gpu_context():
-    """Stellt sicher, dass der GPU-Speicher nach einer Operation freigegeben wird."""
-    try:
-        yield
-    finally:
-        if torch.cuda.is_available():
-            gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-            logger.info("GPU-Speicher durch gpu_context bereinigt.")
 
 def ask_overwrite(file_path):
     """
@@ -2230,7 +2289,7 @@ def translate_segments_optimized_safe(
     tgt_lang: str = "deu_Latn",
     batch_size: int = 2,
     num_hypotheses: int = None
-) -> Tuple[str, str]:
+) -> Tuple[str, str, str]:
     """
     Übersetzt Segmente mit verbesserter Entity-Behandlung und Multi-Hypothesis-Unterstützung.
     
@@ -2244,12 +2303,12 @@ def translate_segments_optimized_safe(
         batch_size (int): Batch-Größe für Übersetzung
         
     Returns:
-        Tuple[str, str]: Pfade zu den erstellten Dateien.
+        Tuple[str, str, str]: Pfade zu den erstellten Dateien (provisorische Übersetzung, bereinigter Quelltext, Hypothesen-CSV).
     """
 
     if os.path.exists(translation_output_file) and not ask_overwrite(translation_output_file):
         logger.info(f"Verwende vorhandenen Übersetzungsbericht: {translation_output_file}")
-        return translation_output_file, cleaned_source_output_file
+        return translation_output_file, cleaned_source_output_file, HYPOTHESES_CSV
     else:
         # Der Benutzer möchte überschreiben, also räumen wir auf.
         logger.info(f"Benutzer hat dem Überschreiben von '{translation_output_file}' zugestimmt. Alte temporäre Dateien werden entfernt.")
@@ -2269,6 +2328,7 @@ def translate_segments_optimized_safe(
     df_source = pd.read_csv(refined_transcription_path, sep='|', dtype=str).fillna('')
 
     segments_to_process = []
+    source_texts_for_similarity = []
 
     for i, row in df_source.iterrows():
         if row['startzeit'] not in processed_keys:
@@ -2362,8 +2422,9 @@ def translate_segments_optimized_safe(
         for i in tqdm(range(0, len(segments_to_process), batch_size), desc="Übersetze geschützte Batches mit Multi-Hypothesis"):
             batch_data = segments_to_process[i:i + batch_size]
             texts_to_translate = [item['protected_text'] for item in batch_data]
+            batch_source_texts = source_texts_for_similarity[i:i + batch_size]
 
-            # Aufruf der MADLAD-Übersetzungsfunktion
+            # Aufruf der neuen MADLAD-Übersetzungsfunktion
             provisional_translations, hypotheses_csv_path = translate_batch_madlad(
                 texts=texts_to_translate,
                 translator=translator_madlad,
@@ -2372,9 +2433,10 @@ def translate_segments_optimized_safe(
                 num_hypotheses=num_hypotheses,
                 batch_data=batch_data
             )
-            
+
             for j, translated_text in enumerate(provisional_translations):
                 segment_data = batch_data[j]
+
                 # Entity-Wiederherstellung
                 current_entity_map = segment_data.get('entity_mapping', {})
                 if not current_entity_map:
@@ -2388,7 +2450,7 @@ def translate_segments_optimized_safe(
 
                 # Debug-Logging für Entity-Pipeline
                 logger.debug(f"Segment {segment_data['id']}: {len(current_entity_map)} Entities")
-                print(f"\n[{segment_data['startzeit']} --> {segment_data['endzeit']}]:")
+                print(f"\n\n[{segment_data['startzeit']} --> {segment_data['endzeit']}]:")
                 print(f"{final_translated_text}")
                 print(f"Entities: {len(current_entity_map)} gefunden\n")
 
@@ -2397,32 +2459,19 @@ def translate_segments_optimized_safe(
                     'endzeit': segment_data["endzeit"],
                     'text': sanitize_for_csv_and_tts(final_translated_text)
                 })
-
                 all_cleaned_sources.append({
                     'startzeit': segment_data["startzeit"],
                     'endzeit': segment_data["endzeit"],
                     'text': sanitize_for_csv_and_tts(segment_data['clean_source_text'])
                 })
 
+            # Speichern des Zwischenstands
             save_progress_csv(all_translations, translation_output_file)
             save_progress_csv(all_cleaned_sources, cleaned_source_output_file)
 
         # Models explizit entladen um VRAM zu befreien
         del translator_madlad
         del tokenizer_madlad
-    
-    # WICHTIG: GPU-Memory komplett leeren vor Similarity-Auswahl
-    comprehensive_gpu_cleanup()
-    time.sleep(3)
-    
-    # Semantische Hypothesen-Auswahl (nach Entladen der Translation-Models)
-    logger.info("Phase 2: Wähle semantisch beste Hypothesen aus...")
-    semantic_optimized_file = select_best_hypotheses_post_translation(
-        hypotheses_csv_path=HYPOTHESES_CSV,
-        translation_output_file=translation_output_file,
-        report_output_path="hypothesis_selection_report.txt",
-        similarity_model_name=ST_QUALITY_MODEL
-    )
 
     logger.info(f"Übersetzung abgeschlossen: {len(all_translations)} gültige Segmente.")
     print("\n---------------------------------")
@@ -2433,7 +2482,7 @@ def translate_segments_optimized_safe(
     logger.info(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden")
     print(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden -> {(translate_end_time / 60):.2f} Minuten")
 
-    return semantic_optimized_file, cleaned_source_output_file
+    return translation_output_file, cleaned_source_output_file, hypotheses_csv_path
 
 def translate_batch_madlad(
     texts: List[str],
@@ -2473,21 +2522,24 @@ def translate_batch_madlad(
     results = translator.translate_batch(
         source=tokenized_texts,
         batch_type="tokens",
-        max_batch_size=1536,
-        beam_size=15,
+        max_batch_size=1024,
+        beam_size=max(15, num_hypotheses),
         num_hypotheses=num_hypotheses,
-        patience=2.0,
+        patience=0.5,
+        length_penalty=0.1,
+        coverage_penalty=0.3,
         repetition_penalty=1.5,
         no_repeat_ngram_size=3,
         return_scores=True
     )
 
+    # Alle Hypothesen dekodieren
     all_hypotheses_for_csv = []
     provisional_best_translations = []
 
-    # Iteriere durch die Ergebnisse für jedes Segment im Batch
     for i, result_item in enumerate(results):
         segment_hypotheses = []
+        # Sichere Iteration über Hypothesen und Scores
         if result_item.hypotheses and result_item.scores and len(result_item.hypotheses) == len(result_item.scores):
             for hyp_idx, tokens in enumerate(result_item.hypotheses):
                 score = result_item.scores[hyp_idx]
@@ -3442,7 +3494,7 @@ def generate_hypothesis_selection_report(
         # Flop 3 Segmente
         summary_content += "--- Flop 3 Segmente (niedrigste Ähnlichkeit) ---\n"
         for seg_id, details in sorted_details[-3:]:
-             summary_content += (
+            summary_content += (
                 f"- Segment {seg_id} (Score: {details['similarity']:.4f})\n"
                 f"  EN: {details['source_text']}\n"
                 f"  DE: {details['best_text']}\n\n"
@@ -3463,11 +3515,24 @@ def select_best_hypotheses_post_translation(
     similarity_model_name: str = ST_QUALITY_MODEL
 ) -> str:
     """
-    NEUE FUNKTION: Wählt die besten Hypothesen NACH der kompletten Übersetzung aus.
-    KORRIGIERTE VERSION: Liest ein "flaches" CSV-Format, bei dem jede Zeile
+    Wählt die besten Hypothesen NACH der kompletten Übersetzung aus.
+    Liest ein "flaches" CSV-Format, bei dem jede Zeile
     einer Hypothese entspricht, um den KeyError zu beheben.
     """
     logger.info("Starte semantische Hypothesen-Auswahl (VRAM-optimiert)...")
+
+    # Pfad zur finalen Ausgabedatei frühzeitig definieren
+    updated_path = translation_output_file.replace('.csv', '_semantic_best.csv')
+
+    # Prüfen, ob die *finale* semantisch optimierte Datei bereits existiert.
+    if os.path.exists(updated_path):
+        if not ask_overwrite(updated_path):
+            logger.info(f"Verwende vorhandene semantisch optimierte Datei: {updated_path}")
+            return updated_path
+        else:
+            # Der Benutzer hat dem Überschreiben zugestimmt.
+            logger.info(f"Benutzer hat Überschreiben von '{updated_path}' zugestimmt. Starte Auswahlprozess neu.")
+
     if not os.path.exists(hypotheses_csv_path):
         logger.warning(f"Hypothesen-CSV nicht gefunden: {hypotheses_csv_path}. Auswahl wird übersprungen.")
         return translation_output_file
@@ -3505,9 +3570,6 @@ def select_best_hypotheses_post_translation(
     if not segments_with_hypotheses:
         logger.warning("Keine gültigen Hypothesen in der CSV-Datei gefunden.")
         return translation_output_file
-    
-    comprehensive_gpu_cleanup()
-    time.sleep(2)
     
     best_translations = {}
     best_translations_details = {}
@@ -3615,7 +3677,7 @@ def evaluate_translation_quality(
     model_name,
     threshold,
     correction_model="qwen3:8b",
-    max_retries=5
+    max_retries=3
 ) -> Tuple[str, str]:
     """
     Prüft semantische Ähnlichkeit, korrigiert niedrige Segmente automatisch via Ollama
@@ -3624,6 +3686,163 @@ def evaluate_translation_quality(
     Returns:
         Tuple[str, str]: (report_path, corrected_csv_path)
     """
+
+    # =================================================================
+    # ERWEITERBARES VOKABULAR-UNTERSTÜTZUNGSSYSTEM
+    # =================================================================
+    
+    VOCABULARY_HINTS = {
+        # Häufig problematische Wörter mit deutschen Übersetzungsoptionen
+        "abomination": "Abscheulichkeit, Abscheu, Gräuel, Verabscheuung",
+        "atrocity": "Grausamkeit, Gräueltat, Scheußlichkeit",
+        "heinous": "abscheulich, verrucht, niederträchtig",
+        "vile": "widerlich, abscheulich, gemein",
+        "despicable": "verachtenswert, niederträchtig, abscheulich",
+        "grotesque": "grotesk, abstoßend, bizarr",
+        "macabre": "makaber, grausig, düster",
+        "sinister": "finster, unheilverkündend, bedrohlich",
+        "ominous": "unheilverkündend, bedrohlich, düster",
+        "eerie": "unheimlich, gespenstisch, schauerlich",
+        "uncanny": "unheimlich, seltsam, merkwürdig",
+        "bewildering": "verwirrend, rätselhaft, bestürzend",
+        "perplexing": "verwirrend, rätselhaft, puzzelnd",
+        "disconcerting": "beunruhigend, verwirrend, verstörend",
+        "harrowing": "erschütternd, quälend, herzzerreißend",
+        "excruciating": "qualvoll, unerträglich, peinigend",
+        "agonizing": "qualvoll, schmerzhaft, peinigend",
+        "torturous": "quälend, folternd, peinigend",
+        "insufferable": "unerträglich, unausstehlich",
+        "unbearable": "unerträglich, nicht zu ertragen",
+        "relentless": "unerbittlich, gnadenlos, unaufhörlich",
+        "ruthless": "rücksichtslos, unbarmherzig, gnadenlos",
+        "merciless": "gnadenlos, erbarmungslos, unbarmherzig",
+        "callous": "gefühllos, herzlos, abgestumpft",
+        "indifferent": "gleichgültig, teilnahmslos, uninteressiert",
+        "apathetic": "teilnahmslos, gleichgültig, apathisch",
+        "cynical": "zynisch, spöttisch, misstrauisch",
+        "skeptical": "skeptisch, zweiflerisch, misstrauisch",
+        "dubious": "zweifelhaft, fragwürdig, verdächtig",
+        "suspicious": "verdächtig, misstrauisch, argwöhnisch",
+        "precarious": "prekär, unsicher, wackelig",
+        "volatile": "flüchtig, unbeständig, explosiv",
+        "turbulent": "turbulent, stürmisch, unruhig",
+        "chaotic": "chaotisch, ungeordnet, wirr",
+        "pandemonium": "Chaos, Tumult, Höllenlärm",
+        "mayhem": "Chaos, Verwüstung, Tumult",
+        "havoc": "Verwüstung, Chaos, Zerstörung",
+        "carnage": "Gemetzel, Blutbad, Verwüstung",
+        "slaughter": "Gemetzel, Schlachtung, Massaker",
+        "massacre": "Massaker, Gemetzel, Blutbad",
+        "annihilation": "Vernichtung, Auslöschung, Zerstörung",
+        "devastation": "Verwüstung, Zerstörung, Verheerung",
+        "obliteration": "Auslöschung, Vernichtung, Zerstörung",
+        "extermination": "Ausrottung, Vernichtung, Tilgung",
+        "eradication": "Ausrottung, Beseitigung, Tilgung",
+        "elimination": "Beseitigung, Ausschaltung, Eliminierung",
+        "termination": "Beendigung, Kündigung, Abbruch",
+        "cessation": "Einstellung, Beendigung, Aufhören",
+        "culmination": "Höhepunkt, Kulmination, Gipfel",
+        "pinnacle": "Gipfel, Höhepunkt, Spitze",
+        "zenith": "Zenit, Höhepunkt, Gipfel",
+        "apex": "Spitze, Gipfel, Höhepunkt",
+        "summit": "Gipfel, Höhepunkt, Spitze",
+        "paramount": "von höchster Bedeutung, vorrangig",
+        "quintessential": "typisch, wesentlich, charakteristisch",
+        "epitome": "Inbegriff, Verkörperung, Musterbeispiel",
+        "embodiment": "Verkörperung, Inbegriff, Verkörperung",
+        "manifestation": "Manifestation, Erscheinung, Ausdruck",
+        "revelation": "Offenbarung, Enthüllung, Erkenntnis",
+        "epiphany": "Erleuchtung, plötzliche Erkenntnis",
+        "enlightenment": "Erleuchtung, Aufklärung, Erkenntnis",
+        "illumination": "Erleuchtung, Beleuchtung, Erhellung",
+        "clarification": "Klärung, Klarstellung, Aufklärung",
+        "elucidation": "Erläuterung, Aufklärung, Verdeutlichung",
+        "elaboration": "Ausarbeitung, Erläuterung, Verfeinerung",
+        "sophistication": "Raffinesse, Kultiviertheit, Verfeinerung",
+        "refinement": "Verfeinerung, Kultiviertheit, Eleganz",
+        "elegance": "Eleganz, Anmut, Vornehmheit",
+        "magnificence": "Pracht, Herrlichkeit, Großartigkeit",
+        "splendor": "Pracht, Glanz, Herrlichkeit",
+        "grandeur": "Pracht, Großartigkeit, Erhabenheit",
+        "majesty": "Majestät, Erhabenheit, Würde",
+        "dignity": "Würde, Anstand, Ehre",
+        "nobility": "Adel, Vornehmheit, Edelmut",
+        "integrity": "Integrität, Ehrlichkeit, Aufrichtigkeit",
+        "sincerity": "Aufrichtigkeit, Ehrlichkeit, Offenheit",
+        "authenticity": "Authentizität, Echtheit, Glaubwürdigkeit",
+        "genuineness": "Echtheit, Aufrichtigkeit, Ehrlichkeit",
+        "candor": "Offenheit, Aufrichtigkeit, Ehrlichkeit",
+        "transparency": "Transparenz, Durchsichtigkeit, Offenheit",
+        "lucidity": "Klarheit, Durchsichtigkeit, Verständlichkeit",
+        "clarity": "Klarheit, Deutlichkeit, Verständlichkeit",
+        "coherence": "Kohärenz, Zusammenhang, Stimmigkeit",
+        "consistency": "Konsistenz, Beständigkeit, Folgerichtigkeit",
+        "persistence": "Ausdauer, Beharrlichkeit, Durchhaltevermögen",
+        "perseverance": "Ausdauer, Durchhaltevermögen, Beharrlichkeit",
+        "tenacity": "Hartnäckigkeit, Zähigkeit, Ausdauer",
+        "resilience": "Widerstandsfähigkeit, Belastbarkeit, Elastizität",
+        "fortitude": "Standhaftigkeit, Mut, innere Stärke",
+        "valor": "Tapferkeit, Mut, Heldenmut",
+        "courage": "Mut, Tapferkeit, Kühnheit",
+        "bravery": "Tapferkeit, Mut, Kühnheit",
+        "audacity": "Kühnheit, Dreistigkeit, Wagemut",
+        "boldness": "Kühnheit, Wagemut, Dreistigkeit",
+        "intrepidity": "Unerschrockenheit, Furchtlosigkeit, Mut",
+        "fearlessness": "Furchtlosigkeit, Unerschrockenheit",
+        "dauntlessness": "Unerschrockenheit, Unverwüstlichkeit",
+        "indomitable": "unbezwingbar, unbesiegbar, unbeugsam",
+        "invincible": "unbesiegbar, unverwundbar, unbezwingbar",
+        "unconquerable": "unbesiegbar, unbezwingbar",
+        "impregnable": "uneinnehmbar, unüberwindlich",
+        "insurmountable": "unüberwindlich, unüberwindbar",
+        "invulnerable": "unverwundbar, unverwüstlich",
+        "impervious": "undurchdringlich, unzugänglich",
+        "impenetrable": "undurchdringlich, unverständlich",
+        "incomprehensible": "unverständlich, unbegreiflich",
+        "unfathomable": "unergründlich, unermesslich",
+        "inscrutable": "unergründlich, rätselhaft",
+        "enigmatic": "rätselhaft, geheimnisvoll",
+        "mysterious": "geheimnisvoll, rätselhaft, mysteriös",
+        "cryptic": "kryptisch, rätselhaft, verschlüsselt",
+        "obscure": "dunkel, unklar, verborgen",
+        "ambiguous": "mehrdeutig, zweideutig, unklar",
+        "equivocal": "zweideutig, mehrdeutig, ausweichend",
+        "vague": "vage, unbestimmt, unklar",
+        "nebulous": "nebelhaft, verschwommen, unklar",
+        "elusive": "schwer fassbar, flüchtig, ausweichend",
+        "ephemeral": "vergänglich, kurzlebig, flüchtig",
+        "transient": "vorübergehend, vergänglich, flüchtig",
+        "fleeting": "flüchtig, vergänglich, kurz",
+        "momentary": "augenblicklich, kurzzeitig, vorübergehend",
+        "temporary": "vorübergehend, zeitweilig, temporär",
+        "provisional": "vorläufig, provisorisch, zeitweilig",
+        "interim": "vorläufig, Zwischen-, einstweilig",
+        "preliminary": "vorläufig, einleitend, Vor-",
+        "preparatory": "vorbereitend, Vorbereitungs-",
+        "introductory": "einführend, einleitend, Einführungs-",
+        
+        # Hier können Sie beliebig weitere Einträge hinzufügen:
+        # "your_word": "deutsche Übersetzung 1, deutsche Übersetzung 2, deutsche Übersetzung 3",
+    }
+    
+    # Erstelle Vokabular-Unterstützungstext für den Prompt
+    def create_vocabulary_support():
+        """Erstellt einen formatierten Vokabel-Unterstützungstext."""
+        if not VOCABULARY_HINTS:
+            return ""
+        
+        vocab_text = "\n\nVOCABULARY SUPPORT:\n"
+        vocab_text += "For frequently mistranslated or untranslated terms, consider these German options:\n"
+        
+        # Sortiere alphabetisch für bessere Übersichtlichkeit
+        for english_word, german_options in sorted(VOCABULARY_HINTS.items()):
+            vocab_text += f"• {english_word} ▷ {german_options}\n"
+        
+        vocab_text += "\nUse these as GUIDANCE only. Always choose the translation that fits the context best.\n"
+        return vocab_text
+    
+    # =================================================================
+
     if os.path.exists(report_path) and not ask_overwrite(report_path):
         logger.info(f"Verwende vorhandenen Qualitätsbericht: {report_path}")
         corrected_translation_csv = translated_csv_path.replace('.csv', '_corrected.csv')
@@ -3702,7 +3921,7 @@ def evaluate_translation_quality(
                 best_correction = orig_de
 
                 # Definiert die Temperatur für jeden Versuch
-                temperatures = [0.0, 0.05, 0.1, 0.2, 0.2]
+                temperatures = [0.0, 0.05, 0.1]
 
                 for attempt in range(max_retries):
                     try:
@@ -3731,9 +3950,15 @@ def evaluate_translation_quality(
                                         "3) STRUCTURE & PUNCTUATION: Mirror the sentence count and punctuation of the English source as closely as German grammar allows."
                                         "4) ENTITIES: Never alter numbers, dates, or proper names."
                                     )
+
+                        # ✅ VOKABULAR-UNTERSTÜTZUNG HINZUFÜGEN
+                        vocabulary_support = create_vocabulary_support()
+                        system_prompt += vocabulary_support
+
+
                         user_prompt = (
                                             f"SOURCE TEXT (ENGLISH): {source_texts[i]}\n\n"
-                                            f"TRANSLATION TO CORRECT (GERMAN): {translated_texts[i]}"
+                                            #f"TRANSLATION TO CORRECT (GERMAN): {translated_texts[i]}"
                                         )
 
                         response = ollama.chat(
@@ -4531,9 +4756,6 @@ def refine_text_pipeline(
     del nlp_model
     del punctuation_model
     del tokenizer
-    time.sleep(2)
-    comprehensive_gpu_cleanup()
-    time.sleep(2)
 
     return output_file, master_entity_map
 
@@ -5186,29 +5408,6 @@ def transfer_conditioning_to_device(gpt_cond_latent, speaker_embedding, target_d
     
     return gpt_cond_latent, speaker_embedding
 
-@contextmanager
-def synchronized_cuda_stream(stream, wait_for_streams=None):
-    """
-    ERWEITERTE VERSION: Context Manager mit automatischer Synchronisation.
-    
-    Args:
-        stream: Zu verwendender Stream
-        wait_for_streams: Liste von Streams auf die gewartet werden soll
-    """
-    if not torch.cuda.is_available():
-        yield
-        return
-    
-    # Vor Stream-Wechsel: Synchronisation mit anderen Streams
-    if wait_for_streams:
-        for wait_stream in wait_for_streams:
-            if wait_stream != stream:
-                stream.wait_stream(wait_stream)
-    
-    # Stream-Context ausführen
-    with torch.cuda.stream(stream):
-        yield
-
 def safe_tts_inference_with_device_handling(
     model, 
     text, 
@@ -5270,7 +5469,8 @@ def text_to_speech_with_voice_cloning(
     sample_path_3,
     #sample_path_4,
     #sample_path_5,
-    output_path
+    output_path,
+    speaker_name=None
 ):
     """
     Optimiert Text-to-Speech mit Voice Cloning und verschiedenen Beschleunigungen.
@@ -5344,7 +5544,7 @@ def text_to_speech_with_voice_cloning(
             logger.info(f"TTS-Modell und Conditioning-Latents erfolgreich geladen...({sample_paths})")
             print(f"TTS-Modell und Conditioning-Latents erfolgreich geladen...({sample_paths})")
 
-            
+            """""
             print("🚀 DeepSpeed-Initialisierung...")
             ds_engine = deepspeed.init_inference(
                 model=xtts_model,
@@ -5356,23 +5556,26 @@ def text_to_speech_with_voice_cloning(
             )
             optimized_tts_model = ds_engine.module
             logger.info("✅ DeepSpeed erfolgreich initialisiert")
-            
+            """
+
+            # Erstelle einen dedizierten CUDA-Stream
+            stream = create_cuda_stream()
 
             for segment_info in tqdm(segments_to_process, desc="Synthetisiere Audio-Chunks"):
                 try:
-                    with torch.inference_mode():
+                    with synchronized_cuda_stream(stream):
                         # Die Inferenz wird nun auf dem vom StreamManager verwalteten Stream ausgeführt.
-                        result = optimized_tts_model.inference(
-                        #result = xtts_model.inference(
+                        #result = optimized_tts_model.inference(
+                        result = xtts_model.inference(
                             text=segment_info['text'],
                             language="de",
                             gpt_cond_latent=gpt_cond_latent,
                             speaker_embedding=speaker_embedding,
-                            speed=1.1,
-                            temperature=0.75,
+                            speed=1.07,
+                            temperature=0.8,
                             repetition_penalty=5.0,
-                            top_k=55,
-                            top_p=0.85,
+                            top_k=60,
+                            top_p=0.9,
                             enable_text_splitting=False
                         )
                         print(f"\n[{segment_info['start']} --> {segment_info['end']}]:\n{segment_info['text']}\n")
@@ -5874,11 +6077,12 @@ def main():
         )
         if not refined_transcription_path:
             logger.error("Veredelung der Transkription fehlgeschlagen."); return
-        comprehensive_gpu_cleanup()
-        time.sleep(2)
+
+        clear_spacy_cache_and_free_vram()
+        time.sleep(3)
 
         # SCHRITT 3: ÜBERSETZUNG
-        translation_file_path, cleaned_source_path = translate_segments_optimized_safe(
+        provisional_translation_file, cleaned_source_path, hypotheses_csv_path= translate_segments_optimized_safe(
             refined_transcription_path=refined_transcription_path,
             master_entity_map=master_entity_map_en,
             translation_output_file=TRANSLATION_FILE,
@@ -5887,20 +6091,34 @@ def main():
             target_lang=target_lang,
             src_lang=src_lang,
             tgt_lang=tgt_lang,
-            num_hypotheses=5
+            num_hypotheses=7
         )
-        if not translation_file_path:
+        if not provisional_translation_file:
             logger.error("Übersetzung fehlgeschlagen."); return
+
+        logger.info("Starte entkoppelten Schritt: Semantische Hypothesen-Auswahl...")
+        semantic_optimized_file = select_best_hypotheses_post_translation(
+            hypotheses_csv_path=hypotheses_csv_path,
+            translation_output_file=provisional_translation_file,
+            report_output_path="hypothesis_selection_report.txt",
+            similarity_model_name=ST_QUALITY_MODEL
+        )
+
+        clear_spacy_cache_and_free_vram()
+        time.sleep(3)
 
         # SCHRITT 4: QUALITÄTSPRÜFUNG
         report_path, corrected_csv = evaluate_translation_quality(
             source_csv_path=cleaned_source_path,
-            translated_csv_path=translation_file_path,
+            translated_csv_path=semantic_optimized_file,
             report_path=TRANSLATION_QUALITY_REPORT,
             summary_path=TRANSLATION_QUALITY_SUMMARY,
             model_name=ST_QUALITY_MODEL,
             threshold=SIMILARITY_THRESHOLD
         )
+
+        clear_spacy_cache_and_free_vram()
+        time.sleep(3)
 
         # SCHRITT 5: VEREDELUNG DER DEUTSCHEN ÜBERSETZUNG
         refined_translation_path, _ = refine_text_pipeline(
@@ -5912,7 +6130,7 @@ def main():
         )
         if not refined_translation_path:
             logger.error("Veredelung der Übersetzung fehlgeschlagen."); return
-            
+
         # SCHRITT 6: TTS-FORMATIERUNG & SYNTHESE
         tts_formatted_file = format_for_tts_splitting(
             input_file=refined_translation_path,
@@ -5920,12 +6138,19 @@ def main():
             target_char_range=(150, 200),  # Optimale Länge: 150, Maximale Länge: 200
             min_words_for_final_segment=3
             )
+
+        clear_spacy_cache_and_free_vram()
+        time.sleep(2)
+
         text_to_speech_with_voice_cloning(
             tts_formatted_file,
             SAMPLE_PATH_1, SAMPLE_PATH_2,
             SAMPLE_PATH_3,
             TRANSLATED_AUDIO_WITH_PAUSES
         )
+
+        clear_spacy_cache_and_free_vram()
+        time.sleep(2)
 
         # SCHRITT 7: FINALES VIDEO ERSTELLEN
         resample_to_44100_stereo(TRANSLATED_AUDIO_WITH_PAUSES, RESAMPLED_AUDIO_FOR_MIXDOWN, SPEED_FACTOR_RESAMPLE_44100)

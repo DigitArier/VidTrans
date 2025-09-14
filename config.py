@@ -1,13 +1,13 @@
 # Dateipfade
-AUDIO_PATH = "1_EUROPA (13) The Last Battle (Part 10 of 10) (2017) (Documentary) [720p]_(Vocals).wav"
-VIDEO_PATH = "EUROPA (13) The Last Battle (Part 10 of 10) (2017) (Documentary) [720p].mp4"
-FINAL_VIDEO_PATH = "EUROPA (13) The Last Battle (Part 10 of 10) (2017) (Documentary) [720p]_deutsch.mp4"
+AUDIO_PATH = "2_the SERPENT god of FORBIDDEN knowledge (PART 2)(DOCUMENTARY)_HD_(Vocals).wav"
+VIDEO_PATH = "the SERPENT god of FORBIDDEN knowledge (PART 2)(DOCUMENTARY)_HD.mp4"
+FINAL_VIDEO_PATH = "the SERPENT god of FORBIDDEN knowledge (PART 2)(DOCUMENTARY)_HD_deutsch.mp4"
 ORIGINAL_AUDIO_PATH = "00_original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
-SAMPLE_PATH_1 = "servant_sample-01.wav"
-SAMPLE_PATH_2 = "servant_sample-02.wav"
-SAMPLE_PATH_3 = "servant_sample-03.wav"
+SAMPLE_PATH_1 = "asleep_sample-01.wav"
+SAMPLE_PATH_2 = "asleep_sample-02.wav"
+SAMPLE_PATH_3 = "asleep_sample-03.wav"
 #SAMPLE_PATH_4 = "gibson_sample-04.wav"
 #SAMPLE_PATH_5 = "papa_sample-05.wav"
 SPEECH_TIMESTAMPS = "speech_timestamps.json"
@@ -16,7 +16,7 @@ ONLY_SPEECH = "only_speech.wav"
 SAMPLING_RATE_VAD = 16000   
 #Transkription
 TRANSCRIPTION_FILE = "01_transcription.csv"
-REFINED_TRANSCRIPTION_FILE = "04a_refined_transcription.csv"
+REFINED_TRANSCRIPTION_FILE = "01a_refined_transcription.csv"
 TRANSCRIPTION_CLEANED = "02_transcription_cleaned.csv"
 PUNCTED_TRANSCRIPTION_FILE = "03_puncted_transcription.csv"
 CORRECTED_TRANSCRIPTION_FILE = "corrected_transcription.csv"
@@ -32,14 +32,18 @@ MAX_CHARS = 150 # Maximale Anzahl an Zeichen pro Segment
 MIN_WORDS = 10 # Minimale Anzahl an Wörtern pro Segment
 ITERATIONS = 3 # Durchläufe
 #Translation
-TRANSLATION_FILE = "05_translation.csv"
-REFINED_TRANSLATION_FILE = "07a_refined_translation.csv"
+MADLAD400_MODEL_DIR = "madlad400-3b-mt-int8_bfloat16"
+MARIANMT_MODEL_DIR = "opus-mt-en-de-ct2"
+MARIANMT_HYPOTHESES_CSV = "02_hypotheses_marianmt.csv"
+HYPOTHESES_CSV = "02_translation_hypotheses_detailed.csv"
+TRANSLATION_FILE = "03_translation.csv"
+REFINED_TRANSLATION_FILE = "03a_refined_translation.csv"
 MERGED_TRANSLATION_FILE = "06_merged_translation.csv"
 REPAIRED_TRANSLATION_FILE = "repaired_translation_file.csv"
 CLEAN_TRANSLATION_FILE = "clean_translation.csv"
 PUNCTED_TRANSLATION_FILE = "puncted_translation.csv"
 CHAR_LIMIT_TRANSLATION = 210
-TTS_FORMATTED_TRANSLATION_FILE = "09_tts_formatted_translation.csv"
+TTS_FORMATTED_TRANSLATION_FILE = "05_tts_formatted_translation.csv"
 # Zusammenführung Übersetzung
 MIN_DUR_TRANSLATION = 3.0# Minimale Segmentdauer in Sekunden
 MAX_DUR_TRANSLATION = 15 # Maximale Segmentdauer in Sekunden
@@ -48,19 +52,19 @@ MAX_CHARS_TRANSLATION = 200 # Maximale Anzahl an Zeichen pro Segment
 MIN_WORDS_TRANSLATION = 7 # Minimale Anzahl an Wörtern pro Segment
 ITERATIONS_TRANSLATION = 3 # Durchläufe
 #Quality_Report
-TRANSLATION_QUALITY_REPORT = "07_translation_quality_report.csv"
-TRANSLATION_QUALITY_SUMMARY = "translation_quality_summary.txt"
-CLEANED_SOURCE_FOR_QUALITY_CHECK = "04_cleaned_source_for_quality_check.csv"
+TRANSLATION_QUALITY_REPORT = "04_translation_quality_report.csv"
+TRANSLATION_QUALITY_SUMMARY = "04_translation_quality_summary.txt"
+CLEANED_SOURCE_FOR_QUALITY_CHECK = "04a_cleaned_source_for_quality_check.csv"
 EMBEDDINGS_FILE_NPZ = "08_german_text_embeddings.npz"
 TRANSLATION_WITH_EMBEDDINGS_CSV = "08_german_text_embeddings.csv"
 # Schwellenwert für die Kosinus-Ähnlichkeit (experimentell bestimmen, z.B. 0.6 - 0.8)
-SIMILARITY_THRESHOLD = 0.85
+SIMILARITY_THRESHOLD = 0.88
 #TTS
 TTS_TEMP_CHUNKS_DIR = "tts_temp_chunks"
 TTS_PROGRESS_MANIFEST = "tts_progress_manifest.csv"
-TRANSLATED_AUDIO_WITH_PAUSES = "10_translated_audio_with_pauses.wav"
-RESAMPLED_AUDIO_FOR_MIXDOWN = "11_resampled_audio_44100.wav"
-ADJUSTED_VIDEO_PATH = "12_adjusted_video.mp4"
+TRANSLATED_AUDIO_WITH_PAUSES = "06_translated_audio_with_pauses.wav"
+RESAMPLED_AUDIO_FOR_MIXDOWN = "07_resampled_audio_44100.wav"
+ADJUSTED_VIDEO_PATH = "08_adjusted_video.mp4"
 USE_PIP = True
 USE_ONNX_VAD = True
 BOS_TOKEN_ID = 0
@@ -94,6 +98,7 @@ SENTENCE_TRANSFORMER_MODELS = {
     "embedding": "sentence-transformers/distiluse-base-multilingual-cased-v2", 
     "embedding_big": "intfloat/multilingual-e5-large-instruct",
     "speed": "sentence-transformers/all-MiniLM-L6-v2",
+    "multi_speed": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     "latest": "Alibaba-NLP/gte-large-en-v1.5"
 }
 
@@ -101,9 +106,9 @@ SENTENCE_TRANSFORMER_MODELS = {
 MIN_WORDS_GLOBAL = 4
 
 # Standard-Modelle für verschiedene Aufgaben
-ST_QUALITY_MODEL = SENTENCE_TRANSFORMER_MODELS["quality_big"]
-ST_EMBEDDING_MODEL_DE = SENTENCE_TRANSFORMER_MODELS["embedding_big"]
-ST_SPEED_MODEL = SENTENCE_TRANSFORMER_MODELS["speed"]
+ST_QUALITY_MODEL = SENTENCE_TRANSFORMER_MODELS["quality"]
+ST_EMBEDDING_MODEL_DE = SENTENCE_TRANSFORMER_MODELS["embedding"]
+ST_SPEED_MODEL = SENTENCE_TRANSFORMER_MODELS["multi_speed"]
 
 # TTS Text-Validierung
 MIN_TTS_TEXT_LENGTH = 5
