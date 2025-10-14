@@ -1204,33 +1204,41 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
             
             # VAD-Parameter für die Sprachsegmentierung definieren
             vad_params = {
-                "threshold": 0.1,               # Niedriger Schwellwert für empfindlichere Spracherkennung
-                "min_speech_duration_ms": 0,  # Minimale Sprachdauer in Millisekunden
-                #"max_speech_duration_s": 15,    # Maximale Sprachdauer in Sekunden
-                "min_silence_duration_ms": 0, # Minimale Stille-Dauer zwischen Segmenten
-                "speech_pad_ms": 350            # Polsterzeit vor und nach Sprachsegmenten
-            }
+                    "threshold": 0.1,                      # Sensitiver für bessere Erkennung  
+                    "min_speech_duration_ms": 0,           # Flexibler
+                    "max_speech_duration_s": 12,           # Kürzere Segmente
+                    "min_silence_duration_ms": 0,          # Keine Mindest-Stille
+                    "speech_pad_ms": 400,                  # Optimales Padding
+                }
             
             segments_generator, info = pipeline.transcribe(
                 audio_file,
-                batch_size=2,
-                beam_size=20,
-                patience=2.0,
+                # === Bestehende Parameter beibehalten ===
+                batch_size=2,                              # Für deine 6GB VRAM
+                beam_size=20,                              # Bereits optimal
+                patience=2.0,                              # Bereits vorhanden
+                
+                # === VAD-OPTIMIERUNGEN ===
                 vad_filter=True,
                 vad_parameters=vad_params,
+                
+                # === HALLUZINATIONS-REDUKTION ===
+                hallucination_silence_threshold=0.15,     # NEU: Frühe Erkennung
+                compression_ratio_threshold=2.8,           # Verschärft von 2.8
+                log_prob_threshold=-0.15,                  # Höhere Schwelle
+                no_speech_threshold=0.9,                   # Konservativer
+                
+                # === QUALITÄTS-VERBESSERUNGEN ===  
+                repetition_penalty=1.08,                   # NEU: Wiederholungen reduzieren
+                no_repeat_ngram_size=6,                    # NEU: 6-Gram Filter
+                temperature=0.15,                          # Kontrollierte Variation
+                word_timestamps=True,                      # Präzise Zeitstempel
+                condition_on_previous_text=True,           # Kontext zwischen Segmenten
+                
+                # === BESTEHENDE PARAMETER ===
                 #chunk_length=45,
-                #compression_ratio_threshold=2.8,    # Schwellenwert für Kompressionsrate
-                #log_prob_threshold=-0.2,             # Schwellenwert für Log-Probabilität
-                #no_speech_threshold=1.0,            # Schwellenwert für Stille
-                #temperature=(0.05, 0.1, 0.15, 0.2, 0.25, 0.5),      # Temperatur für Sampling
-                temperature=0.4,                  # Temperatur für Sampling
-                word_timestamps=True,               # Zeitstempel für Wörter
-                hallucination_silence_threshold=0.2,  # Schwellenwert für Halluzinationen
-                condition_on_previous_text=True,    # Bedingung an vorherigen Text
-                no_repeat_ngram_size=5,
-                repetition_penalty=1.05,
                 language="en",
-                #task="translate"
+                task="transcribe"
             )
 
         all_segments = existing_segments.copy()
@@ -2287,9 +2295,9 @@ def translate_segments_optimized_safe(
     target_lang: str = "de",
     src_lang: str = "eng_Latn",
     tgt_lang: str = "deu_Latn",
-    batch_size: int = 2,
-    num_hypotheses: int = None
-) -> Tuple[str, str, str]:
+    batch_size: int = 1,
+    num_hypotheses: int = 3
+) -> Tuple[str, str]:
     """
     Übersetzt Segmente mit verbesserter Entity-Behandlung und Multi-Hypothesis-Unterstützung.
     
@@ -2425,16 +2433,15 @@ def translate_segments_optimized_safe(
             batch_source_texts = source_texts_for_similarity[i:i + batch_size]
 
             # Aufruf der neuen MADLAD-Übersetzungsfunktion
-            provisional_translations, hypotheses_csv_path = translate_batch_madlad(
+            best_translations, hypotheses_csv_path = translate_batch_madlad(
                 texts=texts_to_translate,
                 translator=translator_madlad,
                 tokenizer=tokenizer_madlad,
                 target_lang=target_lang,
                 num_hypotheses=num_hypotheses,
-                batch_data=batch_data
+                source_texts=batch_source_texts
             )
-
-            for j, translated_text in enumerate(provisional_translations):
+            for j, translated_text in enumerate(best_translations):
                 segment_data = batch_data[j]
 
                 # Entity-Wiederherstellung
@@ -2442,6 +2449,7 @@ def translate_segments_optimized_safe(
                 if not current_entity_map:
                     logger.warning(f"Kein Mapping für Segment {segment_data['id']}. Verwende leeres Dict.")
                     current_entity_map = {}
+
                 # Verwende robuste Wiederherstellung
                 final_translated_text = restore_entities_final(
                     translated_text,
@@ -2450,7 +2458,7 @@ def translate_segments_optimized_safe(
 
                 # Debug-Logging für Entity-Pipeline
                 logger.debug(f"Segment {segment_data['id']}: {len(current_entity_map)} Entities")
-                print(f"\n\n[{segment_data['startzeit']} --> {segment_data['endzeit']}]:")
+                print(f"\n[{segment_data['startzeit']} --> {segment_data['endzeit']}]:")
                 print(f"{final_translated_text}")
                 print(f"Entities: {len(current_entity_map)} gefunden\n")
 
@@ -2459,19 +2467,15 @@ def translate_segments_optimized_safe(
                     'endzeit': segment_data["endzeit"],
                     'text': sanitize_for_csv_and_tts(final_translated_text)
                 })
+
                 all_cleaned_sources.append({
                     'startzeit': segment_data["startzeit"],
                     'endzeit': segment_data["endzeit"],
-                    'text': sanitize_for_csv_and_tts(segment_data['clean_source_text'])
+                    'text': sanitize_for_csv_and_tts(segment_data['original_text'])
                 })
 
-            # Speichern des Zwischenstands
-            save_progress_csv(all_translations, translation_output_file)
-            save_progress_csv(all_cleaned_sources, cleaned_source_output_file)
-
-        # Models explizit entladen um VRAM zu befreien
-        del translator_madlad
-        del tokenizer_madlad
+    save_progress_csv(all_translations, translation_output_file)
+    save_progress_csv(all_cleaned_sources, cleaned_source_output_file)
 
     logger.info(f"Übersetzung abgeschlossen: {len(all_translations)} gültige Segmente.")
     print("\n---------------------------------")
@@ -2489,21 +2493,20 @@ def translate_batch_madlad(
     translator: ctranslate2.Translator,
     tokenizer: T5TokenizerFast,
     target_lang: str = "de",
-    num_hypotheses: int = None,
-    source_texts: List[str] = None, # Hinzugefügt für Konsistenz
-    batch_data: List[Dict] = None
+    num_hypotheses: int = 3,
+    source_texts: List[str] = None,
+    similarity_model_name: str = ST_QUALITY_MODEL
 ) -> Tuple[List[str], str]:
     """
-    Führt eine Batch-Übersetzung mit dem MADLAD-CT2-Modell durch und verarbeitet die Hypothesen korrekt.
-
+    Führt eine Batch-Übersetzung mit dem MADLAD-CT2-Modell durch, basierend auf sentencepiece Tokenizer.
     Args:
-        texts (List[str]): Liste der Rohtexte zum Übersetzen (mit Platzhaltern).
+        texts (List[str]): Liste der Rohtexte zum Übersetzen.
         translator (ctranslate2.Translator): Bereits initialisiertes CTranslate2 MADLAD-Modell.
         tokenizer (T5TokenizerFast): Der für MADLAD passende Tokenizer.
         target_lang (str): Sprach-Code für die Zielsprache, z.B. "de".
         num_hypotheses (int): Anzahl der Übersetzungsvorschläge pro Segment.
-        source_texts (List[str]): Original-Quelltexte für die Hypothesen-CSV (ohne Platzhalter).
-        batch_data (List[Dict]): Metadaten der Segmente im Batch, insbesondere mit 'startzeit'.
+        source_texts (List[str]): Original-Quelltexte für Ähnlichkeitsprüfung (ohne Entity-Platzhalter).
+        similarity_model_name (str): Modell für semantische Ähnlichkeitsprüfung.
 
     Returns:
         Tuple[List[str], str]: Eine Liste der besten Übersetzungen und der Pfad zur Hypothesen-CSV.
@@ -2523,52 +2526,49 @@ def translate_batch_madlad(
         source=tokenized_texts,
         batch_type="tokens",
         max_batch_size=1024,
-        beam_size=max(15, num_hypotheses),
+        beam_size=max(10, num_hypotheses),
         num_hypotheses=num_hypotheses,
-        patience=0.5,
-        length_penalty=0.1,
-        coverage_penalty=0.3,
+        patience=1.0,
+        length_penalty=0.01,
+        coverage_penalty=0,
         repetition_penalty=1.5,
         no_repeat_ngram_size=3,
         return_scores=True
     )
 
     # Alle Hypothesen dekodieren
-    all_hypotheses_for_csv = []
-    provisional_best_translations = []
-
-    for i, result_item in enumerate(results):
+    all_hypotheses = []
+    for i, result in enumerate(results):
         segment_hypotheses = []
-        # Sichere Iteration über Hypothesen und Scores
-        if result_item.hypotheses and result_item.scores and len(result_item.hypotheses) == len(result_item.scores):
-            for hyp_idx, tokens in enumerate(result_item.hypotheses):
-                score = result_item.scores[hyp_idx]
-                token_ids = tokenizer.convert_tokens_to_ids(tokens)
-                decoded_text = tokenizer.decode(token_ids, skip_special_tokens=True).strip()
-                segment_hypotheses.append({
-                    'hypothesis_id': hyp_idx,
-                    'text': decoded_text,
-                    'score': score
-                })
-        
-        all_hypotheses_for_csv.append({
-            'segment_id': batch_data[i]['id'],
-            'source_text': batch_data[i].get('clean_source_text', ''),
-            'hypotheses': segment_hypotheses
-        })
+        for hyp_idx in range(min(num_hypotheses, len(result.hypotheses))):
+            tokens = result.hypotheses[hyp_idx]
+            # Tokens in IDs umwandeln
+            token_ids = tokenizer.convert_tokens_to_ids(tokens)
+            # Dekodieren mit Skip-Special
+            decoded = tokenizer.decode(token_ids, skip_special_tokens=True).strip()
+            segment_hypotheses.append({
+                'hypothesis_id': hyp_idx,
+                'text': decoded
+            })
+        all_hypotheses.append(segment_hypotheses)
 
-        if segment_hypotheses:
-            provisional_best_translations.append(segment_hypotheses[0]['text'])
-        else:
-            logger.warning(f"Keine Hypothese für Segment mit ID {batch_data[i]['id']} generiert.")
-            provisional_best_translations.append("")
-
-    # Die globale Variable HYPOTHESES_CSV wird hier verwendet
+        # Speichere alle Hypothesen in separater CSV
     hypotheses_csv_path = HYPOTHESES_CSV
-    save_all_hypotheses_csv(all_hypotheses_for_csv, hypotheses_csv_path)
-
-    logger.info("Multi-Hypothesis-Übersetzung abgeschlossen. Provisorische Auswahl basierend auf Scores.")
-    return provisional_best_translations, hypotheses_csv_path
+    save_all_hypotheses_csv(all_hypotheses, hypotheses_csv_path)
+    
+    # VORLÄUFIG: Wähle die beste Hypothese basierend auf Score (erste = höchste)
+    # Die semantische Ähnlichkeitsprüfung erfolgt später
+    provisional_translations = []
+    for segment_hypotheses in all_hypotheses:
+        if segment_hypotheses:
+            # Sortiere nach Score (höchster zuerst)
+            best_hypothesis = max(segment_hypotheses, key=lambda h: h.get('score', 0.0))
+            provisional_translations.append(best_hypothesis['text'])
+        else:
+            provisional_translations.append("")
+    
+    logger.info(f"Multi-Hypothesis-Übersetzung abgeschlossen. Provisorische Auswahl basierend auf Scores.")
+    return provisional_translations, hypotheses_csv_path
 
 def translate_batch_nllb200(
     texts: list[str],
@@ -3677,7 +3677,7 @@ def evaluate_translation_quality(
     model_name,
     threshold,
     correction_model="qwen3:8b",
-    max_retries=3
+    max_retries=2
 ) -> Tuple[str, str]:
     """
     Prüft semantische Ähnlichkeit, korrigiert niedrige Segmente automatisch via Ollama
@@ -3820,6 +3820,7 @@ def evaluate_translation_quality(
         "preliminary": "vorläufig, einleitend, Vor-",
         "preparatory": "vorbereitend, Vorbereitungs-",
         "introductory": "einführend, einleitend, Einführungs-",
+        "St": "Sankt, Heiliger",
         
         # Hier können Sie beliebig weitere Einträge hinzufügen:
         # "your_word": "deutsche Übersetzung 1, deutsche Übersetzung 2, deutsche Übersetzung 3",
@@ -3931,14 +3932,14 @@ def evaluate_translation_quality(
                         tqdm.write(f"   Versuch {attempt + 1}/{max_retries}: Sende an Korrektur-LLM ({correction_model}, Temp: {current_temperature})...")
                         system_prompt = (
                                         "You are a hyper-literal German translation engine. Your task is to create a new, correct German translation based *exclusively* on the provided English source text."
-                                        "The English text is the ONLY SOURCE OF TRUTH."
+                                        #"The English text is the ONLY SOURCE OF TRUTH."
                                         
-                                        "CRITICAL INSTRUCTION:"
-                                        "You will also receive a 'TRANSLATION TO CORRECT (GERMAN)'. Treat this German text with EXTREME SKEPTICISM. It is very likely flawed, contains hallucinations, omissions, or semantic errors."
-                                        "Your goal is NOT to 'fix' this flawed translation. Your goal is to produce the CORRECT translation based on the English source."
-                                        "If the provided German translation adds information not present in the English source (like '...when I was 14'), you HAVE TO discard it."
-                                        "If the provided German translation changes the meaning (e.g., 'don't continue' becomes 'are not allowed to continue'), you HAVE TO discard it."
-                                        "If the provided German translation merges or splits sentences incorrectly, you HAVE TO ignore that structure."
+                                        #"CRITICAL INSTRUCTION:"
+                                        #"You will also receive a 'TRANSLATION TO CORRECT (GERMAN)'. Treat this German text with EXTREME SKEPTICISM. It is very likely flawed, contains hallucinations, omissions, or semantic errors."
+                                        #"Your goal is NOT to 'fix' this flawed translation. Your goal is to produce the CORRECT translation based on the English source."
+                                        #"If the provided German translation adds information not present in the English source (like '...when I was 14'), you HAVE TO discard it."
+                                        #"If the provided German translation changes the meaning (e.g., 'don't continue' becomes 'are not allowed to continue'), you HAVE TO discard it."
+                                        #"If the provided German translation merges or splits sentences incorrectly, you HAVE TO ignore that structure."
                                         
                                         "OUTPUT FORMAT:"
                                         "- Output ONLY the corrected, new German text."
@@ -3957,7 +3958,7 @@ def evaluate_translation_quality(
 
 
                         user_prompt = (
-                                            f"SOURCE TEXT (ENGLISH): {source_texts[i]}\n\n"
+                                            f"SOURCE TEXT (ENGLISH): {source_texts[i]}\n"
                                             #f"TRANSLATION TO CORRECT (GERMAN): {translated_texts[i]}"
                                         )
 
@@ -4089,6 +4090,9 @@ def evaluate_translation_quality(
         corrected_translation_csv = translated_csv_path.replace('.csv', '_corrected.csv')
         corrected_df.to_csv(corrected_translation_csv, sep='|', index=False, encoding='utf-8')
         logger.info(f"Korrigierte Übersetzung als CSV gespeichert: {corrected_translation_csv}")
+
+        del correction_model
+        del model_name
 
         return report_path, corrected_translation_csv
 
@@ -4420,7 +4424,7 @@ def entity_protection_final(
     text: str,
     nlp_model,
     tokenizer: T5Tokenizer,
-    custom_words: List[str] = ["Datura", "Acid", "Langan"]  # Optionale Liste benutzerdefinierter Wörter zum Schützen
+    custom_words: List[str] = ["Datura", "Acid", "Langan", "Lobet", "lobet"]  # Optionale Liste benutzerdefinierter Wörter zum Schützen
 ) -> Tuple[str, Dict[str, EntityInfo]]:
     """
     Stellt sicher, dass T5-native Sentinel-Tokens (<extra_id_0>) verwendet werden,
@@ -5533,10 +5537,11 @@ def text_to_speech_with_voice_cloning(
             sample_paths = [
                 sample_path_1,
                 sample_path_2,
-                sample_path_3
+                sample_path_3,
+                #sample_path_4
                 ]
             gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(
-                audio_path=sample_paths, load_sr=22050, sound_norm_refs=False
+                audio_path=sample_paths, gpt_cond_len=10, load_sr=22050, sound_norm_refs=False
             )
             gpt_cond_latent = gpt_cond_latent.to(device)
             speaker_embedding = speaker_embedding.to(device)
@@ -5544,7 +5549,7 @@ def text_to_speech_with_voice_cloning(
             logger.info(f"TTS-Modell und Conditioning-Latents erfolgreich geladen...({sample_paths})")
             print(f"TTS-Modell und Conditioning-Latents erfolgreich geladen...({sample_paths})")
 
-            """""
+            # DeepSpeed Inferenz-Engine initialisieren
             print("🚀 DeepSpeed-Initialisierung...")
             ds_engine = deepspeed.init_inference(
                 model=xtts_model,
@@ -5556,28 +5561,28 @@ def text_to_speech_with_voice_cloning(
             )
             optimized_tts_model = ds_engine.module
             logger.info("✅ DeepSpeed erfolgreich initialisiert")
-            """
+            
 
             # Erstelle einen dedizierten CUDA-Stream
             stream = create_cuda_stream()
 
             for segment_info in tqdm(segments_to_process, desc="Synthetisiere Audio-Chunks"):
                 try:
-                    with synchronized_cuda_stream(stream):
-                        # Die Inferenz wird nun auf dem vom StreamManager verwalteten Stream ausgeführt.
+                    with torch.inference_mode():
                         #result = optimized_tts_model.inference(
                         result = xtts_model.inference(
                             text=segment_info['text'],
                             language="de",
                             gpt_cond_latent=gpt_cond_latent,
                             speaker_embedding=speaker_embedding,
-                            speed=1.07,
-                            temperature=0.8,
+                            speed=1.1,
+                            temperature=0.7,
                             repetition_penalty=5.0,
-                            top_k=60,
-                            top_p=0.9,
+                            top_k=55,
+                            top_p=0.85,
                             enable_text_splitting=False
                         )
+
                         print(f"\n[{segment_info['start']} --> {segment_info['end']}]:\n{segment_info['text']}\n")
                     audio_clip = result.get("wav")
                     if audio_clip is None or audio_clip.size == 0:
@@ -6067,6 +6072,9 @@ def main():
         """
         transcribe_audio_with_timestamps(ORIGINAL_AUDIO_PATH, TRANSCRIPTION_FILE)
 
+        clear_spacy_cache_and_free_vram()
+        time.sleep(3)
+
         # SCHRITT 2: VEREDELUNG DER ENGLISCHEN TRANSKRIPTION
         refined_transcription_path, master_entity_map_en = refine_text_pipeline(
             input_file=TRANSCRIPTION_FILE,
@@ -6091,10 +6099,13 @@ def main():
             target_lang=target_lang,
             src_lang=src_lang,
             tgt_lang=tgt_lang,
-            num_hypotheses=7
+            num_hypotheses=10
         )
         if not provisional_translation_file:
             logger.error("Übersetzung fehlgeschlagen."); return
+
+        clear_spacy_cache_and_free_vram()
+        time.sleep(3)
 
         logger.info("Starte entkoppelten Schritt: Semantische Hypothesen-Auswahl...")
         semantic_optimized_file = select_best_hypotheses_post_translation(
@@ -6131,6 +6142,9 @@ def main():
         if not refined_translation_path:
             logger.error("Veredelung der Übersetzung fehlgeschlagen."); return
 
+        clear_spacy_cache_and_free_vram()
+        time.sleep(3)
+
         # SCHRITT 6: TTS-FORMATIERUNG & SYNTHESE
         tts_formatted_file = format_for_tts_splitting(
             input_file=refined_translation_path,
@@ -6144,8 +6158,10 @@ def main():
 
         text_to_speech_with_voice_cloning(
             tts_formatted_file,
-            SAMPLE_PATH_1, SAMPLE_PATH_2,
+            SAMPLE_PATH_1,
+            SAMPLE_PATH_2,
             SAMPLE_PATH_3,
+            #SAMPLE_PATH_4,
             TRANSLATED_AUDIO_WITH_PAUSES
         )
 
