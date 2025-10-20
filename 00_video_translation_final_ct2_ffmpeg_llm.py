@@ -81,6 +81,7 @@ from functools import partial
 import multiprocessing as mp
 from multiprocessing import Pool, cpu_count
 from functools import partial
+from llama_cpp import Llama
 from tqdm import tqdm
 from contextlib import contextmanager
 from deepmultilingualpunctuation import PunctuationModel
@@ -2246,44 +2247,74 @@ def _is_refusal(text: str) -> bool:
 
 def save_all_hypotheses_csv(all_hypotheses: List[Dict], output_file: str):
     """
-    Speichert alle Hypothesen in einer flachen CSV-Datei.
-    KORRIGIERTE VERSION: Öffnet die Datei im Append-Modus ('a'), um Daten
-    über mehrere Batches hinweg zu sammeln, ohne sie zu überschreiben.
-    Schreibt den Header nur, wenn die Datei neu erstellt wird oder leer ist.
+    KORRIGIERTE VERSION: Speichert alle Hypothesen in einer flachen CSV-Datei.
+    
+    ÄNDERUNGEN:
+    - Verbesserte Fehlerbehandlung
+    - Explizite Datenstruktur-Validierung  
+    - Bessere Logging-Ausgaben
+    
+    Args:
+        all_hypotheses: Liste von Dictionaries mit Segment-Daten
+        output_file: Pfad zur Ausgabe-CSV
     """
     if not all_hypotheses:
         logger.warning("Es wurden keine Hypothesen zum Speichern übergeben.")
         return
-
-    # Prüfen, ob die Datei bereits existiert UND nicht leer ist.
+    
+    logger.info(f"Speichere {len(all_hypotheses)} Segmente mit Hypothesen in: {output_file}")
+    
+    # Prüfen, ob die Datei bereits existiert UND nicht leer ist
     file_exists_and_has_content = os.path.exists(output_file) and os.path.getsize(output_file) > 0
-
+    
     try:
-        # IMMER im Append-Modus ('a') öffnen, um Daten sicher hinzuzufügen.
+        # IMMER im Append-Modus 'a' öffnen, um Daten sicher hinzuzufügen
         with open(output_file, mode='a', encoding='utf-8', newline='') as csvfile:
             fieldnames = ['segment_id', 'source_text', 'hypothesis_id', 'text', 'score']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames, delimiter='|')
-
-            # Schreibe den Header nur, wenn die Datei noch nicht existiert oder leer ist.
+            
+            # Schreibe den Header nur, wenn die Datei noch nicht existiert oder leer ist
             if not file_exists_and_has_content:
                 writer.writeheader()
-
-            # Iteriert durch jedes Segment und schreibt für jede Hypothese eine Zeile.
+                logger.debug(f"CSV-Header geschrieben in: {output_file}")
+            
+            total_hypotheses_written = 0
+            
+            # Iteriert durch jedes Segment und schreibt für jede Hypothese eine Zeile
             for segment_data in all_hypotheses:
-                segment_id = segment_data.get('segment_id')
-                source_text = segment_data.get('source_text', '')
-                for hyp_data in segment_data.get('hypotheses', []):
+                segment_id = segment_data.get("segment_id")
+                source_text = segment_data.get("source_text", "")
+                
+                # Validierung der Segment-Daten
+                if segment_id is None:
+                    logger.warning(f"Segment ohne segment_id übersprungen: {segment_data}")
+                    continue
+                
+                hypotheses = segment_data.get("hypotheses", [])
+                if not hypotheses:
+                    logger.warning(f"Segment {segment_id} hat keine Hypothesen")
+                    continue
+                
+                # Schreibe jede Hypothese als separate Zeile
+                for hyp_data in hypotheses:
+                    if not isinstance(hyp_data, dict):
+                        logger.warning(f"Ungültige Hypothese in Segment {segment_id}: {hyp_data}")
+                        continue
+                    
                     writer.writerow({
                         'segment_id': segment_id,
                         'source_text': source_text,
-                        'hypothesis_id': hyp_data.get('hypothesis_id'),
-                        'text': hyp_data.get('text'),
-                        'score': hyp_data.get('score')
+                        'hypothesis_id': hyp_data.get('hypothesis_id', 0),
+                        'text': hyp_data.get('text', ''),
+                        'score': hyp_data.get('score', 0.0)
                     })
-        
-        logger.debug(f"Hypothesen-Batch erfolgreich in {output_file} gespeichert/angehängt.")
+                    total_hypotheses_written += 1
+            
+            logger.info(f"✅ {total_hypotheses_written} Hypothesen erfolgreich in {output_file} gespeichert/angehängt.")
+            
     except Exception as e:
-        logger.error(f"Fehler beim Speichern der Hypothesen-CSV: {e}", exc_info=True)
+        logger.error(f"❌ Fehler beim Speichern der Hypothesen-CSV: {e}", exc_info=True)
+        raise
 
 # Übersetzen
 def translate_segments_optimized_safe(
@@ -2296,7 +2327,7 @@ def translate_segments_optimized_safe(
     src_lang: str = "eng_Latn",
     tgt_lang: str = "deu_Latn",
     batch_size: int = 1,
-    num_hypotheses: int = 3
+    num_hypotheses: int = 5
 ) -> Tuple[str, str]:
     """
     Übersetzt Segmente mit verbesserter Entity-Behandlung und Multi-Hypothesis-Unterstützung.
@@ -2493,12 +2524,15 @@ def translate_batch_madlad(
     translator: ctranslate2.Translator,
     tokenizer: T5TokenizerFast,
     target_lang: str = "de",
-    num_hypotheses: int = 3,
+    num_hypotheses: int = 5,
     source_texts: List[str] = None,
     similarity_model_name: str = ST_QUALITY_MODEL
 ) -> Tuple[List[str], str]:
     """
-    Führt eine Batch-Übersetzung mit dem MADLAD-CT2-Modell durch, basierend auf sentencepiece Tokenizer.
+    KORRIGIERTE VERSION: Führt eine Batch-Übersetzung mit dem MADLAD-CT2-Modell durch.
+    
+    ÄNDERUNG: Korrigiert das Datenformat für save_all_hypotheses_csv.
+    
     Args:
         texts (List[str]): Liste der Rohtexte zum Übersetzen.
         translator (ctranslate2.Translator): Bereits initialisiertes CTranslate2 MADLAD-Modell.
@@ -2507,7 +2541,7 @@ def translate_batch_madlad(
         num_hypotheses (int): Anzahl der Übersetzungsvorschläge pro Segment.
         source_texts (List[str]): Original-Quelltexte für Ähnlichkeitsprüfung (ohne Entity-Platzhalter).
         similarity_model_name (str): Modell für semantische Ähnlichkeitsprüfung.
-
+        
     Returns:
         Tuple[List[str], str]: Eine Liste der besten Übersetzungen und der Pfad zur Hypothesen-CSV.
     """
@@ -2515,11 +2549,11 @@ def translate_batch_madlad(
 
     # Quelldaten mit dem erforderlichen Sprachpräfix vorbereiten
     prefixed_texts = [f"<2{target_lang}> {txt}" for txt in texts]
-
+    
     # Tokenisierung der vorbereiteten Texte
     # CTranslate2 erwartet eine Liste von Token-Listen
     tokenized_texts = [tokenizer.tokenize(text) for text in prefixed_texts]
-
+    
     # Übersetzung mit CTranslate2 durchführen
     # beam_size sollte >= num_hypotheses sein
     results = translator.translate_batch(
@@ -2536,38 +2570,58 @@ def translate_batch_madlad(
         return_scores=True
     )
 
-    # Alle Hypothesen dekodieren
-    all_hypotheses = []
+    # KORRIGIERTE STRUKTUR: Erstelle korrekte Datenstruktur für save_all_hypotheses_csv
+    all_hypotheses_for_csv = []
+    provisional_translations = []
+    
     for i, result in enumerate(results):
+        # Datenstruktur für dieses Segment erstellen
+        segment_data = {
+            "segment_id": i,  # Eindeutige Segment-ID
+            "source_text": source_texts[i] if source_texts and i < len(source_texts) else texts[i],
+            "hypotheses": []
+        }
+        
         segment_hypotheses = []
+        
+        # Alle Hypothesen für dieses Segment dekodieren
         for hyp_idx in range(min(num_hypotheses, len(result.hypotheses))):
             tokens = result.hypotheses[hyp_idx]
+            
             # Tokens in IDs umwandeln
             token_ids = tokenizer.convert_tokens_to_ids(tokens)
+            
             # Dekodieren mit Skip-Special
             decoded = tokenizer.decode(token_ids, skip_special_tokens=True).strip()
-            segment_hypotheses.append({
-                'hypothesis_id': hyp_idx,
-                'text': decoded
-            })
-        all_hypotheses.append(segment_hypotheses)
-
-        # Speichere alle Hypothesen in separater CSV
-    hypotheses_csv_path = HYPOTHESES_CSV
-    save_all_hypotheses_csv(all_hypotheses, hypotheses_csv_path)
-    
-    # VORLÄUFIG: Wähle die beste Hypothese basierend auf Score (erste = höchste)
-    # Die semantische Ähnlichkeitsprüfung erfolgt später
-    provisional_translations = []
-    for segment_hypotheses in all_hypotheses:
+            
+            # Score für diese Hypothese (falls verfügbar)
+            score = result.scores[hyp_idx] if hasattr(result, 'scores') and hyp_idx < len(result.scores) else 0.0
+            
+            hypothesis_data = {
+                "hypothesis_id": hyp_idx,
+                "text": decoded,
+                "score": score
+            }
+            
+            segment_hypotheses.append(hypothesis_data)
+            segment_data["hypotheses"].append(hypothesis_data)
+        
+        # Beste Hypothese für provisorische Auswahl (höchster Score)
         if segment_hypotheses:
-            # Sortiere nach Score (höchster zuerst)
             best_hypothesis = max(segment_hypotheses, key=lambda h: h.get('score', 0.0))
             provisional_translations.append(best_hypothesis['text'])
         else:
             provisional_translations.append("")
+        
+        all_hypotheses_for_csv.append(segment_data)
     
-    logger.info(f"Multi-Hypothesis-Übersetzung abgeschlossen. Provisorische Auswahl basierend auf Scores.")
+    # Speichere alle Hypothesen in separater CSV
+    hypotheses_csv_path = HYPOTHESES_CSV
+    save_all_hypotheses_csv(all_hypotheses_for_csv, hypotheses_csv_path)
+    
+    logger.info(f"Multi-Hypothesis-Übersetzung abgeschlossen. {len(provisional_translations)} Segmente verarbeitet.")
+    logger.info(f"Hypothesen gespeichert in: {hypotheses_csv_path}")
+    
     return provisional_translations, hypotheses_csv_path
 
 def translate_batch_nllb200(
@@ -3932,14 +3986,6 @@ def evaluate_translation_quality(
                         tqdm.write(f"   Versuch {attempt + 1}/{max_retries}: Sende an Korrektur-LLM ({correction_model}, Temp: {current_temperature})...")
                         system_prompt = (
                                         "You are a hyper-literal German translation engine. Your task is to create a new, correct German translation based *exclusively* on the provided English source text."
-                                        #"The English text is the ONLY SOURCE OF TRUTH."
-                                        
-                                        #"CRITICAL INSTRUCTION:"
-                                        #"You will also receive a 'TRANSLATION TO CORRECT (GERMAN)'. Treat this German text with EXTREME SKEPTICISM. It is very likely flawed, contains hallucinations, omissions, or semantic errors."
-                                        #"Your goal is NOT to 'fix' this flawed translation. Your goal is to produce the CORRECT translation based on the English source."
-                                        #"If the provided German translation adds information not present in the English source (like '...when I was 14'), you HAVE TO discard it."
-                                        #"If the provided German translation changes the meaning (e.g., 'don't continue' becomes 'are not allowed to continue'), you HAVE TO discard it."
-                                        #"If the provided German translation merges or splits sentences incorrectly, you HAVE TO ignore that structure."
                                         
                                         "OUTPUT FORMAT:"
                                         "- Output ONLY the corrected, new German text."
@@ -4096,6 +4142,453 @@ def evaluate_translation_quality(
 
         return report_path, corrected_translation_csv
 
+    except Exception as e:
+        logger.error(f"Fehler bei der Qualitätsprüfung der Übersetzung: {e}", exc_info=True)
+        return None
+
+def evaluate_translation_quality_llamacpp(
+    source_csv_path: str,
+    translated_csv_path: str,
+    report_path: str,
+    summary_path: str,
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    threshold: float = 0.75,
+    #correction_model_path: str = "D:/Modelle/Translate/Qwen3-8B-Gemini-2.5-Pro-Distill-GGUF/qwen3-8B-gemini-2.5-pro-distill_Q4_K_M.gguf",  # Pfad zum GGUF-Modell
+    max_retries: int = 2,
+    device: str = "cuda"
+) -> Tuple[str, str]:
+    """
+    Prüft semantische Ähnlichkeit und korrigiert niedrige Segmente automatisch via llama-cpp-python
+    und erzeugt detaillierten Bericht + Zusammenfassung.
+    
+    Args:
+        source_csv_path: Pfad zur Original-Quell-CSV
+        translated_csv_path: Pfad zur übersetzten CSV
+        report_path: Pfad für detaillierten Bericht
+        summary_path: Pfad für Zusammenfassung
+        similarity_model_name: Sentence-Transformer Modell für Ähnlichkeitsberechnung
+        threshold: Mindest-Ähnlichkeitsschwelle (0-1)
+        correction_model_path: Pfad zum lokalen GGUF-Modell für Korrekturen
+        max_retries: Maximale Anzahl Korrekturversuche
+        device: Gerät für Berechnungen ("cuda" oder "cpu")
+    
+    Returns:
+        Tuple[str, str]: (report_path, corrected_csv_path)
+    """
+    
+    # Vokabular-Unterstützung für häufige Übersetzungsprobleme
+    VOCABULARY_HINTS = {
+        # Häufig problematische Wörter mit deutschen Übersetzungsoptionen
+        "abomination": "Abscheulichkeit, Abscheu, Gräuel, Verabscheuung",
+        "atrocity": "Grausamkeit, Gräueltat, Scheußlichkeit",
+        "heinous": "abscheulich, verrucht, niederträchtig",
+        "vile": "widerlich, abscheulich, gemein",
+        "despicable": "verachtenswert, niederträchtig, abscheulich",
+        "grotesque": "grotesk, abstoßend, bizarr",
+        "macabre": "makaber, grausig, düster",
+        "sinister": "finster, unheilverkündend, bedrohlich",
+        "ominous": "unheilverkündend, bedrohlich, düster",
+        "eerie": "unheimlich, gespenstisch, schauerlich",
+        "uncanny": "unheimlich, seltsam, merkwürdig",
+        "bewildering": "verwirrend, rätselhaft, bestürzend",
+        "perplexing": "verwirrend, rätselhaft, puzzelnd",
+        "disconcerting": "beunruhigend, verwirrend, verstörend",
+        "harrowing": "erschütternd, quälend, herzzerreißend",
+        "excruciating": "qualvoll, unerträglich, peinigend",
+        "agonizing": "qualvoll, schmerzhaft, peinigend",
+        "torturous": "quälend, folternd, peinigend",
+        "insufferable": "unerträglich, unausstehlich",
+        "unbearable": "unerträglich, nicht zu ertragen",
+        "relentless": "unerbittlich, gnadenlos, unaufhörlich",
+        "ruthless": "rücksichtslos, unbarmherzig, gnadenlos",
+        "merciless": "gnadenlos, erbarmungslos, unbarmherzig",
+        "callous": "gefühllos, herzlos, abgestumpft",
+        "indifferent": "gleichgültig, teilnahmslos, uninteressiert",
+        "apathetic": "teilnahmslos, gleichgültig, apathisch",
+        "cynical": "zynisch, spöttisch, misstrauisch",
+        "skeptical": "skeptisch, zweiflerisch, misstrauisch",
+        "dubious": "zweifelhaft, fragwürdig, verdächtig",
+        "suspicious": "verdächtig, misstrauisch, argwöhnisch",
+        "precarious": "prekär, unsicher, wackelig",
+        "volatile": "flüchtig, unbeständig, explosiv",
+        "turbulent": "turbulent, stürmisch, unruhig",
+        "chaotic": "chaotisch, ungeordnet, wirr",
+        "pandemonium": "Chaos, Tumult, Höllenlärm",
+        "mayhem": "Chaos, Verwüstung, Tumult",
+        "havoc": "Verwüstung, Chaos, Zerstörung",
+        "carnage": "Gemetzel, Blutbad, Verwüstung",
+        "slaughter": "Gemetzel, Schlachtung, Massaker",
+        "massacre": "Massaker, Gemetzel, Blutbad",
+        "annihilation": "Vernichtung, Auslöschung, Zerstörung",
+        "devastation": "Verwüstung, Zerstörung, Verheerung",
+        "obliteration": "Auslöschung, Vernichtung, Zerstörung",
+        "extermination": "Ausrottung, Vernichtung, Tilgung",
+        "eradication": "Ausrottung, Beseitigung, Tilgung",
+        "elimination": "Beseitigung, Ausschaltung, Eliminierung",
+        "termination": "Beendigung, Kündigung, Abbruch",
+        "cessation": "Einstellung, Beendigung, Aufhören",
+        "culmination": "Höhepunkt, Kulmination, Gipfel",
+        "pinnacle": "Gipfel, Höhepunkt, Spitze",
+        "zenith": "Zenit, Höhepunkt, Gipfel",
+        "apex": "Spitze, Gipfel, Höhepunkt",
+        "summit": "Gipfel, Höhepunkt, Spitze",
+        "paramount": "von höchster Bedeutung, vorrangig",
+        "quintessential": "typisch, wesentlich, charakteristisch",
+        "epitome": "Inbegriff, Verkörperung, Musterbeispiel",
+        "embodiment": "Verkörperung, Inbegriff, Verkörperung",
+        "manifestation": "Manifestation, Erscheinung, Ausdruck",
+        "revelation": "Offenbarung, Enthüllung, Erkenntnis",
+        "epiphany": "Erleuchtung, plötzliche Erkenntnis",
+        "enlightenment": "Erleuchtung, Aufklärung, Erkenntnis",
+        "illumination": "Erleuchtung, Beleuchtung, Erhellung",
+        "clarification": "Klärung, Klarstellung, Aufklärung",
+        "elucidation": "Erläuterung, Aufklärung, Verdeutlichung",
+        "elaboration": "Ausarbeitung, Erläuterung, Verfeinerung",
+        "sophistication": "Raffinesse, Kultiviertheit, Verfeinerung",
+        "refinement": "Verfeinerung, Kultiviertheit, Eleganz",
+        "elegance": "Eleganz, Anmut, Vornehmheit",
+        "magnificence": "Pracht, Herrlichkeit, Großartigkeit",
+        "splendor": "Pracht, Glanz, Herrlichkeit",
+        "grandeur": "Pracht, Großartigkeit, Erhabenheit",
+        "majesty": "Majestät, Erhabenheit, Würde",
+        "dignity": "Würde, Anstand, Ehre",
+        "nobility": "Adel, Vornehmheit, Edelmut",
+        "integrity": "Integrität, Ehrlichkeit, Aufrichtigkeit",
+        "sincerity": "Aufrichtigkeit, Ehrlichkeit, Offenheit",
+        "authenticity": "Authentizität, Echtheit, Glaubwürdigkeit",
+        "genuineness": "Echtheit, Aufrichtigkeit, Ehrlichkeit",
+        "candor": "Offenheit, Aufrichtigkeit, Ehrlichkeit",
+        "transparency": "Transparenz, Durchsichtigkeit, Offenheit",
+        "lucidity": "Klarheit, Durchsichtigkeit, Verständlichkeit",
+        "clarity": "Klarheit, Deutlichkeit, Verständlichkeit",
+        "coherence": "Kohärenz, Zusammenhang, Stimmigkeit",
+        "consistency": "Konsistenz, Beständigkeit, Folgerichtigkeit",
+        "persistence": "Ausdauer, Beharrlichkeit, Durchhaltevermögen",
+        "perseverance": "Ausdauer, Durchhaltevermögen, Beharrlichkeit",
+        "tenacity": "Hartnäckigkeit, Zähigkeit, Ausdauer",
+        "resilience": "Widerstandsfähigkeit, Belastbarkeit, Elastizität",
+        "fortitude": "Standhaftigkeit, Mut, innere Stärke",
+        "valor": "Tapferkeit, Mut, Heldenmut",
+        "courage": "Mut, Tapferkeit, Kühnheit",
+        "bravery": "Tapferkeit, Mut, Kühnheit",
+        "audacity": "Kühnheit, Dreistigkeit, Wagemut",
+        "boldness": "Kühnheit, Wagemut, Dreistigkeit",
+        "intrepidity": "Unerschrockenheit, Furchtlosigkeit, Mut",
+        "fearlessness": "Furchtlosigkeit, Unerschrockenheit",
+        "dauntlessness": "Unerschrockenheit, Unverwüstlichkeit",
+        "indomitable": "unbezwingbar, unbesiegbar, unbeugsam",
+        "invincible": "unbesiegbar, unverwundbar, unbezwingbar",
+        "unconquerable": "unbesiegbar, unbezwingbar",
+        "impregnable": "uneinnehmbar, unüberwindlich",
+        "insurmountable": "unüberwindlich, unüberwindbar",
+        "invulnerable": "unverwundbar, unverwüstlich",
+        "impervious": "undurchdringlich, unzugänglich",
+        "impenetrable": "undurchdringlich, unverständlich",
+        "incomprehensible": "unverständlich, unbegreiflich",
+        "unfathomable": "unergründlich, unermesslich",
+        "inscrutable": "unergründlich, rätselhaft",
+        "enigmatic": "rätselhaft, geheimnisvoll",
+        "mysterious": "geheimnisvoll, rätselhaft, mysteriös",
+        "cryptic": "kryptisch, rätselhaft, verschlüsselt",
+        "obscure": "dunkel, unklar, verborgen",
+        "ambiguous": "mehrdeutig, zweideutig, unklar",
+        "equivocal": "zweideutig, mehrdeutig, ausweichend",
+        "vague": "vage, unbestimmt, unklar",
+        "nebulous": "nebelhaft, verschwommen, unklar",
+        "elusive": "schwer fassbar, flüchtig, ausweichend",
+        "ephemeral": "vergänglich, kurzlebig, flüchtig",
+        "transient": "vorübergehend, vergänglich, flüchtig",
+        "fleeting": "flüchtig, vergänglich, kurz",
+        "momentary": "augenblicklich, kurzzeitig, vorübergehend",
+        "temporary": "vorübergehend, zeitweilig, temporär",
+        "provisional": "vorläufig, provisorisch, zeitweilig",
+        "interim": "vorläufig, Zwischen-, einstweilig",
+        "preliminary": "vorläufig, einleitend, Vor-",
+        "preparatory": "vorbereitend, Vorbereitungs-",
+        "introductory": "einführend, einleitend, Einführungs-",
+        "St": "Sankt, Heiliger",
+        
+        # Hier können Sie beliebig weitere Einträge hinzufügen:
+        # "your_word": "deutsche Übersetzung 1, deutsche Übersetzung 2, deutsche Übersetzung 3",
+    }
+    
+    def create_vocabulary_support() -> str:
+        """Erstellt einen formatierten Vokabel-Unterstützungstext."""
+        if not VOCABULARY_HINTS:
+            return ""
+        
+        vocab_text = "\\nSUPPORT VOCABULARY:\\n"
+        vocab_text += "For frequently mistranslated terms, consider these German options:\\n"
+        
+        for english_word, german_options in sorted(VOCABULARY_HINTS.items()):
+            vocab_text += f"- {english_word}: {german_options}\\n"
+        
+        vocab_text += "Use these as GUIDANCE only. Always choose the translation that fits the context best.\\n"
+        return vocab_text
+    
+    # Temperatur-Stufen für Korrekturversuche
+    temperatures = [0.0, 0.3, 0.7]
+    
+    # Überprüfung der Eingabedateien
+    if os.path.exists(report_path) and not ask_overwrite(report_path):
+        logger.info(f"Verwende vorhandenen Qualitätsbericht: {report_path}")
+        corrected_translation_csv = translated_csv_path.replace('.csv', '_corrected.csv')
+        return report_path, corrected_translation_csv
+
+    logger.info(f"Starte erweiterte Qualitätsprüfung mit Modell: {model_name}")
+
+    try:
+        # Daten laden
+        df_source = pd.read_csv(source_csv_path, sep='|', dtype=str).fillna('')
+        df_translated = pd.read_csv(translated_csv_path, sep='|', dtype=str).fillna('')
+        
+        # Originalspaltennamen sichern
+        original_source_columns = df_source.columns.tolist()
+        
+        if len(df_source) != len(df_translated):
+            logger.warning(f"Zeilenanzahl stimmt nicht überein: {len(df_source)} vs {len(df_translated)}. Prüfung übersprungen.")
+            return None
+        
+        # Spalten normalisieren
+        df_source.columns = [col.strip().lower() for col in df_source.columns]
+        df_translated.columns = [col.strip().lower() for col in df_translated.columns]
+        
+        if 'text' not in df_source.columns or 'text' not in df_translated.columns:
+            logger.error("Benötigte Spalte 'text' nicht in den CSVs gefunden.")
+            return None
+        
+        source_texts = df_source['text'].tolist()
+        translated_texts = df_translated['text'].tolist()
+        
+        # KI-basierte Prüfung
+        logger.info(f"Lade Similarity-Modell: {model_name}")
+        with torch.cuda.device(device) if device == "cuda" else torch.no_grad():
+            model = SentenceTransformer(model_name, device=device)
+            
+            embeddings_source = model.encode(source_texts, convert_to_tensor=True, show_progress_bar=True)
+            embeddings_translated = model.encode(translated_texts, convert_to_tensor=True, show_progress_bar=True)
+            
+            similarities = torch.diag(cos_sim(embeddings_source, embeddings_translated)).tolist()
+        
+        # Ergebnisse aufbereiten + Automatische Korrektur
+        results = []
+        issues_found = 0
+        corrections_made = 0
+        avg_similarity_before = sum(similarities) / len(similarities) if similarities else 0.0
+        corrected_similarities = similarities.copy()
+        auto_corrected_segments = []
+        
+        model_path="qwen3-8B-gemini-2.5-pro-distill_Q4_K_M.gguf"
+        
+        # Llama-cpp-python Modell laden
+        logger.info(f"Lade Korrektur-Modell: {model_path}")
+        try:
+            # Modell-Parameter für RTX 4050 optimiert
+            correction_model = Llama.from_pretrained(
+                repo_id="Liontix/Qwen3-8B-Gemini-2.5-Pro-Distill-GGUF",
+                filename=model_path,
+                local_dir="D:\Modelle\Translate\Qwen3-8B-Gemini-2.5-Pro-Distill-GGUF",
+                n_ctx=4096,      # Kontext-Länge
+                n_gpu_layers=-1, # Alle Layer auf GPU (-1 = automatisch)
+                n_batch=512,     # Batch-Größe
+                n_threads=6,     # CPU-Threads
+                verbose=False,   # Weniger Ausgaben
+                chat_format="chatml"  # Chat-Format für Instruct-Modelle
+            )
+            logger.info("✅ llama-cpp-python Modell erfolgreich geladen")
+        except Exception as e:
+            logger.error(f"Fehler beim Laden des Korrektur-Modells: {e}")
+            logger.info("Fallback: Verwende Qualitätsprüfung ohne automatische Korrektur")
+            correction_model = None
+        
+        # Zähle Segmente, die korrigiert werden müssen
+        segments_to_correct_count = sum(1 for sim in similarities if sim < threshold)
+        logger.info(f"Gefundene problematische Segmente (< {threshold:.2f}): {segments_to_correct_count}")
+        
+        correction_pbar = tqdm(total=segments_to_correct_count, desc="Korrektur markierter Segmente")
+        
+        for i in range(len(df_source)):
+            similarity = similarities[i]
+            status = f"OK ({similarity:.3f})"
+            flag = ""
+            correction_note = ""
+            final_corrected_text = translated_texts[i]
+            
+            if similarity < threshold:
+                status = f"Niedrig ({similarity:.3f})"
+                flag = "CHECK MANUALLY"
+                issues_found += 1
+                
+                # Automatische Korrektur falls Modell verfügbar
+                if correction_model:
+                    tqdm.write("─" * 80)
+                    tqdm.write(f"🔧 Segment {i} zur Korrektur markiert (Ähnlichkeit: {similarity:.3f} < {threshold})")
+                    tqdm.write(f"📝 Original (EN): {source_texts[i]}")
+                    tqdm.write(f"🔄 Übersetzung (DE): {translated_texts[i]}")
+                    tqdm.write("─" * 80)
+                    
+                    # Retry-Mechanismus für automatische Korrektur
+                    success = False
+                    orig_de = translated_texts[i]
+                    best_similarity = similarity
+                    best_correction = orig_de
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            # Temperatur-Zuweisung basierend auf Versuch
+                            current_temperature = temperatures[attempt] if attempt < len(temperatures) else temperatures[-1]
+                            
+                            tqdm.write(f"🔄 Versuch {attempt + 1}/{max_retries}: Sende an Korrektur-LLM, Temp: {current_temperature}...")
+                            
+                            # System-Prompt: Erklärt Aufgabe, Entity Protection und Sprache
+                            system_prompt = (
+                                        "You are a hyper-literal German translation engine. Your task is to create a new, correct German translation based *exclusively* on the provided English source text.\\n\\n"
+                                        
+                                        "OUTPUT FORMAT:\\n"
+                                        "- Output ONLY the corrected, new German text.\\n"
+                                        "- NO labels, NO notes, NO quotes, NO extra whitespace. NO pre- or post-text.\\n\\n"
+                                        
+                                        "HARD CONSTRAINTS (non-negotiable, based on the ENGLISH source):\\n"
+                                        "1) SEMANTIC FIDELITY: The meaning must be identical to the English source. This is the highest priority.\\n"
+                                        "2) NO ADDITIONS/OMISSIONS: Do not add or remove any information. If the source is a fragment or just a few words, the translation must be a fragment or those words correctly translated.\\n"
+                                        "3) STRUCTURE & PUNCTUATION: Mirror the sentence count and punctuation of the English source as closely as German grammar allows.\\n"
+                                        "4) ENTITIES: Never alter numbers, dates, or proper names.\\n"
+                            )
+                            
+                            # Vokabular-Unterstützung hinzufügen
+                            vocabulary_support = create_vocabulary_support()
+                            system_prompt += vocabulary_support
+                            
+                            user_prompt = (
+                                f"SOURCE TEXT (ENGLISH): {source_texts[i]}\\n"
+                                #f"TRANSLATION TO CORRECT (GERMAN): {translated_texts[i]}"
+                            )
+                            
+                            # Chat-Completion mit llama-cpp-python
+                            response = correction_model.create_chat_completion(
+                                messages=[
+                                    {'role': 'system', 'content': system_prompt},
+                                    {'role': 'user', 'content': user_prompt}
+                                ],
+                                temperature=current_temperature,
+                                max_tokens=512,
+                                stop=["<|im_end|>", "<|endoftext|>"]  # Standard Stop-Tokens
+                            )
+                            
+                            correction_candidate = response['choices'][0]['message']['content'].strip()
+                            tqdm.write(f"💡 Korrekturvorschlag: {correction_candidate}")
+                            
+                            # Nach-Korrektur-Ähnlichkeit berechnen
+                            new_embedding = model.encode(correction_candidate, convert_to_tensor=True)
+                            new_similarity = cos_sim(embeddings_source[i:i+1], new_embedding).item()
+                            
+                            if new_similarity > best_similarity + 0.002:  # Mindest-Verbesserung
+                                tqdm.write(f"✅ Bessere Version gefunden: {best_similarity:.3f} → {new_similarity:.3f}")
+                                best_similarity = new_similarity
+                                best_correction = correction_candidate
+                            else:
+                                tqdm.write(f"❌ Keine signifikante Verbesserung: {similarity:.3f} → {new_similarity:.3f}")
+                                
+                        except Exception as e:
+                            logger.warning(f"Korrektur-Versuch {attempt+1} für Segment {i} fehlgeschlagen: {e}")
+                    
+                    # Nach allen Versuchen: finale Entscheidung
+                    if best_similarity > similarity:
+                        corrections_made += 1
+                        final_corrected_text = best_correction
+                        status = f"Korrigiert ({best_similarity:.3f})"
+                        flag = "AUTO-CORRECTED"
+                        correction_note = f"Beste Korrektur nach {max_retries} Versuchen: {best_similarity:.3f}"
+                        corrected_similarities[i] = best_similarity
+                        auto_corrected_segments.append({
+                            "index": i,
+                            "sim_before": similarity,
+                            "sim_after": best_similarity,
+                            "src_en": source_texts[i],
+                            "de_before": orig_de,
+                            "de_after": best_correction
+                        })
+                        tqdm.write(f"🎉 BESTE VERSION ÜBERNOMMEN: {similarity:.3f} → {best_similarity:.3f}")
+                        logger.info(f"Segment {i} erfolgreich korrigiert: Ähnlichkeit {similarity:.3f} → {best_similarity:.3f}")
+                    else:
+                        # Wenn keine Verbesserung gefunden wurde, bleibt der Originaltext
+                        final_corrected_text = orig_de
+                        correction_note = f"Keine Verbesserung nach {max_retries} Versuchen gefunden."
+                        tqdm.write("⚠️ KEINE VERBESSERUNG, Original wird beibehalten.")
+                    
+                    # Fortschrittsbalken aktualisieren, da ein Korrektur-Block abgeschlossen ist
+                    correction_pbar.update(1)
+            
+            results.append({
+                original_source_columns[0]: df_source.iloc[i].get(original_source_columns[0].lower(), "N/A"),
+                original_source_columns[1]: df_source.iloc[i].get(original_source_columns[1].lower(), "N/A"), 
+                "Quelltext": source_texts[i],
+                "Übersetzung": final_corrected_text,
+                "Ähnlichkeit": f"{similarity:.4f}",
+                "KorrigierteÄhnlichkeit": f"{corrected_similarities[i]:.4f}" if flag == "AUTO-CORRECTED" else "",
+                "Status": status,
+                "KorrekturNote": correction_note,
+                "Flag": flag
+            })
+        
+        correction_pbar.close()
+        
+        # Detaillierten Bericht speichern
+        df_report = pd.DataFrame(results)
+        df_report.to_csv(report_path, sep='|', index=False, encoding='utf-8')
+        logger.info(f"Detaillierter Qualitätsbericht gespeichert: {report_path}")
+        
+        # Zusammenfassung berechnen
+        avg_similarity_after = sum(corrected_similarities) / len(corrected_similarities) if corrected_similarities else 0.0
+        
+        summary_content = f"""Qualitätsprüfung der Übersetzung - Zusammenfassung
+        
+Datum der Prüfung: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Quell-Segmente: {len(df_source)}
+Gefundene Probleme (Ähnlichkeit < {threshold}): {issues_found}
+Korrigierte Probleme: {corrections_made}
+Durchschnittliche Ähnlichkeit vorher: {avg_similarity_before:.4f}
+Durchschnittliche Ähnlichkeit nachher: {avg_similarity_after:.4f}
+Verbesserung: {((avg_similarity_after - avg_similarity_before) / avg_similarity_before * 100):.1f}%
+
+🔧 Korrigierte Segmente:
+--------------------------------"""
+        
+        if auto_corrected_segments:
+            for item in auto_corrected_segments:
+                summary_content += f"""
+- Segment {item['index']} ({item['sim_before']:.3f} → {item['sim_after']:.3f})
+  EN (Original): {item['src_en']}
+  DE (vorher): {item['de_before']}
+  DE (nachher): {item['de_after']}"""
+        else:
+            summary_content += "\\n- keine"
+        
+        # Zusammenfassung speichern
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            f.write(summary_content)
+        
+        logger.info(f"Zusammenfassender Bericht gespeichert: {summary_path}")
+        
+        # Korrigierte Übersetzung als CSV speichern für refine_text_pipeline
+        corrected_df = df_translated.copy()  # Kopiere Originalstruktur
+        corrected_df['text'] = [res['Übersetzung'] for res in results]  # Aktualisiere Texte mit Korrekturen
+        corrected_translation_csv = translated_csv_path.replace(".csv", "_corrected.csv")
+        corrected_df.to_csv(corrected_translation_csv, sep='|', index=False, encoding='utf-8')
+        logger.info(f"Korrigierte Übersetzung als CSV gespeichert: {corrected_translation_csv}")
+        
+        print(f"📊 QA-Prüfung abgeschlossen. Bericht: {report_path}, Zusammenfassung: {summary_path}")
+        print(f"🔍 Gefundene Probleme: {issues_found}, Korrigiert: {corrections_made}")
+        print(f"📈 Semantische Verbesserung: {((avg_similarity_after - avg_similarity_before) / avg_similarity_before * 100):.1f}%")
+        print("─" * 80)
+        
+        # Ressourcen freigeben
+        if 'correction_model' in locals():
+            del correction_model
+        del model
+        
+        return report_path, corrected_translation_csv
+        
     except Exception as e:
         logger.error(f"Fehler bei der Qualitätsprüfung der Übersetzung: {e}", exc_info=True)
         return None
@@ -4424,7 +4917,7 @@ def entity_protection_final(
     text: str,
     nlp_model,
     tokenizer: T5Tokenizer,
-    custom_words: List[str] = ["Datura", "Acid", "Langan", "Lobet", "lobet"]  # Optionale Liste benutzerdefinierter Wörter zum Schützen
+    custom_words: List[str] = ["Datura", "Acid", "Langan", "Lobet", "lobet", "Danket", "preiset"]  # Optionale Liste benutzerdefinierter Wörter zum Schützen
 ) -> Tuple[str, Dict[str, EntityInfo]]:
     """
     Stellt sicher, dass T5-native Sentinel-Tokens (<extra_id_0>) verwendet werden,
@@ -5050,7 +5543,7 @@ def initialize_language_tool(lang: str, lt_path: str):
         "--port", str(port), "--allow-origin", "*"
     ], cwd=lt_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     
-    time.sleep(15)  # Server-Start abwarten
+    time.sleep(10)  # Server-Start abwarten
     
     os.environ["LANGUAGE_TOOL_HOST"] = "localhost"
     os.environ["LANGUAGE_TOOL_PORT"] = str(port)
@@ -5576,10 +6069,10 @@ def text_to_speech_with_voice_cloning(
                             gpt_cond_latent=gpt_cond_latent,
                             speaker_embedding=speaker_embedding,
                             speed=1.1,
-                            temperature=0.7,
+                            temperature=0.8,
                             repetition_penalty=5.0,
-                            top_k=55,
-                            top_p=0.85,
+                            top_k=60,
+                            top_p=0.95,
                             enable_text_splitting=False
                         )
 

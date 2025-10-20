@@ -1,14 +1,14 @@
 # Dateipfade
-AUDIO_PATH = "2_the SERPENT god of FORBIDDEN knowledge (PART 2)(DOCUMENTARY)_HD_(Vocals).wav"
-VIDEO_PATH = "the SERPENT god of FORBIDDEN knowledge (PART 2)(DOCUMENTARY)_HD.mp4"
-FINAL_VIDEO_PATH = "the SERPENT god of FORBIDDEN knowledge (PART 2)(DOCUMENTARY)_HD_deutsch.mp4"
+AUDIO_PATH = "1_the SERPENT god of FORBIDDEN knowledge (DOCUMENTARY) (PART 1)_HD_(Vocals).wav"
+VIDEO_PATH = "the SERPENT god of FORBIDDEN knowledge (DOCUMENTARY) (PART 1)_HD.mp4"
+FINAL_VIDEO_PATH = "the SERPENT god of FORBIDDEN knowledge (DOCUMENTARY) (PART 1)_HD_deutsch.mp4"
 ORIGINAL_AUDIO_PATH = "00_original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
-SAMPLE_PATH_1 = "asleep_sample-01.wav"
-SAMPLE_PATH_2 = "asleep_sample-02.wav"
-SAMPLE_PATH_3 = "asleep_sample-03.wav"
-#SAMPLE_PATH_4 = "gibson_sample-04.wav"
+SAMPLE_PATH_1 = "ich_sample-01.wav"
+SAMPLE_PATH_2 = "ich_sample-02.wav"
+SAMPLE_PATH_3 = "ich_sample-03.wav"
+#SAMPLE_PATH_4 = "ich_sample-04.wav"
 #SAMPLE_PATH_5 = "papa_sample-05.wav"
 SPEECH_TIMESTAMPS = "speech_timestamps.json"
 DOWNSAMPLED_AUDIO_PATH = "downsampled_audio.wav"
@@ -93,6 +93,7 @@ vocoder_cfg = r"D:\Modelle\Vocoder\bigvgan_v2_24khz_100band_256x\config.json"
 # Sentence Transformer Modell-Konfiguration
 SENTENCE_TRANSFORMER_MODELS = {
     "quality": "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+    "quality_LaBSE": "sentence-transformers/LaBSE",
     "quality_neu": "sentence-transformers/multi-qa-mpnet-base-dot-v1",
     "quality_big": "intfloat/multilingual-e5-large",
     "embedding": "sentence-transformers/distiluse-base-multilingual-cased-v2", 
@@ -106,7 +107,7 @@ SENTENCE_TRANSFORMER_MODELS = {
 MIN_WORDS_GLOBAL = 4
 
 # Standard-Modelle für verschiedene Aufgaben
-ST_QUALITY_MODEL = SENTENCE_TRANSFORMER_MODELS["quality"]
+ST_QUALITY_MODEL = SENTENCE_TRANSFORMER_MODELS["quality_big"]
 ST_EMBEDDING_MODEL_DE = SENTENCE_TRANSFORMER_MODELS["embedding"]
 ST_SPEED_MODEL = SENTENCE_TRANSFORMER_MODELS["multi_speed"]
 
