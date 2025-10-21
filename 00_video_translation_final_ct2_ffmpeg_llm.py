@@ -1215,7 +1215,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
             segments_generator, info = pipeline.transcribe(
                 audio_file,
                 # === Bestehende Parameter beibehalten ===
-                batch_size=2,                              # Für deine 6GB VRAM
+                batch_size=1,                              # Für deine 6GB VRAM
                 beam_size=20,                              # Bereits optimal
                 patience=2.0,                              # Bereits vorhanden
                 
@@ -3723,6 +3723,27 @@ def is_valid_segment(segment, check_text_content=True):
     return True
 
 # Qualitätsbewertung mit automatischer Korrektur via Ollama
+def calculate_max_chars_for_segment(duration_seconds: float) -> int:
+    """
+    Berechnet maximale Zeichenanzahl für Untertitel basierend auf Segment-Dauer.
+    
+    Professionelle Standards (Netflix, BBC):
+    - Lesegeschwindigkeit: 15-20 Zeichen/Sekunde
+    - Max. 42 Zeichen pro Zeile
+    - Max. 2 Zeilen pro Event
+    
+    Args:
+        duration_seconds: Segment-Dauer in Sekunden
+        
+    Returns:
+        Maximale Zeichenanzahl (inkl. Leerzeichen)
+    """
+    CPS_TARGET = 17  # Zeichen pro Sekunde (optimal für Deutsch)
+    max_chars = int(duration_seconds * CPS_TARGET)
+    
+    # Begrenzung: Max 84 Zeichen (2 Zeilen à 42 Zeichen)
+    return min(max_chars, 84)
+
 def evaluate_translation_quality(
     source_csv_path,
     translated_csv_path,
@@ -3974,6 +3995,10 @@ def evaluate_translation_quality(
                 orig_de = translated_texts[i]
                 best_similarity = similarity
                 best_correction = orig_de
+                segment_start = parse_time(df_source.iloc[i]['startzeit'])
+                segment_end = parse_time(df_source.iloc[i]['endzeit'])
+                segment_duration = segment_end - segment_start
+                max_chars = calculate_max_chars_for_segment(segment_duration)
 
                 # Definiert die Temperatur für jeden Versuch
                 temperatures = [0.0, 0.05, 0.1]
@@ -3985,27 +4010,37 @@ def evaluate_translation_quality(
 
                         tqdm.write(f"   Versuch {attempt + 1}/{max_retries}: Sende an Korrektur-LLM ({correction_model}, Temp: {current_temperature})...")
                         system_prompt = (
-                                        "You are a hyper-literal German translation engine. Your task is to create a new, correct German translation based *exclusively* on the provided English source text."
+                                        "You are a professional German subtitle translator specializing in natural-sounding film dialogue."
+                                        "Your task is to create idiomatic, native German text that feels like it was originally written in German, not translated."
                                         
                                         "OUTPUT FORMAT:"
-                                        "- Output ONLY the corrected, new German text."
-                                        "- NO labels, NO notes, NO quotes, NO extra whitespace. NO pre- or post-text."
+                                        "- Output ONLY the corrected German text"
+                                        "- NO labels, NO notes, NO quotes, NO explanations"
                                         
-                                        "HARD CONSTRAINTS (non-negotiable, based on the ENGLISH source):"
-                                        "1) SEMANTIC FIDELITY: The meaning must be identical to the English source. This is the highest priority."
-                                        "2) NO ADDITIONS/OMISSIONS: Do not add or remove any information. If the source is a fragment or just a few words, the translation must be a fragment or those words correctly translated."
-                                        "3) STRUCTURE & PUNCTUATION: Mirror the sentence count and punctuation of the English source as closely as German grammar allows."
-                                        "4) ENTITIES: Never alter numbers, dates, or proper names."
+                                        "TRANSLATION PRINCIPLES (priority order):"
+                                        "1) SEMANTIC FIDELITY: The meaning must match the English source exactly. This is the highest priority."
+                                        "2) NATURAL GERMAN: Use native German word order and phrasing. Restructure sentences if needed for idiomatic flow."
+                                        "3) CONCISENESS: Prefer shorter, clearer phrasing. Subtitles must be readable at a glance."
+                                        "4) NO ADDITIONS/OMISSIONS: Keep all key information, but remove English filler words if they don't translate naturally."
+                                        "5) ENTITIES: Never alter numbers, dates, or proper names."
+                                        
+                                        "STYLE GUIDANCE:"
+                                        "- Use natural German verb placement (V2 in main clauses, verb-final in subordinate clauses)"
+                                        "- Prefer active voice over passive when possible"
+                                        "- Use contractions if the source is casual (e.g., 'hab ich' instead of 'habe ich')"
+                                        "- Avoid compound words longer than 20 characters"
+                                        "- Break long German compounds into separate words if clearer (e.g., 'Qualitäts Management' not 'Qualitätsmanagement')"
                                     )
 
                         # ✅ VOKABULAR-UNTERSTÜTZUNG HINZUFÜGEN
                         vocabulary_support = create_vocabulary_support()
                         system_prompt += vocabulary_support
-
+                        system_prompt += f"\n\nCRITICAL CHARACTER LIMIT: The German translation MUST NOT exceed {max_chars} characters. Use shorter synonyms, remove filler words if needed."
 
                         user_prompt = (
                                             f"SOURCE TEXT (ENGLISH): {source_texts[i]}\n"
-                                            #f"TRANSLATION TO CORRECT (GERMAN): {translated_texts[i]}"
+                                            f"TRANSLATION TO CORRECT OR SHORTEN (GERMAN): {translated_texts[i]}\n"
+                                            f"SEGMENT DURATION: {segment_duration:.2f} seconds → MAX {max_chars} characters (spaces included)"
                                         )
 
                         response = ollama.chat(
@@ -4145,6 +4180,168 @@ def evaluate_translation_quality(
     except Exception as e:
         logger.error(f"Fehler bei der Qualitätsprüfung der Übersetzung: {e}", exc_info=True)
         return None
+
+def polish_all_translations(
+    source_csv_path: str,
+    translated_csv_path: str,
+    output_csv_path: str,
+    model_name: str = "qwen3:8b",
+    skip_threshold: float = 0.9
+) -> str:
+    """
+    Systematisches Polishing aller Übersetzungen für maximale Natürlichkeit.
+    
+    Args:
+        source_csv_path: Original-Englisch CSV
+        translated_csv_path: MadLad400-Übersetzung CSV
+        output_csv_path: Polierte Ausgabe CSV
+        model_name: Ollama-Modell für Polishing
+        skip_threshold: Überspringe Segmente über diesem Similarity-Score
+        
+    Returns:
+        Pfad zur polierten CSV
+    """
+    logger.info("Starte systematisches Translation-Polishing für alle Segmente...")
+    
+    df_source = pd.read_csv(source_csv_path, sep='|', dtype=str).fillna('')
+    df_translated = pd.read_csv(translated_csv_path, sep='|', dtype=str).fillna('')
+    
+    # Normalisiere Spaltennamen
+    df_source.columns = [col.strip().lower() for col in df_source.columns]
+    df_translated.columns = [col.strip().lower() for col in df_translated.columns]
+    
+    source_texts = df_source['text'].tolist()
+    translated_texts = df_translated['text'].tolist()
+    
+    # Berechne Similarity für Skip-Logik
+    with gpu_context():
+        model = SentenceTransformer(ST_QUALITY_MODEL, device=device)
+        embeddings_source = model.encode(source_texts, convert_to_tensor=True, show_progress_bar=False)
+        embeddings_translated = model.encode(translated_texts, convert_to_tensor=True, show_progress_bar=False)
+        similarities = torch.diag(cos_sim(embeddings_source, embeddings_translated)).tolist()
+    
+    polished_texts = []
+    skipped_count = 0
+    
+    # Polishing-System-Prompt (optimiert für Naturalness)
+    polishing_system_prompt = (
+        "You are a German subtitle editor specializing in natural-sounding translations."
+        "Your task is to refine the provided German translation to make it more natural, concise, and readable."
+        "The translation is already semantically correct, so focus on NATURALNESS and BREVITY."
+        
+        "POLISHING GOALS:"
+        "1) NATURALNESS: Improve German word order and phrasing for native-speaker flow"
+        "2) BREVITY: Shorten by 10-20% without losing meaning (remove redundancy, use shorter synonyms)"
+        "3) CLARITY: Simplify complex sentences, remove ambiguity"
+        "4) CONSISTENCY: Use standard German, avoid overly formal or archaic terms"
+        
+        "OUTPUT FORMAT:"
+        "- Output ONLY the polished German text"
+        "- NO explanations, NO labels, NO quotes"
+    )
+    
+    # Erstelle manuellen Progress-Bar für bessere Kontrolle
+    pbar = tqdm(total=len(source_texts), desc="Polishing Translations")
+
+    for i in range(len(source_texts)):
+        similarity = similarities[i]
+        
+        # Skip sehr hochqualitative Segmente
+        if similarity > skip_threshold:
+            polished_texts.append(translated_texts[i])
+            skipped_count += 1
+            pbar.update(1)
+            continue
+        
+        # Berechne CPS-Limit
+        segment_start = parse_time(df_source.iloc[i]['startzeit'])
+        segment_end = parse_time(df_source.iloc[i]['endzeit'])
+        segment_duration = segment_end - segment_start
+        max_chars = calculate_max_chars_for_segment(segment_duration)
+        
+        # NEU: Live-Ausgabe vor Polishing
+        tqdm.write(f"\n{'='*80}")
+        tqdm.write(f"🔧 Segment {i} wird poliert (Similarity: {similarity:.3f} < {skip_threshold})")
+        tqdm.write(f"   Zeit: {df_source.iloc[i]['startzeit']} → {df_source.iloc[i]['endzeit']} (Dauer: {segment_duration:.1f}s)")
+        tqdm.write(f"   Original (EN): '{source_texts[i]}'")
+        tqdm.write(f"   MadLad (DE):   '{translated_texts[i]}' ({len(translated_texts[i])} Zeichen)")
+        tqdm.write(f"   Max. erlaubt:  {max_chars} Zeichen (CPS-Limit: 17 Zeichen/Sekunde)")
+        tqdm.write(f"{'-'*80}")
+        
+        user_prompt = (
+            f"SOURCE (EN): {source_texts[i]}\n"
+            f"TRANSLATION (DE): {translated_texts[i]}\n"
+            f"MAX CHARACTERS: {max_chars}\n"
+            f"CURRENT QUALITY SCORE: {similarity:.3f}"
+        )
+        
+        try:
+            # NEU: Zeige dass Ollama arbeitet
+            tqdm.write(f"   ⏳ Sende an Ollama ({model_name}, Temp: 0.3)...")
+            
+            response = ollama.chat(
+                model=model_name,
+                messages=[
+                    {'role': 'system', 'content': polishing_system_prompt},
+                    {'role': 'user', 'content': user_prompt}
+                ],
+                options={
+                    'temperature': 0.3,
+                    'num_ctx': 4096
+                },
+                think=False
+            )
+            
+            polished = response['message']['content'].strip()
+            tqdm.write(f"   ✅ Poliert: '{polished}' ({len(polished)} Zeichen)")
+
+            original_len = len(translated_texts[i])
+            polished_len = len(polished)
+            polished_count = 0
+
+            # FALL 1: Perfekt - innerhalb CPS-Limit
+            if polished_len <= max_chars:
+                tqdm.write(f"   ✨ PERFEKT! Innerhalb Limit ({polished_len} ≤ {max_chars})")
+                polished_texts.append(polished)
+                polished_count += 1
+
+            # FALL 2: Zu lang, ABER besser als Original
+            elif polished_len < original_len:
+                reduction = original_len - polished_len
+                reduction_pct = (reduction / original_len * 100)
+                
+                tqdm.write(f"   ⚠️  Noch {polished_len - max_chars} über Limit, ABER {reduction_pct:.1f}% kürzer!")
+                tqdm.write(f"   → Verwende polierte Version (deutliche Verbesserung!)")
+                polished_texts.append(polished)
+                polished_count += 1
+
+            # FALL 3: Polished länger als Original
+            else:
+                increase = polished_len - original_len
+                tqdm.write(f"   ❌ VERSCHLECHTERUNG! Polished +{increase} Zeichen länger")
+                tqdm.write(f"   → Behalte Original")
+                polished_texts.append(translated_texts[i])
+                
+        except Exception as e:
+            tqdm.write(f"   ❌ FEHLER: {e}")
+            tqdm.write(f"   → Behalte Original-Übersetzung")
+            logger.error(f"Polishing fehlgeschlagen für Segment {i}: {e}")
+            polished_texts.append(translated_texts[i])
+        
+        # Update Progress-Bar
+        pbar.update(1)
+
+    # Schließe Progress-Bar
+    pbar.close()
+
+    
+    # Speichere polierte Version
+    df_polished = df_translated.copy()
+    df_polished['text'] = polished_texts
+    df_polished.to_csv(output_csv_path, sep='|', index=False)
+    
+    logger.info(f"Polishing abgeschlossen. {len(polished_texts) - skipped_count}/{len(polished_texts)} Segmente verfeinert. Gespeichert: {output_csv_path}")
+    return output_csv_path
 
 def evaluate_translation_quality_llamacpp(
     source_csv_path: str,
@@ -6563,6 +6760,10 @@ def main():
                             SAMPLE_PATH_3
                             )
         """
+
+        clear_spacy_cache_and_free_vram()
+        time.sleep(3)
+
         transcribe_audio_with_timestamps(ORIGINAL_AUDIO_PATH, TRANSCRIPTION_FILE)
 
         clear_spacy_cache_and_free_vram()
@@ -6620,6 +6821,37 @@ def main():
             model_name=ST_QUALITY_MODEL,
             threshold=SIMILARITY_THRESHOLD
         )
+
+        clear_spacy_cache_and_free_vram()
+        time.sleep(3)
+
+        # NEU: SCHRITT 4.5: POLISHING (nach Qualitätsprüfung, vor Refinement)
+        POLISHED_TRANSLATION_CSV = corrected_csv.replace('.csv', '_polished.csv')
+
+        if not os.path.exists(POLISHED_TRANSLATION_CSV) or ask_overwrite(POLISHED_TRANSLATION_CSV):
+            logger.info("=" * 80)
+            logger.info("SCHRITT 4.5: Systematisches Polishing für natürliche Übersetzung")
+            logger.info("=" * 80)
+            
+            try:
+                polished_file = polish_all_translations(
+                    source_csv_path=CLEANED_SOURCE_FOR_QUALITY_CHECK,
+                    translated_csv_path=corrected_csv,
+                    output_csv_path=POLISHED_TRANSLATION_CSV,
+                    model_name="qwen3:8b",
+                    skip_threshold=0.9
+                )
+                
+                # Verwende polierte Version für weitere Schritte
+                corrected_csv = polished_file
+                logger.info(f"✅ Polishing abgeschlossen. Verwende: {corrected_csv}")
+                
+            except Exception as e:
+                logger.error(f"⚠️ Polishing fehlgeschlagen: {e}. Verwende Original.")
+                logger.error(f"Traceback:", exc_info=True)
+        else:
+            logger.info(f"Verwende vorhandene polierte Übersetzung: {POLISHED_TRANSLATION_CSV}")
+            corrected_csv = POLISHED_TRANSLATION_CSV
 
         clear_spacy_cache_and_free_vram()
         time.sleep(3)
