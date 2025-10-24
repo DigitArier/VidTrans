@@ -4035,7 +4035,7 @@ def evaluate_translation_quality(
     summary_path,
     model_name,
     threshold,
-    correction_model="qwen3:8b",
+    correction_model="gemma2:9b",
     max_retries=2
 ) -> Tuple[str, str]:
     """
@@ -4131,7 +4131,7 @@ def evaluate_translation_quality(
                 max_chars = calculate_max_chars_for_segment(segment_duration)
 
                 # Definiert die Temperatur für jeden Versuch
-                temperatures = [0.0, 0.05, 0.1]
+                temperatures = [0.2, 0.3, 0.4]
 
                 for attempt in range(max_retries):
                     try:
@@ -4139,6 +4139,21 @@ def evaluate_translation_quality(
                         current_temperature = temperatures[attempt] if attempt < len(temperatures) else temperatures[-1]
 
                         tqdm.write(f"   Versuch {attempt + 1}/{max_retries}: Sende an Korrektur-LLM ({correction_model}, Temp: {current_temperature})...")
+                        system_prompt = (
+                                        "You are a professional German subtitle translator."
+                                        "Your task: Create natural, idiomatic German translations."
+
+                                        "RULES:"
+                                        "1. Match meaning exactly - no additions or omissions"
+                                        "2. Use natural German word order"
+                                        "3. Keep translations concise for subtitles"
+                                        "4. Never change numbers, names, or dates"
+                                        #"5. Character limit: {maxchars} characters (including spaces)"
+
+                                        "OUTPUT: Only the German translation, no explanations."
+                                        )
+
+                        """
                         system_prompt = (
                                         
                                         "You are a professional German subtitle translator specializing in natural-sounding film dialogue."
@@ -4157,11 +4172,11 @@ def evaluate_translation_quality(
                                         "- Use contractions if the source is casual (e.g., 'hab ich' instead of 'habe ich')"
                                         "- Avoid compound words longer than 20 characters"
                                         "- Break long German compounds into separate words if clearer (e.g., 'Qualitäts Management' not 'Qualitätsmanagement')"
-                                        """
-                                        "You are a German subtitle editor specializing in natural-sounding translations."
-                                        "Your task is to refine the provided German translation to make it more natural, concise, and readable."
-                                        "The translation is already semantically correct, so focus on NATURALNESS and BREVITY."
-                                        """
+                                        
+                                        #"You are a German subtitle editor specializing in natural-sounding translations."
+                                        #"Your task is to refine the provided German translation to make it more natural, concise, and readable."
+                                        #"The translation is already semantically correct, so focus on NATURALNESS and BREVITY."
+                                        
                                         "POLISHING GOALS:"
                                         "1) NATURALNESS: Improve German word order and phrasing for native-speaker flow"
                                         "2) BREVITY: Shorten by 10-20% without losing meaning (remove redundancy, use shorter synonyms)"
@@ -4177,7 +4192,7 @@ def evaluate_translation_quality(
                         vocabulary_support = create_vocabulary_support()
                         system_prompt += vocabulary_support
                         system_prompt += f"\n\nCRITICAL CHARACTER LIMIT: The German translation MUST NOT exceed {max_chars} characters. Use shorter synonyms, remove filler words if needed."
-
+                        """
                         user_prompt = (
                                             f"SOURCE TEXT (ENGLISH): {source_texts[i]}\n"
                                             #f"TRANSLATION TO CORRECT OR SHORTEN (GERMAN): {translated_texts[i]}\n"
@@ -4192,7 +4207,7 @@ def evaluate_translation_quality(
                             ],
                             options={
                                 'temperature': current_temperature,
-                                'num_ctx': 8192
+                                'num_ctx': 4096
                             },
                             think=False
                         )
@@ -4327,7 +4342,7 @@ def polish_all_translations(
     translated_csv_path: str,
     output_csv_path: str,
     sp_model_name: str,
-    llm_model_name: str = "qwen3:8b",
+    llm_model_name: str = "gemma2:9b",
     skip_threshold: float = None
 ) -> str:
     """
@@ -4366,6 +4381,7 @@ def polish_all_translations(
     skipped_count = 0
     
     # Polishing-System-Prompt (optimiert für Naturalness)
+    """
     polishing_system_prompt = (
         "You are a German subtitle editor specializing in natural-sounding translations."
         "Your task is to refine the provided German translation to make it more natural, concise, and readable."
@@ -4384,7 +4400,20 @@ def polish_all_translations(
 
     vocabulary_support = create_vocabulary_support()
     polishing_system_prompt += vocabulary_support
+    """
+    polishing_system_prompt = (
+                "You are a professional German subtitle translator."
+                "Your task: Create natural, idiomatic German translations."
 
+                "RULES:"
+                "1. Match meaning exactly - no additions or omissions"
+                "2. Use natural German word order"
+                "3. Keep translations concise for subtitles"
+                "4. Never change numbers, names, or dates"
+                "5. Character limit: {maxchars} characters (including spaces)"
+
+                "OUTPUT: Only the German translation, no explanations."
+                )
     # Erstelle manuellen Progress-Bar für bessere Kontrolle
     pbar = tqdm(total=len(source_texts), desc="Polishing Translations")
 
@@ -6782,12 +6811,7 @@ def text_to_speech_with_voice_cloning(
             # ======================================================================
             # PHASE 4: Audio-Assemblierung
             # ======================================================================
-            try:
-                assemble_final_audio_ffmpeg_parallel(output_path)
-            except Exception as e:
-                logger.warning(f"Parallele Assemblierung fehlgeschlagen: {e}")
-                logger.info("Fallback auf sequenzielle Verarbeitung...")
-                assemble_final_audio_ffmpeg_sequential(output_path)
+            assemble_final_audio_ffmpeg_sequential(output_path)
 
             logger.info(f"TTS-Prozess abgeschlossen. Finale Audiodatei: {output_path}")
 
@@ -7419,7 +7443,8 @@ def main():
             translated_csv_path=semantic_optimized_file,
             report_path=TRANSLATION_QUALITY_REPORT,
             summary_path=TRANSLATION_QUALITY_SUMMARY,
-            model_name=ST_QUALITY_MODEL,
+            model_name=ST_MINI_MODEL,
+            correction_model="gemma2:9b",
             threshold=SIMILARITY_THRESHOLD_EVAL
         )
 
@@ -7439,8 +7464,8 @@ def main():
                     source_csv_path=CLEANED_SOURCE_FOR_QUALITY_CHECK,
                     translated_csv_path=corrected_csv,
                     output_csv_path=POLISHED_TRANSLATION_CSV,
-                    sp_model_name=ST_POLISH_MODEL_DE,
-                    llm_model_name="qwen3:8b",
+                    sp_model_name=ST_MINI_MODEL,
+                    llm_model_name="gemma2:9b",
                     skip_threshold=SIMILARITY_THRESHOLD_POLISHING
                 )
                 
