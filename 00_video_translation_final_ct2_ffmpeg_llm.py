@@ -33,11 +33,7 @@ def setup_logging():
 
     logger.info("Logging wurde erfolgreich im Hauptprozess initialisiert.")
 
-"""
-import coverage
-cov = coverage.Coverage(branch=True)
-cov.start()
-"""
+from coverage import Coverage
 import sys
 import ctypes
 import socket
@@ -4131,7 +4127,7 @@ def evaluate_translation_quality(
                 max_chars = calculate_max_chars_for_segment(segment_duration)
 
                 # Definiert die Temperatur für jeden Versuch
-                temperatures = [0.2, 0.3, 0.4]
+                temperatures = [0.2, 0.4]
 
                 for attempt in range(max_retries):
                     try:
@@ -7357,6 +7353,9 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
 # ==============================
 
 def main():
+    cov = Coverage()
+    cov.start()
+    
     """
     Orchestriert alle Schritte, um das Video zu übersetzen, TTS-Audio zu erzeugen und schließlich ein fertiges Video zu erstellen.
     Diese Version verwaltet den Lebenszyklus aller benötigten Server.
@@ -7540,6 +7539,11 @@ def main():
             stop_language_tool_server(lt_process)
         if ollama_process:
             stop_ollama_server(ollama_process)
+
+    cov.stop()
+    cov.save()
+
+    cov.html_report()
 
 if __name__ == "__main__":
 
