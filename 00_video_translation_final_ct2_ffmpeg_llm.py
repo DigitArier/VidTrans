@@ -7455,9 +7455,9 @@ def main():
         POLISHED_TRANSLATION_CSV = corrected_csv.replace('.csv', '_polished.csv')
 
         if not os.path.exists(POLISHED_TRANSLATION_CSV) or ask_overwrite(POLISHED_TRANSLATION_CSV):
-            logger.info("=" * 80)
+            logger.info("=" * 88)
             logger.info("SCHRITT 4.5: Systematisches Polishing für natürliche Übersetzung")
-            logger.info("=" * 80)
+            logger.info("=" * 88)
             
             try:
                 polished_file = polish_all_translations(
