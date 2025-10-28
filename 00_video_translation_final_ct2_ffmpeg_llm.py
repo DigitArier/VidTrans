@@ -2371,6 +2371,7 @@ def _is_refusal(text: str) -> bool:
         return True
     return any(pattern in text_lower for pattern in refusal_patterns)
 
+# Übersetzen
 def save_all_hypotheses_csv(all_hypotheses: List[Dict], output_file: str):
     """
     KORRIGIERTE VERSION: Speichert alle Hypothesen in einer flachen CSV-Datei.
@@ -2442,7 +2443,6 @@ def save_all_hypotheses_csv(all_hypotheses: List[Dict], output_file: str):
         logger.error(f"❌ Fehler beim Speichern der Hypothesen-CSV: {e}", exc_info=True)
         raise
 
-# Übersetzen
 def translate_segments_optimized_safe(
     refined_transcription_path: str,
     master_entity_map: Dict[int, Dict[str, EntityInfo]],
@@ -2452,8 +2452,8 @@ def translate_segments_optimized_safe(
     target_lang: str = "de",
     src_lang: str = "eng_Latn",
     tgt_lang: str = "deu_Latn",
-    batch_size: int = 1,
-    num_hypotheses: int = 5
+    batch_size: int = 2,
+    num_hypotheses: int = 10
 ) -> Tuple[str, str]:
     """
     Übersetzt Segmente mit verbesserter Entity-Behandlung und Multi-Hypothesis-Unterstützung.
@@ -2584,10 +2584,10 @@ def translate_segments_optimized_safe(
         logger.info("Verwende MADLAD CTranslate2 für die Übersetzung.")
         translator_madlad, tokenizer_madlad = load_madlad400_translator_ct2(device=device)
 
-        for i in tqdm(range(0, len(segments_to_process), batch_size), desc="Übersetze geschützte Batches mit Multi-Hypothesis"):
-            batch_data = segments_to_process[i:i + batch_size]
+        for idx in tqdm(range(0, len(segments_to_process), batch_size), desc="Übersetze geschützte Batches mit Multi-Hypothesis"):
+            batch_data = segments_to_process[idx:idx + batch_size]
             texts_to_translate = [item['protected_text'] for item in batch_data]
-            batch_source_texts = source_texts_for_similarity[i:i + batch_size]
+            batch_source_texts = source_texts_for_similarity[idx:idx + batch_size]
 
             # Aufruf der neuen MADLAD-Übersetzungsfunktion
             best_translations, hypotheses_csv_path = translate_batch_madlad(
@@ -2650,7 +2650,7 @@ def translate_batch_madlad(
     translator: ctranslate2.Translator,
     tokenizer: T5TokenizerFast,
     target_lang: str = "de",
-    num_hypotheses: int = 5,
+    num_hypotheses: int = 10,
     source_texts: List[str] = None,
     similarity_model_name: str = ST_QUALITY_MODEL
 ) -> Tuple[List[str], str]:
@@ -2700,11 +2700,11 @@ def translate_batch_madlad(
     all_hypotheses_for_csv = []
     provisional_translations = []
     
-    for i, result in enumerate(results):
+    for result_idx, result in enumerate(results):
         # Datenstruktur für dieses Segment erstellen
         segment_data = {
-            "segment_id": i,  # Eindeutige Segment-ID
-            "source_text": source_texts[i] if source_texts and i < len(source_texts) else texts[i],
+            "segment_id": result_idx,  # Eindeutige Segment-ID
+            "source_text": source_texts[result_idx] if source_texts and result_idx < len(source_texts) else texts[result_idx],
             "hypotheses": []
         }
         
@@ -4032,7 +4032,7 @@ def evaluate_translation_quality(
     model_name,
     threshold,
     correction_model="gemma2:9b",
-    max_retries=2
+    max_retries=5
 ) -> Tuple[str, str]:
     """
     Prüft semantische Ähnlichkeit, korrigiert niedrige Segmente automatisch via Ollama
@@ -4127,7 +4127,7 @@ def evaluate_translation_quality(
                 max_chars = calculate_max_chars_for_segment(segment_duration)
 
                 # Definiert die Temperatur für jeden Versuch
-                temperatures = [0.2, 0.4]
+                temperatures = [0.2, 0.25, 0.3]
 
                 for attempt in range(max_retries):
                     try:
@@ -5284,7 +5284,9 @@ def entity_protection_final(
     text: str,
     nlp_model,
     tokenizer: T5Tokenizer,
-    custom_words: List[str] = ["Datura", "Acid", "Langan", "Lobet", "lobet", "Danket", "preiset"]  # Optionale Liste benutzerdefinierter Wörter zum Schützen
+    custom_words: List[str] = [
+        "Datura", "Acid", "Langan", "Lobet", "lobet", "Danket", "preiset", "Glitch", "JFK", "MLK"
+        ]  # Optionale Liste benutzerdefinierter Wörter zum Schützen
 ) -> Tuple[str, Dict[str, EntityInfo]]:
     """
     Stellt sicher, dass T5-native Sentinel-Tokens (<extra_id_0>) verwendet werden,
@@ -7442,7 +7444,7 @@ def main():
             translated_csv_path=semantic_optimized_file,
             report_path=TRANSLATION_QUALITY_REPORT,
             summary_path=TRANSLATION_QUALITY_SUMMARY,
-            model_name=ST_MINI_MODEL,
+            model_name=ST_POLISH_MODEL_DE,
             correction_model="gemma2:9b",
             threshold=SIMILARITY_THRESHOLD_EVAL
         )
@@ -7463,7 +7465,7 @@ def main():
                     source_csv_path=CLEANED_SOURCE_FOR_QUALITY_CHECK,
                     translated_csv_path=corrected_csv,
                     output_csv_path=POLISHED_TRANSLATION_CSV,
-                    sp_model_name=ST_MINI_MODEL,
+                    sp_model_name=ST_POLISH_MODEL_DE,
                     llm_model_name="gemma2:9b",
                     skip_threshold=SIMILARITY_THRESHOLD_POLISHING
                 )
