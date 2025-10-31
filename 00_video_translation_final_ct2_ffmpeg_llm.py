@@ -304,7 +304,6 @@ if device == "cpu":
 
 # Startzeit für die Gesamtmessung
 start_time = time.time()
-step_times = {}
 
 # Sprachkürzel für das gesamte Projekt
 source_lang="en"
@@ -1341,8 +1340,8 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
             segments_generator, info = pipeline.transcribe(
                 audio_file,
                 # === Bestehende Parameter beibehalten ===
-                batch_size=1,                              # Für deine 6GB VRAM
-                beam_size=20,                              # Bereits optimal
+                batch_size=2,                              # Für deine 6GB VRAM
+                beam_size=10,                              # Bereits optimal
                 patience=2.0,                              # Bereits vorhanden
                 
                 # === VAD-OPTIMIERUNGEN ===
@@ -2452,7 +2451,7 @@ def translate_segments_optimized_safe(
     target_lang: str = "de",
     src_lang: str = "eng_Latn",
     tgt_lang: str = "deu_Latn",
-    batch_size: int = 2,
+    batch_size: int = 1,
     num_hypotheses: int = 10
 ) -> Tuple[str, str]:
     """
@@ -3702,7 +3701,7 @@ def select_best_hypotheses_post_translation(
     logger.info("Starte semantische Hypothesen-Auswahl (VRAM-optimiert)...")
 
     # Pfad zur finalen Ausgabedatei frühzeitig definieren
-    updated_path = translation_output_file.replace('.csv', '_semantic_best.csv')
+    updated_path = SEMANTIC_BEST_TRANSLATION_FILE
 
     # Prüfen, ob die *finale* semantisch optimierte Datei bereits existiert.
     if os.path.exists(updated_path):
@@ -3796,7 +3795,7 @@ def select_best_hypotheses_post_translation(
             if i in best_translations:
                 df_trans.at[i, 'text'] = best_translations[i]
 
-        updated_path = translation_output_file.replace('.csv', '_semantic_best.csv')
+        updated_path = SEMANTIC_BEST_TRANSLATION_FILE
         df_trans.to_csv(updated_path, sep='|', index=False, encoding='utf-8')
         logger.info(f"Semantisch optimierte Übersetzung gespeichert: {updated_path}")
         generate_hypothesis_selection_report(
@@ -3864,7 +3863,7 @@ def calculate_max_chars_for_segment(duration_seconds: float) -> int:
     Returns:
         Maximale Zeichenanzahl (inkl. Leerzeichen)
     """
-    CPS_TARGET = 17  # Zeichen pro Sekunde (optimal für Deutsch)
+    CPS_TARGET = 20  # Zeichen pro Sekunde (optimal für Deutsch)
     max_chars = int(duration_seconds * CPS_TARGET)
     
     # Begrenzung: Max 84 Zeichen (2 Zeilen à 42 Zeichen)
@@ -4046,7 +4045,7 @@ def evaluate_translation_quality(
 
     if os.path.exists(report_path) and not ask_overwrite(report_path):
         logger.info(f"Verwende vorhandenen Qualitätsbericht: {report_path}")
-        corrected_translation_csv = translated_csv_path.replace('.csv', '_corrected.csv')
+        corrected_translation_csv = CORRECTED_TRANSLATION_FILE
         return report_path, corrected_translation_csv
 
     logger.info(f"Starte erweiterte Qualitätsprüfung mit Modell: {model_name}")
@@ -4183,12 +4182,17 @@ def evaluate_translation_quality(
                                         "- Output ONLY the polished German text"
                                         "- NO explanations, NO labels, NO quotes"
                                     )
-
+                        """
+                        
                         # ✅ VOKABULAR-UNTERSTÜTZUNG HINZUFÜGEN
                         vocabulary_support = create_vocabulary_support()
                         system_prompt += vocabulary_support
-                        system_prompt += f"\n\nCRITICAL CHARACTER LIMIT: The German translation MUST NOT exceed {max_chars} characters. Use shorter synonyms, remove filler words if needed."
-                        """
+                        system_prompt += (
+                            f"\n\nCRITICAL CHARACTER LIMIT: "
+                            f"The German translation MUST NOT exceed {max_chars} characters. "
+                            f"Use shorter synonyms, remove filler words if needed."
+                        )
+
                         user_prompt = (
                                             f"SOURCE TEXT (ENGLISH): {source_texts[i]}\n"
                                             #f"TRANSLATION TO CORRECT OR SHORTEN (GERMAN): {translated_texts[i]}\n"
@@ -4320,7 +4324,7 @@ def evaluate_translation_quality(
         # Speichere die korrigierte Übersetzung als CSV für refine_text_pipeline
         corrected_df = df_translated.copy()  # Kopiere Originalstruktur
         corrected_df['text'] = [res['Uebersetzung'] for res in results]  # Aktualisiere Texte mit Korrekturen
-        corrected_translation_csv = translated_csv_path.replace('.csv', '_corrected.csv')
+        corrected_translation_csv = CORRECTED_TRANSLATION_FILE
         corrected_df.to_csv(corrected_translation_csv, sep='|', index=False, encoding='utf-8')
         logger.info(f"Korrigierte Übersetzung als CSV gespeichert: {corrected_translation_csv}")
 
@@ -4348,7 +4352,8 @@ def polish_all_translations(
         source_csv_path: Original-Englisch CSV
         translated_csv_path: MadLad400-Übersetzung CSV
         output_csv_path: Polierte Ausgabe CSV
-        model_name: Ollama-Modell für Polishing
+        sp_model_name: SentenceTransformer-Modell für Similarity-Berechnung
+        llm_model_name: Ollama-Modell für Polishing
         skip_threshold: Überspringe Segmente über diesem Similarity-Score
         
     Returns:
@@ -4375,43 +4380,14 @@ def polish_all_translations(
     
     polished_texts = []
     skipped_count = 0
-    
-    # Polishing-System-Prompt (optimiert für Naturalness)
-    """
-    polishing_system_prompt = (
-        "You are a German subtitle editor specializing in natural-sounding translations."
-        "Your task is to refine the provided German translation to make it more natural, concise, and readable."
-        "The translation is already semantically correct, so focus on NATURALNESS and BREVITY."
-        
-        "POLISHING GOALS:"
-        "1) NATURALNESS: Improve German word order and phrasing for native-speaker flow"
-        "2) BREVITY: Shorten by 10-20% without losing meaning (remove redundancy, use shorter synonyms)"
-        "3) CLARITY: Simplify complex sentences, remove ambiguity"
-        "4) CONSISTENCY: Use standard German, avoid overly formal or archaic terms"
-        
-        "OUTPUT FORMAT:"
-        "- Output ONLY the polished German text"
-        "- NO explanations, NO labels, NO quotes"
-    )
+    polished_count = 0
+    rejected_count = 0
+    unchanged_count = 0
 
-    vocabulary_support = create_vocabulary_support()
-    polishing_system_prompt += vocabulary_support
-    """
-    polishing_system_prompt = (
-                "You are a professional German subtitle translator."
-                "Your task: Create natural, idiomatic German translations."
 
-                "RULES:"
-                "1. Match meaning exactly - no additions or omissions"
-                "2. Use natural German word order"
-                "3. Keep translations concise for subtitles"
-                "4. Never change numbers, names, or dates"
-                "5. Character limit: {maxchars} characters (including spaces)"
-
-                "OUTPUT: Only the German translation, no explanations."
-                )
     # Erstelle manuellen Progress-Bar für bessere Kontrolle
     pbar = tqdm(total=len(source_texts), desc="Polishing Translations")
+
 
     for i in range(len(source_texts)):
         similarity = similarities[i]
@@ -4429,88 +4405,187 @@ def polish_all_translations(
         segment_duration = segment_end - segment_start
         max_chars = calculate_max_chars_for_segment(segment_duration)
         
-        # NEU: Live-Ausgabe vor Polishing
-        tqdm.write(f"\n{'='*80}")
+        # Live-Ausgabe vor Polishing
+        tqdm.write(f"\\n{'='*80}")
         tqdm.write(f"🔧 Segment {i} wird poliert (Similarity: {similarity:.3f} < {skip_threshold})")
         tqdm.write(f"   Zeit: {df_source.iloc[i]['startzeit']} → {df_source.iloc[i]['endzeit']} (Dauer: {segment_duration:.1f}s)")
         tqdm.write(f"   Original (EN): '{source_texts[i]}'")
         tqdm.write(f"   MadLad (DE):   '{translated_texts[i]}' ({len(translated_texts[i])} Zeichen)")
-        tqdm.write(f"   Max. erlaubt:  {max_chars} Zeichen (CPS-Limit: 17 Zeichen/Sekunde)")
+        tqdm.write(f"   Max. erlaubt:  {max_chars} Zeichen (CPS-Limit: 20 Zeichen/Sekunde)")
         tqdm.write(f"{'-'*80}")
         
+        # Polishing-System-Prompt (optimiert für Naturalness)
+        polishing_system_prompt = (
+            "You are a professional German subtitle translator."
+            "Your task: Create natural, idiomatic German translations."
+
+
+            "RULES:"
+            "1. Match meaning exactly - no additions or omissions"
+            "2. Use natural German word order"
+            "3. Keep translations concise for subtitles"
+            "4. Never change numbers, names, or dates"
+            f"5. Character limit: {max_chars} characters (including spaces)"
+
+
+            "OUTPUT: Only the German translation, no explanations."
+        )
+
+
+        # ✅ VOKABULAR-UNTERSTÜTZUNG HINZUFÜGEN
+        vocabulary_support = create_vocabulary_support()
+        polishing_system_prompt += vocabulary_support
+        polishing_system_prompt += (
+            f"\\n\\nCRITICAL CHARACTER LIMIT: "
+            f"The German translation MUST NOT exceed {max_chars} characters. "
+            f"Use shorter synonyms, remove filler words if needed."
+        )
+        
         user_prompt = (
-            f"SOURCE (EN): {source_texts[i]}\n"
-            #f"TRANSLATION (DE): {translated_texts[i]}\n"
-            f"MAX CHARACTERS: {max_chars}\n"
+            f"SOURCE (EN): {source_texts[i]}\\n"
+            f"MAX CHARACTERS: {max_chars}\\n"
             f"CURRENT QUALITY SCORE: {similarity:.3f}"
         )
         
+        # ✅ 2 Versuche mit Temperaturen 0.3 und 0.4
+        temperatures = [0.3, 0.4]
+        best_polished = translated_texts[i]
+        best_similarity = similarity
+        original_similarity = similarity
+        
         try:
-            # NEU: Zeige dass Ollama arbeitet
-            tqdm.write(f"   ⏳ Sende an Ollama ({llm_model_name}, Temp: 0.3)...")
-            
-            response = ollama.chat(
-                model=llm_model_name,
-                messages=[
-                    {'role': 'system', 'content': polishing_system_prompt},
-                    {'role': 'user', 'content': user_prompt}
-                ],
-                options={
-                    'temperature': 0.3,
-                    'num_ctx': 4096
-                },
-                think=False
-            )
-            
-            polished = response['message']['content'].strip()
-            tqdm.write(f"   ✅ Poliert: '{polished}' ({len(polished)} Zeichen)")
-
-            original_len = len(translated_texts[i])
-            polished_len = len(polished)
-            polished_count = 0
-
-            # FALL 1: Perfekt - innerhalb CPS-Limit
-            if polished_len <= max_chars:
-                tqdm.write(f"   ✨ PERFEKT! Innerhalb Limit ({polished_len} ≤ {max_chars})")
-                polished_texts.append(polished)
-                polished_count += 1
-
-            # FALL 2: Zu lang, ABER besser als Original
-            elif polished_len < original_len:
-                reduction = original_len - polished_len
-                reduction_pct = (reduction / original_len * 100)
+            for attempt, temp in enumerate(temperatures, start=1):
+                # Zeige dass Ollama arbeitet
+                tqdm.write(f"   ⏳ Versuch {attempt}/{len(temperatures)}: Sende an Ollama ({llm_model_name}, Temp: {temp})...")
                 
-                tqdm.write(f"   ⚠️  Noch {polished_len - max_chars} über Limit, ABER {reduction_pct:.1f}% kürzer!")
-                tqdm.write(f"   → Verwende polierte Version (deutliche Verbesserung!)")
-                polished_texts.append(polished)
-                polished_count += 1
+                response = ollama.chat(
+                    model=llm_model_name,
+                    messages=[
+                        {'role': 'system', 'content': polishing_system_prompt},
+                        {'role': 'user', 'content': user_prompt}
+                    ],
+                    options={
+                        'temperature': temp,
+                        'num_ctx': 4096
+                    },
+                    think=False
+                )
+                
+                polished = response['message']['content'].strip()
+                tqdm.write(f"   📝 Poliert (V{attempt}): '{polished}' ({len(polished)} Zeichen)")
 
-            # FALL 3: Polished länger als Original
-            else:
-                increase = polished_len - original_len
-                tqdm.write(f"   ❌ VERSCHLECHTERUNG! Polished +{increase} Zeichen länger")
+
+                # ✅ Berechne Similarity des polierten Texts
+                with gpu_context():
+                    polished_embedding = model.encode([polished], convert_to_tensor=True, show_progress_bar=False)
+                    polished_similarity = cos_sim(embeddings_source[i:i+1], polished_embedding).item()
+                
+                tqdm.write(f"   📊 Similarity: Original={original_similarity:.3f}, Poliert={polished_similarity:.3f}, Δ={polished_similarity - original_similarity:.3f}")
+                
+                # ✅ Prüfe semantische Verschlechterung
+                if polished_similarity < (original_similarity - 0.1):
+                    tqdm.write(f"   ❌ ABGELEHNT: Semantische Verschlechterung > -0.1 (Δ={polished_similarity - original_similarity:.3f})")
+                    continue  # Nächster Versuch
+                
+                # Wenn besser als bisheriger Best: Speichern
+                if polished_similarity > best_similarity:
+                    best_similarity = polished_similarity
+                    best_polished = polished
+                    tqdm.write(f"   ✅ NEUE BESTE VERSION (Similarity: {best_similarity:.3f})")
+
+
+            # Nach allen Versuchen: Finale Entscheidung
+            original_len = len(translated_texts[i])
+            polished_len = len(best_polished)
+
+
+            # ✅ Prüfe zuerst ob semantisch verschlechtert (< -0.1)
+            if best_similarity < (original_similarity - 0.1):
+                tqdm.write(f"   ❌ ALLE VERSUCHE ABGELEHNT: Keine akzeptable Version gefunden (beste Δ={best_similarity - original_similarity:.3f})")
                 tqdm.write(f"   → Behalte Original")
                 polished_texts.append(translated_texts[i])
+                rejected_count += 1
+                
+            # ✅ Wenn semantisch OK (≥ -0.1), dann prüfe Länge und Veränderung
+            else:
+                # FALL A: Text unverändert (Ollama bestätigt Qualität)
+                if best_polished == translated_texts[i]:
+                    tqdm.write(f"   ✅ UNVERÄNDERT: Ollama bestätigt Original als optimal (Similarity: {best_similarity:.3f})")
+                    tqdm.write(f"   → Verwende Original (bereits beste Version)")
+                    polished_texts.append(translated_texts[i])
+                    unchanged_count += 1  # ✅ NEU: Separater Zähler
+
+
+                # FALL B: Text verändert - prüfe CPS-Limit
+                else:
+                    # FALL B1: Perfekt innerhalb Limit
+                    if polished_len <= max_chars:
+                        tqdm.write(f"   ✨ PERFEKT! Innerhalb Limit ({polished_len} ≤ {max_chars})")
+                        polished_texts.append(best_polished)
+                        polished_count += 1
+
+
+                    # FALL B2: Bis zu +10 Zeichen bei semantischer Verbesserung
+                    elif polished_len <= (max_chars + 10) and best_similarity > original_similarity:
+                        overage = polished_len - max_chars
+                        improvement = best_similarity - original_similarity
+                        
+                        tqdm.write(f"   ✅ TOLERIERT: +{overage} Zeichen über Limit, ABER Verbesserung (+{improvement:.3f})!")
+                        tqdm.write(f"   → Verwende polierte Version ({polished_len} ≤ {max_chars + 10})")
+                        polished_texts.append(best_polished)
+                        polished_count += 1
+
+
+                    # FALL B3: Zu lang, ABER kürzer als Original
+                    elif polished_len < original_len:
+                        reduction = original_len - polished_len
+                        reduction_pct = (reduction / original_len * 100)
+                        
+                        tqdm.write(f"   ⚠️  Noch {polished_len - max_chars} über Limit, ABER {reduction_pct:.1f}% kürzer!")
+                        tqdm.write(f"   → Verwende polierte Version (Kürzung!)")
+                        polished_texts.append(best_polished)
+                        polished_count += 1
+
+
+                    # FALL B4: Zu lang UND nicht kürzer
+                    else:
+                        increase = polished_len - original_len
+                        tqdm.write(f"   ❌ LÄNGENPROBLEM! Polished {increase:+d} Zeichen ({polished_len} vs {original_len})")
+                        tqdm.write(f"   → Behalte Original")
+                        polished_texts.append(translated_texts[i])
+                        rejected_count += 1
                 
         except Exception as e:
             tqdm.write(f"   ❌ FEHLER: {e}")
             tqdm.write(f"   → Behalte Original-Übersetzung")
             logger.error(f"Polishing fehlgeschlagen für Segment {i}: {e}")
             polished_texts.append(translated_texts[i])
+            rejected_count += 1
         
         # Update Progress-Bar
         pbar.update(1)
 
+
     # Schließe Progress-Bar
     pbar.close()
+
 
     
     # Speichere polierte Version
     df_polished = df_translated.copy()
     df_polished['text'] = polished_texts
     df_polished.to_csv(output_csv_path, sep='|', index=False)
+    del sp_model_name
+    del llm_model_name
     
-    logger.info(f"Polishing abgeschlossen. {len(polished_texts) - skipped_count}/{len(polished_texts)} Segmente verfeinert. Gespeichert: {output_csv_path}")
+    logger.info(
+        f"Polishing abgeschlossen. "
+        f"Übersprungen: {skipped_count}, "
+        f"Poliert: {polished_count}, "
+        f"Abgelehnt: {rejected_count}, "
+        f"Gesamt: {len(polished_texts)}. "
+        f"Gespeichert: {output_csv_path}"
+    )
     return output_csv_path
 
 def evaluate_translation_quality_llamacpp(
@@ -4699,7 +4774,7 @@ def evaluate_translation_quality_llamacpp(
     # Überprüfung der Eingabedateien
     if os.path.exists(report_path) and not ask_overwrite(report_path):
         logger.info(f"Verwende vorhandenen Qualitätsbericht: {report_path}")
-        corrected_translation_csv = translated_csv_path.replace('.csv', '_corrected.csv')
+        corrected_translation_csv = CORRECTED_TRANSLATION_FILE
         return report_path, corrected_translation_csv
 
     logger.info(f"Starte erweiterte Qualitätsprüfung mit Modell: {model_name}")
@@ -4940,7 +5015,7 @@ Verbesserung: {((avg_similarity_after - avg_similarity_before) / avg_similarity_
         # Korrigierte Übersetzung als CSV speichern für refine_text_pipeline
         corrected_df = df_translated.copy()  # Kopiere Originalstruktur
         corrected_df['text'] = [res['Übersetzung'] for res in results]  # Aktualisiere Texte mit Korrekturen
-        corrected_translation_csv = translated_csv_path.replace(".csv", "_corrected.csv")
+        corrected_translation_csv = CORRECTED_TRANSLATION_FILE
         corrected_df.to_csv(corrected_translation_csv, sep='|', index=False, encoding='utf-8')
         logger.info(f"Korrigierte Übersetzung als CSV gespeichert: {corrected_translation_csv}")
         
@@ -6782,11 +6857,11 @@ def text_to_speech_with_voice_cloning(
                             language="de",
                             gpt_cond_latent=gpt_cond_latent,
                             speaker_embedding=speaker_embedding,
-                            speed=1.1,
-                            temperature=0.8,
+                            speed=1.0,
+                            temperature=0.75,
                             repetition_penalty=5.0,
                             top_k=60,
-                            top_p=0.95,
+                            top_p=0.9,
                             enable_text_splitting=False
                         )
 
@@ -7350,6 +7425,22 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
         logger.error(f"FFmpeg stderr-Ausgabe: {stderr}")
         raise
 
+# ==============================================================================
+# EXECUTION CONTROL FLAGS
+# ==============================================================================
+
+# Setzen Sie diese Flags, um Schritte gezielt zu überspringen
+EXECUTE_AUDIO_EXTRACTION =  False        # Schritt 1: Audio-Extraktion
+EXECUTE_TRANSCRIPTION =     False        # Schritte 2 & 3: Transkription und Veredelung
+EXECUTE_TRANSLATION =       True        # Schritt 4: Übersetzung & Hypothesen-Auswahl
+EXECUTE_CORRECTION =        True        # Schritt 5: Veredelung, Korrektur
+EXECUTE_POLISHING =         True        # Schritt 5.5: Systematisches Polishing
+EXECUTE_VEREDELUNG =        True        # Schritt 5.75: Finale Veredelung
+EXECUTE_TTS_FORMATTING =    True        # Schritt 6: TTS-Formatierung
+EXECUTE_TTS =               True        # Schritt 7: TTS-Synthese
+EXECUTE_VIDEO_ADJUSTMENT =  True        # Schritt 8: Video-Geschwindigkeitsanpassung
+EXECUTE_VIDEO_CREATION =    True        # Schritt 9: Finales Video
+
 # ==============================
 # Hauptprogramm
 # ==============================
@@ -7375,156 +7466,252 @@ def main():
         ollama_process = start_ollama_server()
         if not ollama_process:
             raise RuntimeError("Ollama-Server konnte nicht gestartet werden und ist für die Übersetzung erforderlich.")
+        
+        # ==========================================================================
+        # DATEI-PFAD INITIALISIERUNGEN (Konstanten für reibungslosen Ablauf)
+        # ==========================================================================
+        # Alle dateibezogenen Variablen werden hier zu Beginn initialisiert,
+        # um UnboundLocalError zu vermeiden
+
+        # Standardwerte für alle Dateipfad-Variablen aus config.py
+        corrected_csv = SEMANTIC_BEST_TRANSLATION_FILE  # Fallback-Standard
+        provisional_translation_file = PROVISIONAL_TRANSLATION_CSV  # aus config.py
+        cleaned_source_path = CLEANED_SOURCE_FOR_QUALITY_CHECK  # aus config.py
+        hypotheses_csv_path = HYPOTHESES_CSV  # aus config.py
+        refined_transcription_path = REFINED_TRANSCRIPTION_FILE  # aus config.py
+        master_entity_map_en = {}  # Leeres Dict als Standard
 
         # --- PIPELINE START ---
         # SCHRITT 1: VORBEREITUNG & TRANSKRIPTION
         if not os.path.exists(VIDEO_PATH):
             logger.error(f"Eingabevideo nicht gefunden: {VIDEO_PATH}"); return
-        extract_audio_ffmpeg(AUDIO_PATH, ORIGINAL_AUDIO_PATH)
-        """
-        create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH_1, SAMPLE_PATH_2,
-                            SAMPLE_PATH_3
-                            )
-        """
+
+        if EXECUTE_AUDIO_EXTRACTION:
+            extract_audio_ffmpeg(AUDIO_PATH, ORIGINAL_AUDIO_PATH)
+            """
+            create_voice_sample(ORIGINAL_AUDIO_PATH, SAMPLE_PATH_1, SAMPLE_PATH_2,
+                                SAMPLE_PATH_3
+                                )
+            """
 
         clear_spacy_cache_and_free_vram()
         time.sleep(3)
 
-        transcribe_audio_with_timestamps(ORIGINAL_AUDIO_PATH, TRANSCRIPTION_FILE)
+        if EXECUTE_TRANSCRIPTION:
+            transcribe_audio_with_timestamps(ORIGINAL_AUDIO_PATH, TRANSCRIPTION_FILE)
 
-        clear_spacy_cache_and_free_vram()
-        time.sleep(3)
+            clear_spacy_cache_and_free_vram()
+            time.sleep(3)
 
-        # SCHRITT 2: VEREDELUNG DER ENGLISCHEN TRANSKRIPTION
-        refined_transcription_path, master_entity_map_en = refine_text_pipeline(
-            input_file=TRANSCRIPTION_FILE,
-            output_file=REFINED_TRANSCRIPTION_FILE,
-            spacy_model_name="en_core_web_trf",
-            lang_code='en-US',
-            tokenizer_path="madlad400-3b-mt-int8_bfloat16"
-        )
-        if not refined_transcription_path:
-            logger.error("Veredelung der Transkription fehlgeschlagen."); return
+            # SCHRITT 2: VEREDELUNG DER ENGLISCHEN TRANSKRIPTION
+            refined_transcription_path, master_entity_map_en = refine_text_pipeline(
+                input_file=TRANSCRIPTION_FILE,
+                output_file=REFINED_TRANSCRIPTION_FILE,
+                spacy_model_name="en_core_web_trf",
+                lang_code='en-US',
+                tokenizer_path="madlad400-3b-mt-int8_bfloat16"
+            )
+            if not refined_transcription_path:
+                logger.error("Veredelung der Transkription fehlgeschlagen."); return
 
-        clear_spacy_cache_and_free_vram()
-        time.sleep(3)
+            clear_spacy_cache_and_free_vram()
+            time.sleep(3)
 
-        # SCHRITT 3: ÜBERSETZUNG
-        provisional_translation_file, cleaned_source_path, hypotheses_csv_path= translate_segments_optimized_safe(
-            refined_transcription_path=refined_transcription_path,
-            master_entity_map=master_entity_map_en,
-            translation_output_file=TRANSLATION_FILE,
-            cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
-            source_lang=source_lang,
-            target_lang=target_lang,
-            src_lang=src_lang,
-            tgt_lang=tgt_lang,
-            num_hypotheses=10
-        )
-        if not provisional_translation_file:
-            logger.error("Übersetzung fehlgeschlagen."); return
+        if EXECUTE_TRANSLATION:
+            # SCHRITT 3: ÜBERSETZUNG
+            if os.path.exists(REFINED_TRANSCRIPTION_FILE) or ask_overwrite(REFINED_TRANSCRIPTION_FILE):
+                translate_segments_optimized_safe(
+                    refined_transcription_path=REFINED_TRANSCRIPTION_FILE,
+                    master_entity_map=master_entity_map_en,
+                    translation_output_file=TRANSLATION_FILE,
+                    cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    src_lang=src_lang,
+                    tgt_lang=tgt_lang,
+                    num_hypotheses=10
+                )
+            else:
+                logger.warning(f'Skipping Übersetzung: {REFINED_TRANSCRIPTION_FILE} nicht gefunden.')
 
-        clear_spacy_cache_and_free_vram()
-        time.sleep(3)
+            clear_spacy_cache_and_free_vram()
+            time.sleep(3)
 
-        logger.info("Starte entkoppelten Schritt: Semantische Hypothesen-Auswahl...")
-        semantic_optimized_file = select_best_hypotheses_post_translation(
-            hypotheses_csv_path=hypotheses_csv_path,
-            translation_output_file=provisional_translation_file,
-            report_output_path="hypothesis_selection_report.txt",
-            similarity_model_name=ST_QUALITY_MODEL
-        )
+            logger.info("Starte entkoppelten Schritt: Semantische Hypothesen-Auswahl...")
+            semantic_optimized_file = select_best_hypotheses_post_translation(
+                hypotheses_csv_path=hypotheses_csv_path,
+                translation_output_file=provisional_translation_file,
+                report_output_path="hypothesis_selection_report.txt",
+                similarity_model_name=ST_QUALITY_MODEL
+            )
 
-        clear_spacy_cache_and_free_vram()
-        time.sleep(3)
+            if semantic_optimized_file and os.path.exists(semantic_optimized_file):
+                logger.info(f"✓ Semantisch optimierte Übersetzung gespeichert: {semantic_optimized_file}")
+                
+                # ✅ Prüfe ob es die ERWARTETE Datei ist
+                if semantic_optimized_file != SEMANTIC_BEST_TRANSLATION_FILE:
+                    logger.warning(
+                        f"⚠️  WARNUNG: Erwartete Datei {SEMANTIC_BEST_TRANSLATION_FILE}, "
+                        f"aber erhalten: {semantic_optimized_file}"
+                    )
+                    # ✅ Kopiere die Datei zum erwarteten Namen
+                    import shutil
+                    shutil.copy2(semantic_optimized_file, SEMANTIC_BEST_TRANSLATION_FILE)
+                    logger.info(f"✓ Datei kopiert nach: {SEMANTIC_BEST_TRANSLATION_FILE}")
+            else:
+                logger.error(
+                    f"❌ KRITISCHER FEHLER: select_best_hypotheses_post_translation() hat keine gültige Datei erstellt!\n"
+                    f"   Rückgabewert: {semantic_optimized_file}\n"
+                    f"   Datei existiert: {os.path.exists(semantic_optimized_file) if semantic_optimized_file else 'N/A'}\n"
+                    f"   Mögliche Ursachen:\n"
+                    f"   1. HYPOTHESES_CSV ({HYPOTHESES_CSV}) fehlt\n"
+                    f"   2. Fehler in translate_segments_optimized_safe()\n"
+                    f"   3. ask_overwrite() wurde mit 'Nein' beantwortet"
+                )
+                # ✅ Erstelle Fallback-Datei (Kopie von PROVISIONAL_TRANSLATION_CSV)
+                if os.path.exists(PROVISIONAL_TRANSLATION_CSV):
+                    import shutil
+                    shutil.copy2(PROVISIONAL_TRANSLATION_CSV, SEMANTIC_BEST_TRANSLATION_FILE)
+                    logger.warning(f"⚠️  Fallback: Verwende {PROVISIONAL_TRANSLATION_CSV} als {SEMANTIC_BEST_TRANSLATION_FILE}")
+                else:
+                    logger.error(f"❌ Auch Fallback-Datei fehlt: {PROVISIONAL_TRANSLATION_CSV}")
+                    logger.error("   Kann nicht fortfahren - Stoppe Pipeline!")
+                    return  # ← Beende main() vorzeitig
 
-        # SCHRITT 4: QUALITÄTSPRÜFUNG
-        report_path, corrected_csv = evaluate_translation_quality(
-            source_csv_path=cleaned_source_path,
-            translated_csv_path=semantic_optimized_file,
-            report_path=TRANSLATION_QUALITY_REPORT,
-            summary_path=TRANSLATION_QUALITY_SUMMARY,
-            model_name=ST_POLISH_MODEL_DE,
-            correction_model="gemma2:9b",
-            threshold=SIMILARITY_THRESHOLD_EVAL
-        )
+            clear_spacy_cache_and_free_vram()
+            time.sleep(3)
 
-        clear_spacy_cache_and_free_vram()
-        time.sleep(3)
-
-        # NEU: SCHRITT 4.5: POLISHING (nach Qualitätsprüfung, vor Refinement)
-        POLISHED_TRANSLATION_CSV = corrected_csv.replace('.csv', '_polished.csv')
-
-        if not os.path.exists(POLISHED_TRANSLATION_CSV) or ask_overwrite(POLISHED_TRANSLATION_CSV):
-            logger.info("=" * 88)
-            logger.info("SCHRITT 4.5: Systematisches Polishing für natürliche Übersetzung")
-            logger.info("=" * 88)
+        if EXECUTE_CORRECTION:
+            # SCHRITT 4: KORREKTUR
+            if not os.path.exists(SEMANTIC_BEST_TRANSLATION_FILE):
+                logger.error(
+                    f"❌ KRITISCHER FEHLER: Erforderliche Datei fehlt!\n"
+                    f"   Datei: {SEMANTIC_BEST_TRANSLATION_FILE}\n"
+                    f"   Diese Datei sollte durch select_best_hypotheses_post_translation() erstellt worden sein.\n"
+                    f"   Prüfe die Logs des vorherigen Schritts (EXECUTE_TRANSLATION)."
+                )
+                
+                # ✅ Versuche Fallback
+                if os.path.exists(PROVISIONAL_TRANSLATION_CSV):
+                    logger.warning(f"⚠️  Verwende Fallback: {PROVISIONAL_TRANSLATION_CSV}")
+                    import shutil
+                    shutil.copy2(PROVISIONAL_TRANSLATION_CSV, SEMANTIC_BEST_TRANSLATION_FILE)
+                else:
+                    logger.error("   Überspringe Qualitätsprüfung (keine Datei verfügbar)")
+                    # Setze EXECUTE_CORRECTION auf False, damit auch Polishing übersprungen wird
+                    EXECUTE_CORRECTION = False
+                    EXECUTE_POLISHING = False
             
-            try:
-                polished_file = polish_all_translations(
+            # ✅ NUR wenn Datei existiert, fortfahren
+            if EXECUTE_CORRECTION and os.path.exists(SEMANTIC_BEST_TRANSLATION_FILE):
+                if ask_overwrite(SEMANTIC_BEST_TRANSLATION_FILE):
+                    logger.info(f"✓ Starte Qualitätsprüfung für: {SEMANTIC_BEST_TRANSLATION_FILE}")
+                    evaluate_translation_quality(
+                        source_csv_path=CLEANED_SOURCE_FOR_QUALITY_CHECK,
+                        translated_csv_path=SEMANTIC_BEST_TRANSLATION_FILE,
+                        report_path=TRANSLATION_QUALITY_REPORT,
+                        summary_path=TRANSLATION_QUALITY_SUMMARY,
+                        model_name=ST_POLISH_MODEL_DE,
+                        correction_model="gemma2:9b",
+                        threshold=SIMILARITY_THRESHOLD_EVAL
+                    )
+                else:
+                    logger.info(f'✓ Verwende vorhandene Qualitätsprüfung')
+
+            clear_spacy_cache_and_free_vram()
+            time.sleep(3)
+
+        if EXECUTE_POLISHING:
+            # SCHRITT 4.5: POLISHING (nach Qualitätsprüfung, vor Refinement)
+            # Fallback-Kette: CORRECTED → SEMANTIC
+            input_polish_file = (CORRECTED_TRANSLATION_FILE if os.path.exists(CORRECTED_TRANSLATION_FILE)
+                                else SEMANTIC_BEST_TRANSLATION_FILE)
+            
+            # ✅ ROBUSTE EXISTENZPRÜFUNG
+            if not os.path.exists(input_polish_file):
+                logger.error(
+                    f"❌ FEHLER: Polishing-Eingabedatei fehlt!\n"
+                    f"   Erwartete Datei: {input_polish_file}\n"
+                    f"   Überspringe Polishing-Schritt."
+                )
+                EXECUTE_POLISHING = False
+            
+            # ✅ NUR wenn Datei existiert
+            if EXECUTE_POLISHING and (os.path.exists(input_polish_file) or ask_overwrite(input_polish_file)):
+                logger.info(f"✓ Starte Polishing mit: {input_polish_file}")
+                polish_all_translations(
                     source_csv_path=CLEANED_SOURCE_FOR_QUALITY_CHECK,
-                    translated_csv_path=corrected_csv,
+                    translated_csv_path=input_polish_file,
                     output_csv_path=POLISHED_TRANSLATION_CSV,
                     sp_model_name=ST_POLISH_MODEL_DE,
                     llm_model_name="gemma2:9b",
                     skip_threshold=SIMILARITY_THRESHOLD_POLISHING
                 )
-                
-                # Verwende polierte Version für weitere Schritte
-                corrected_csv = polished_file
-                logger.info(f"✅ Polishing abgeschlossen. Verwende: {corrected_csv}")
-                
-            except Exception as e:
-                logger.error(f"⚠️ Polishing fehlgeschlagen: {e}. Verwende Original.")
-                logger.error(f"Traceback:", exc_info=True)
-        else:
-            logger.info(f"Verwende vorhandene polierte Übersetzung: {POLISHED_TRANSLATION_CSV}")
-            corrected_csv = POLISHED_TRANSLATION_CSV
+            else:
+                logger.info(f'✓ Verwende vorhandene polierte Übersetzung: {POLISHED_TRANSLATION_CSV}')
+                corrected_csv = POLISHED_TRANSLATION_CSV
 
-        clear_spacy_cache_and_free_vram()
-        time.sleep(3)
+            clear_spacy_cache_and_free_vram()
+            time.sleep(3)
 
-        # SCHRITT 5: VEREDELUNG DER DEUTSCHEN ÜBERSETZUNG
-        refined_translation_path, _ = refine_text_pipeline(
-            input_file=corrected_csv,
-            output_file=REFINED_TRANSLATION_FILE,
-            spacy_model_name="de_dep_news_trf",
-            lang_code='de-DE',
-            tokenizer_path="madlad400-3b-mt-int8_bfloat16"
-        )
-        if not refined_translation_path:
-            logger.error("Veredelung der Übersetzung fehlgeschlagen."); return
+        if EXECUTE_VEREDELUNG:
+            # SCHRITT 5: VEREDELUNG DER DEUTSCHEN ÜBERSETZUNG
+            # Fallback-Kette: POLISHED → CORRECTED → SEMANTIC
+            input_refine_file = (POLISHED_TRANSLATION_CSV if os.path.exists(POLISHED_TRANSLATION_CSV) else
+                                CORRECTED_TRANSLATION_FILE if os.path.exists(CORRECTED_TRANSLATION_FILE) else
+                                SEMANTIC_BEST_TRANSLATION_FILE)
+            
+            if os.path.exists(input_refine_file) or ask_overwrite(input_refine_file):
+                refine_text_pipeline(
+                    input_file=input_refine_file,
+                    output_file=REFINED_TRANSLATION_FILE,
+                    spacy_model_name="de_dep_news_trf",
+                    lang_code='de-DE',
+                    tokenizer_path="madlad400-3b-mt-int8_bfloat16"
+                )
 
-        clear_spacy_cache_and_free_vram()
-        time.sleep(3)
+            clear_spacy_cache_and_free_vram()
+            time.sleep(3)
 
-        # SCHRITT 6: TTS-FORMATIERUNG & SYNTHESE
-        tts_formatted_file = format_for_tts_splitting(
-            input_file=refined_translation_path,
-            output_file=TTS_FORMATTED_TRANSLATION_FILE,
-            target_char_range=(150, 200),  # Optimale Länge: 150, Maximale Länge: 200
-            min_words_for_final_segment=3
-            )
+        if EXECUTE_TTS_FORMATTING:
+            # SCHRITT 6: TTS-FORMATIERUNG & SYNTHESE
+            # Vollständige Fallback-Kette für Übersetzungen
+            tts_input_candidates = [REFINED_TRANSLATION_FILE, POLISHED_TRANSLATION_CSV, 
+                                CORRECTED_TRANSLATION_FILE, SEMANTIC_BEST_TRANSLATION_FILE]
+            tts_input_file = next((f for f in tts_input_candidates if os.path.exists(f)), None)
+            
+            if tts_input_file or ask_overwrite(REFINED_TRANSLATION_FILE):
+                format_for_tts_splitting(
+                    input_file=tts_input_file or REFINED_TRANSLATION_FILE,
+                    output_file=TTS_FORMATTED_TRANSLATION_FILE,
+                    target_char_range=(130, 180),  # Optimale Länge: 150, Maximale Länge: 200
+                    min_words_for_final_segment=3
+                    )
 
-        clear_spacy_cache_and_free_vram()
-        time.sleep(2)
+                clear_spacy_cache_and_free_vram()
+                time.sleep(2)
 
-        text_to_speech_with_voice_cloning(
-            tts_formatted_file,
-            SAMPLE_PATH_1,
-            SAMPLE_PATH_2,
-            SAMPLE_PATH_3,
-            #SAMPLE_PATH_4,
-            TRANSLATED_AUDIO_WITH_PAUSES
-        )
+        if EXECUTE_TTS:
+            if os.path.exists(TTS_FORMATTED_TRANSLATION_FILE) or ask_overwrite(TTS_FORMATTED_TRANSLATION_FILE):
+                text_to_speech_with_voice_cloning(
+                    TTS_FORMATTED_TRANSLATION_FILE,
+                    SAMPLE_PATH_1,
+                    SAMPLE_PATH_2,
+                    SAMPLE_PATH_3,
+                    #SAMPLE_PATH_4,
+                    TRANSLATED_AUDIO_WITH_PAUSES
+                )
 
-        clear_spacy_cache_and_free_vram()
-        time.sleep(2)
+                clear_spacy_cache_and_free_vram()
+                time.sleep(2)
+                resample_to_44100_stereo(TRANSLATED_AUDIO_WITH_PAUSES, RESAMPLED_AUDIO_FOR_MIXDOWN, SPEED_FACTOR_RESAMPLE_44100)
 
-        # SCHRITT 7: FINALES VIDEO ERSTELLEN
-        resample_to_44100_stereo(TRANSLATED_AUDIO_WITH_PAUSES, RESAMPLED_AUDIO_FOR_MIXDOWN, SPEED_FACTOR_RESAMPLE_44100)
-        adjust_playback_speed(VIDEO_PATH, ADJUSTED_VIDEO_PATH, SPEED_FACTOR_PLAYBACK)
-        combine_video_audio_ffmpeg(ADJUSTED_VIDEO_PATH, RESAMPLED_AUDIO_FOR_MIXDOWN, FINAL_VIDEO_PATH)
+        if EXECUTE_VIDEO_ADJUSTMENT:
+            # SCHRITT 7: FINALES VIDEO ERSTELLEN
+            adjust_playback_speed(VIDEO_PATH, ADJUSTED_VIDEO_PATH, SPEED_FACTOR_PLAYBACK)
+
+        if EXECUTE_VIDEO_CREATION:
+            combine_video_audio_ffmpeg(ADJUSTED_VIDEO_PATH, RESAMPLED_AUDIO_FOR_MIXDOWN, FINAL_VIDEO_PATH)
 
         total_time = time.time() - start_time
         logger.info(f"Projekt erfolgreich abgeschlossen in {(total_time / 60):.2f} Minuten.")
