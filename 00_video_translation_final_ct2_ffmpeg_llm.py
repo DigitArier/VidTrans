@@ -3714,7 +3714,7 @@ def select_best_hypotheses_post_translation(
 
     if not os.path.exists(hypotheses_csv_path):
         logger.warning(f"Hypothesen-CSV nicht gefunden: {hypotheses_csv_path}. Auswahl wird übersprungen.")
-        return translation_output_file
+        return TRANSLATION_FILE if os.path.exists(TRANSLATION_FILE) else translation_output_file
 
     df_hyp = pd.read_csv(hypotheses_csv_path, sep='|', dtype=str).fillna('')
 
@@ -3723,7 +3723,7 @@ def select_best_hypotheses_post_translation(
     if not expected_cols.issubset(df_hyp.columns):
         missing_cols = expected_cols - set(df_hyp.columns)
         logger.error(f"Hypothesen-CSV fehlen Spalten: {missing_cols}. Auswahl wird übersprungen.")
-        return translation_output_file
+        return TRANSLATION_FILE if os.path.exists(TRANSLATION_FILE) else translation_output_file
 
     # Gruppiere die flachen Daten nach der Segment-ID
     segments_with_hypotheses = {}
@@ -3787,15 +3787,14 @@ def select_best_hypotheses_post_translation(
                 'all_hypotheses_with_scores': sorted(zip(hypothesis_texts, similarities), key=lambda x: x[1], reverse=True)
             }
 
-    if os.path.exists(translation_output_file):
-        df_trans = pd.read_csv(translation_output_file, sep='|', dtype=str).fillna('')
+    if os.path.exists(TRANSLATION_FILE):
+        df_trans = pd.read_csv(TRANSLATION_FILE, sep='|', dtype=str).fillna('')
         
         # Der Index des DataFrames 'df_trans' sollte der 'seg_id' entsprechen.
         for i, row in df_trans.iterrows():
             if i in best_translations:
                 df_trans.at[i, 'text'] = best_translations[i]
 
-        updated_path = SEMANTIC_BEST_TRANSLATION_FILE
         df_trans.to_csv(updated_path, sep='|', index=False, encoding='utf-8')
         logger.info(f"Semantisch optimierte Übersetzung gespeichert: {updated_path}")
         generate_hypothesis_selection_report(
@@ -4060,7 +4059,7 @@ def evaluate_translation_quality(
 
         if len(df_source) != len(df_translated):
             logger.warning(f"Zeilenanzahl stimmt nicht überein ({len(df_source)} vs {len(df_translated)}). Prüfung übersprungen.")
-            return None
+            return None, None
 
         # Spalten normalisieren
         df_source.columns = [col.strip().lower() for col in df_source.columns]
@@ -4068,7 +4067,7 @@ def evaluate_translation_quality(
 
         if 'text' not in df_source.columns or 'text' not in df_translated.columns:
             logger.error(f"Benötigte Spalte 'text' nicht in den CSVs gefunden.")
-            return None
+            return None, None
 
         source_texts = df_source['text'].tolist()
         translated_texts = df_translated['text'].tolist()
@@ -4335,7 +4334,7 @@ def evaluate_translation_quality(
 
     except Exception as e:
         logger.error(f"Fehler bei der Qualitätsprüfung der Übersetzung: {e}", exc_info=True)
-        return None
+        return None, None
 
 def polish_all_translations(
     source_csv_path: str,
@@ -7430,8 +7429,8 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
 # ==============================================================================
 
 # Setzen Sie diese Flags, um Schritte gezielt zu überspringen
-EXECUTE_AUDIO_EXTRACTION =  False        # Schritt 1: Audio-Extraktion
-EXECUTE_TRANSCRIPTION =     False        # Schritte 2 & 3: Transkription und Veredelung
+EXECUTE_AUDIO_EXTRACTION =  True        # Schritt 1: Audio-Extraktion
+EXECUTE_TRANSCRIPTION =     True        # Schritte 2 & 3: Transkription und Veredelung
 EXECUTE_TRANSLATION =       True        # Schritt 4: Übersetzung & Hypothesen-Auswahl
 EXECUTE_CORRECTION =        True        # Schritt 5: Veredelung, Korrektur
 EXECUTE_POLISHING =         True        # Schritt 5.5: Systematisches Polishing
@@ -7474,12 +7473,13 @@ def main():
         # um UnboundLocalError zu vermeiden
 
         # Standardwerte für alle Dateipfad-Variablen aus config.py
-        corrected_csv = SEMANTIC_BEST_TRANSLATION_FILE  # Fallback-Standard
-        provisional_translation_file = PROVISIONAL_TRANSLATION_CSV  # aus config.py
-        cleaned_source_path = CLEANED_SOURCE_FOR_QUALITY_CHECK  # aus config.py
-        hypotheses_csv_path = HYPOTHESES_CSV  # aus config.py
-        refined_transcription_path = REFINED_TRANSCRIPTION_FILE  # aus config.py
+        #corrected_csv = SEMANTIC_BEST_TRANSLATION_FILE  # Fallback-Standard
+        #provisional_translation_file = PROVISIONAL_TRANSLATION_CSV  # aus config.py
+        #cleaned_source_path = CLEANED_SOURCE_FOR_QUALITY_CHECK  # aus config.py
+        #hypotheses_csv_path = HYPOTHESES_CSV  # aus config.py
+        #refined_transcription_path = REFINED_TRANSCRIPTION_FILE  # aus config.py
         master_entity_map_en = {}  # Leeres Dict als Standard
+        #global EXECUTE_POLISHING
 
         # --- PIPELINE START ---
         # SCHRITT 1: VORBEREITUNG & TRANSKRIPTION
@@ -7538,85 +7538,27 @@ def main():
             time.sleep(3)
 
             logger.info("Starte entkoppelten Schritt: Semantische Hypothesen-Auswahl...")
-            semantic_optimized_file = select_best_hypotheses_post_translation(
-                hypotheses_csv_path=hypotheses_csv_path,
-                translation_output_file=provisional_translation_file,
+            select_best_hypotheses_post_translation(
+                hypotheses_csv_path=HYPOTHESES_CSV,
+                translation_output_file=SEMANTIC_BEST_TRANSLATION_FILE,
                 report_output_path="hypothesis_selection_report.txt",
                 similarity_model_name=ST_QUALITY_MODEL
             )
-
-            if semantic_optimized_file and os.path.exists(semantic_optimized_file):
-                logger.info(f"✓ Semantisch optimierte Übersetzung gespeichert: {semantic_optimized_file}")
-                
-                # ✅ Prüfe ob es die ERWARTETE Datei ist
-                if semantic_optimized_file != SEMANTIC_BEST_TRANSLATION_FILE:
-                    logger.warning(
-                        f"⚠️  WARNUNG: Erwartete Datei {SEMANTIC_BEST_TRANSLATION_FILE}, "
-                        f"aber erhalten: {semantic_optimized_file}"
-                    )
-                    # ✅ Kopiere die Datei zum erwarteten Namen
-                    import shutil
-                    shutil.copy2(semantic_optimized_file, SEMANTIC_BEST_TRANSLATION_FILE)
-                    logger.info(f"✓ Datei kopiert nach: {SEMANTIC_BEST_TRANSLATION_FILE}")
-            else:
-                logger.error(
-                    f"❌ KRITISCHER FEHLER: select_best_hypotheses_post_translation() hat keine gültige Datei erstellt!\n"
-                    f"   Rückgabewert: {semantic_optimized_file}\n"
-                    f"   Datei existiert: {os.path.exists(semantic_optimized_file) if semantic_optimized_file else 'N/A'}\n"
-                    f"   Mögliche Ursachen:\n"
-                    f"   1. HYPOTHESES_CSV ({HYPOTHESES_CSV}) fehlt\n"
-                    f"   2. Fehler in translate_segments_optimized_safe()\n"
-                    f"   3. ask_overwrite() wurde mit 'Nein' beantwortet"
-                )
-                # ✅ Erstelle Fallback-Datei (Kopie von PROVISIONAL_TRANSLATION_CSV)
-                if os.path.exists(PROVISIONAL_TRANSLATION_CSV):
-                    import shutil
-                    shutil.copy2(PROVISIONAL_TRANSLATION_CSV, SEMANTIC_BEST_TRANSLATION_FILE)
-                    logger.warning(f"⚠️  Fallback: Verwende {PROVISIONAL_TRANSLATION_CSV} als {SEMANTIC_BEST_TRANSLATION_FILE}")
-                else:
-                    logger.error(f"❌ Auch Fallback-Datei fehlt: {PROVISIONAL_TRANSLATION_CSV}")
-                    logger.error("   Kann nicht fortfahren - Stoppe Pipeline!")
-                    return  # ← Beende main() vorzeitig
 
             clear_spacy_cache_and_free_vram()
             time.sleep(3)
 
         if EXECUTE_CORRECTION:
             # SCHRITT 4: KORREKTUR
-            if not os.path.exists(SEMANTIC_BEST_TRANSLATION_FILE):
-                logger.error(
-                    f"❌ KRITISCHER FEHLER: Erforderliche Datei fehlt!\n"
-                    f"   Datei: {SEMANTIC_BEST_TRANSLATION_FILE}\n"
-                    f"   Diese Datei sollte durch select_best_hypotheses_post_translation() erstellt worden sein.\n"
-                    f"   Prüfe die Logs des vorherigen Schritts (EXECUTE_TRANSLATION)."
-                )
-                
-                # ✅ Versuche Fallback
-                if os.path.exists(PROVISIONAL_TRANSLATION_CSV):
-                    logger.warning(f"⚠️  Verwende Fallback: {PROVISIONAL_TRANSLATION_CSV}")
-                    import shutil
-                    shutil.copy2(PROVISIONAL_TRANSLATION_CSV, SEMANTIC_BEST_TRANSLATION_FILE)
-                else:
-                    logger.error("   Überspringe Qualitätsprüfung (keine Datei verfügbar)")
-                    # Setze EXECUTE_CORRECTION auf False, damit auch Polishing übersprungen wird
-                    EXECUTE_CORRECTION = False
-                    EXECUTE_POLISHING = False
-            
-            # ✅ NUR wenn Datei existiert, fortfahren
-            if EXECUTE_CORRECTION and os.path.exists(SEMANTIC_BEST_TRANSLATION_FILE):
-                if ask_overwrite(SEMANTIC_BEST_TRANSLATION_FILE):
-                    logger.info(f"✓ Starte Qualitätsprüfung für: {SEMANTIC_BEST_TRANSLATION_FILE}")
-                    evaluate_translation_quality(
-                        source_csv_path=CLEANED_SOURCE_FOR_QUALITY_CHECK,
-                        translated_csv_path=SEMANTIC_BEST_TRANSLATION_FILE,
-                        report_path=TRANSLATION_QUALITY_REPORT,
-                        summary_path=TRANSLATION_QUALITY_SUMMARY,
-                        model_name=ST_POLISH_MODEL_DE,
-                        correction_model="gemma2:9b",
-                        threshold=SIMILARITY_THRESHOLD_EVAL
-                    )
-                else:
-                    logger.info(f'✓ Verwende vorhandene Qualitätsprüfung')
+            report_path, corrected_csv = evaluate_translation_quality(
+                source_csv_path=CLEANED_SOURCE_FOR_QUALITY_CHECK,
+                translated_csv_path=SEMANTIC_BEST_TRANSLATION_FILE,
+                report_path=TRANSLATION_QUALITY_REPORT,
+                summary_path=TRANSLATION_QUALITY_SUMMARY,
+                model_name=ST_POLISH_MODEL_DE,
+                correction_model="gemma2:9b",
+                threshold=SIMILARITY_THRESHOLD_EVAL
+            )
 
             clear_spacy_cache_and_free_vram()
             time.sleep(3)
@@ -7624,87 +7566,58 @@ def main():
         if EXECUTE_POLISHING:
             # SCHRITT 4.5: POLISHING (nach Qualitätsprüfung, vor Refinement)
             # Fallback-Kette: CORRECTED → SEMANTIC
-            input_polish_file = (CORRECTED_TRANSLATION_FILE if os.path.exists(CORRECTED_TRANSLATION_FILE)
-                                else SEMANTIC_BEST_TRANSLATION_FILE)
-            
-            # ✅ ROBUSTE EXISTENZPRÜFUNG
-            if not os.path.exists(input_polish_file):
-                logger.error(
-                    f"❌ FEHLER: Polishing-Eingabedatei fehlt!\n"
-                    f"   Erwartete Datei: {input_polish_file}\n"
-                    f"   Überspringe Polishing-Schritt."
-                )
-                EXECUTE_POLISHING = False
-            
-            # ✅ NUR wenn Datei existiert
-            if EXECUTE_POLISHING and (os.path.exists(input_polish_file) or ask_overwrite(input_polish_file)):
-                logger.info(f"✓ Starte Polishing mit: {input_polish_file}")
-                polish_all_translations(
-                    source_csv_path=CLEANED_SOURCE_FOR_QUALITY_CHECK,
-                    translated_csv_path=input_polish_file,
-                    output_csv_path=POLISHED_TRANSLATION_CSV,
-                    sp_model_name=ST_POLISH_MODEL_DE,
-                    llm_model_name="gemma2:9b",
-                    skip_threshold=SIMILARITY_THRESHOLD_POLISHING
-                )
-            else:
-                logger.info(f'✓ Verwende vorhandene polierte Übersetzung: {POLISHED_TRANSLATION_CSV}')
-                corrected_csv = POLISHED_TRANSLATION_CSV
+            polish_all_translations(
+                source_csv_path=CLEANED_SOURCE_FOR_QUALITY_CHECK,
+                translated_csv_path=CORRECTED_TRANSLATION_FILE,
+                output_csv_path=POLISHED_TRANSLATION_CSV,
+                sp_model_name=ST_POLISH_MODEL_DE,
+                llm_model_name="gemma2:9b",
+                skip_threshold=SIMILARITY_THRESHOLD_POLISHING
+            )
+        else:
+            logger.info(f'✓ Verwende vorhandene polierte Übersetzung: {POLISHED_TRANSLATION_CSV}')
 
             clear_spacy_cache_and_free_vram()
             time.sleep(3)
 
         if EXECUTE_VEREDELUNG:
             # SCHRITT 5: VEREDELUNG DER DEUTSCHEN ÜBERSETZUNG
-            # Fallback-Kette: POLISHED → CORRECTED → SEMANTIC
-            input_refine_file = (POLISHED_TRANSLATION_CSV if os.path.exists(POLISHED_TRANSLATION_CSV) else
-                                CORRECTED_TRANSLATION_FILE if os.path.exists(CORRECTED_TRANSLATION_FILE) else
-                                SEMANTIC_BEST_TRANSLATION_FILE)
-            
-            if os.path.exists(input_refine_file) or ask_overwrite(input_refine_file):
-                refine_text_pipeline(
-                    input_file=input_refine_file,
-                    output_file=REFINED_TRANSLATION_FILE,
-                    spacy_model_name="de_dep_news_trf",
-                    lang_code='de-DE',
-                    tokenizer_path="madlad400-3b-mt-int8_bfloat16"
-                )
+            refine_text_pipeline(
+                input_file=POLISHED_TRANSLATION_CSV or CORRECTED_TRANSLATION_FILE,
+                output_file=REFINED_TRANSLATION_FILE,
+                spacy_model_name="de_dep_news_trf",
+                lang_code='de-DE',
+                tokenizer_path="madlad400-3b-mt-int8_bfloat16"
+            )
 
             clear_spacy_cache_and_free_vram()
             time.sleep(3)
 
         if EXECUTE_TTS_FORMATTING:
             # SCHRITT 6: TTS-FORMATIERUNG & SYNTHESE
-            # Vollständige Fallback-Kette für Übersetzungen
-            tts_input_candidates = [REFINED_TRANSLATION_FILE, POLISHED_TRANSLATION_CSV, 
-                                CORRECTED_TRANSLATION_FILE, SEMANTIC_BEST_TRANSLATION_FILE]
-            tts_input_file = next((f for f in tts_input_candidates if os.path.exists(f)), None)
-            
-            if tts_input_file or ask_overwrite(REFINED_TRANSLATION_FILE):
-                format_for_tts_splitting(
-                    input_file=tts_input_file or REFINED_TRANSLATION_FILE,
-                    output_file=TTS_FORMATTED_TRANSLATION_FILE,
-                    target_char_range=(130, 180),  # Optimale Länge: 150, Maximale Länge: 200
-                    min_words_for_final_segment=3
-                    )
-
-                clear_spacy_cache_and_free_vram()
-                time.sleep(2)
-
-        if EXECUTE_TTS:
-            if os.path.exists(TTS_FORMATTED_TRANSLATION_FILE) or ask_overwrite(TTS_FORMATTED_TRANSLATION_FILE):
-                text_to_speech_with_voice_cloning(
-                    TTS_FORMATTED_TRANSLATION_FILE,
-                    SAMPLE_PATH_1,
-                    SAMPLE_PATH_2,
-                    SAMPLE_PATH_3,
-                    #SAMPLE_PATH_4,
-                    TRANSLATED_AUDIO_WITH_PAUSES
+            format_for_tts_splitting(
+                input_file=REFINED_TRANSLATION_FILE,
+                output_file=TTS_FORMATTED_TRANSLATION_FILE,
+                target_char_range=(130, 180),  # Optimale Länge: 150, Maximale Länge: 200
+                min_words_for_final_segment=3
                 )
 
-                clear_spacy_cache_and_free_vram()
-                time.sleep(2)
-                resample_to_44100_stereo(TRANSLATED_AUDIO_WITH_PAUSES, RESAMPLED_AUDIO_FOR_MIXDOWN, SPEED_FACTOR_RESAMPLE_44100)
+            clear_spacy_cache_and_free_vram()
+            time.sleep(2)
+
+        if EXECUTE_TTS:
+            text_to_speech_with_voice_cloning(
+                TTS_FORMATTED_TRANSLATION_FILE,
+                SAMPLE_PATH_1,
+                SAMPLE_PATH_2,
+                SAMPLE_PATH_3,
+                #SAMPLE_PATH_4,
+                TRANSLATED_AUDIO_WITH_PAUSES
+            )
+
+            clear_spacy_cache_and_free_vram()
+            time.sleep(2)
+            resample_to_44100_stereo(TRANSLATED_AUDIO_WITH_PAUSES, RESAMPLED_AUDIO_FOR_MIXDOWN, SPEED_FACTOR_RESAMPLE_44100)
 
         if EXECUTE_VIDEO_ADJUSTMENT:
             # SCHRITT 7: FINALES VIDEO ERSTELLEN
