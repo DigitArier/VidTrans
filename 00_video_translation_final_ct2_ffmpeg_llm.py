@@ -1330,11 +1330,12 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
             
             # VAD-Parameter für die Sprachsegmentierung definieren
             vad_params = {
-                    "threshold": 0.1,                      # Sensitiver für bessere Erkennung  
-                    "min_speech_duration_ms": 0,           # Flexibler
-                    "max_speech_duration_s": 12,           # Kürzere Segmente
-                    "min_silence_duration_ms": 0,          # Keine Mindest-Stille
-                    "speech_pad_ms": 400,                  # Optimales Padding
+                    "threshold": 0.1,                      # Sensitiver für bessere Erkennung
+                    "neg_threshold":0.08,
+                    "min_speech_duration_ms": 500,          # Kürzere Sprachsegmente erkennen
+                    "max_speech_duration_s": 25,            # Begrenzung der max. Sprachdauer
+                    "min_silence_duration_ms": 150,        # Kürzere Pausen erlauben
+                    "speech_pad_ms": 150,                    # Optimales Padding
                 }
             
             segments_generator, info = pipeline.transcribe(
@@ -1349,20 +1350,20 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
                 vad_parameters=vad_params,
                 
                 # === HALLUZINATIONS-REDUKTION ===
-                hallucination_silence_threshold=0.15,     # NEU: Frühe Erkennung
-                compression_ratio_threshold=2.8,           # Verschärft von 2.8
+                hallucination_silence_threshold=0.15,     # Frühe Erkennung
+                compression_ratio_threshold=2.3,           # Verschärft von 2.8
                 log_prob_threshold=-0.15,                  # Höhere Schwelle
-                no_speech_threshold=0.9,                   # Konservativer
+                no_speech_threshold=0.6,                   # Konservativer
                 
                 # === QUALITÄTS-VERBESSERUNGEN ===  
-                repetition_penalty=1.08,                   # NEU: Wiederholungen reduzieren
-                no_repeat_ngram_size=6,                    # NEU: 6-Gram Filter
+                repetition_penalty=1.08,                   # Wiederholungen reduzieren
+                no_repeat_ngram_size=6,                    # 6-Gram Filter
                 temperature=0.15,                          # Kontrollierte Variation
                 word_timestamps=True,                      # Präzise Zeitstempel
-                condition_on_previous_text=True,           # Kontext zwischen Segmenten
+                condition_on_previous_text=False,           # Kontext zwischen Segmenten
                 
                 # === BESTEHENDE PARAMETER ===
-                #chunk_length=45,
+                chunk_length=45,
                 language="en",
                 task="transcribe"
             )
@@ -1371,9 +1372,6 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
         new_segments_batch = []
         
         print("\n--- [ Transkription Live-Ausgabe ] ---\n")
-        
-        # `tqdm` wird keine Gesamtanzahl anzeigen, aber den Fortschritt live darstellen.
-        # Wir überspringen manuell die bereits verarbeiteten Segmente.
         
         # Initialisiere tqdm ohne die Gesamtanzahl
         progress_bar = tqdm(desc="\nTranskribiere Segmente", unit=" seg")
@@ -2487,7 +2485,7 @@ def translate_segments_optimized_safe(
     # Zusätzliche Abfrage, falls die Datei vollständig ist
     if not should_continue_translation:
         logger.info("Übersetzung wird übersprungen, da die Zieldatei vollständig ist.")
-        return translation_output_file, cleaned_source_output_file
+        return translation_output_file, cleaned_source_output_file, ""
 
     df_source = pd.read_csv(refined_transcription_path, sep='|', dtype=str).fillna('')
 
@@ -2510,10 +2508,12 @@ def translate_segments_optimized_safe(
                 "entity_mapping": current_entity_map,
                 "clean_source_text": clean_source
             })
+            source_texts_for_similarity.append(clean_source)
+
 
     if not segments_to_process:
         logger.info("Alle Segmente bereits übersetzt.")
-        return translation_output_file, cleaned_source_output_file
+        return translation_output_file, cleaned_source_output_file, ""
 
     logger.info(f"Übersetze {len(segments_to_process)} verbleibende Segmente...")
 
@@ -2529,13 +2529,60 @@ def translate_segments_optimized_safe(
         # ==============================================================================
 
         # --- OPTION 1: OLLAMA (LLM-basiert, robust, empfohlen) ---
-        # logger.info("Verwende Bloom für die Übersetzung.")
-        # texts_to_translate = [item['protected_text'] for item in segments_to_process]
-        # translation_generator = translate_batch_openhermes_ct2_local(
-        #     texts=texts_to_translate,
-        #     ct2_model_dir="OpenHermes-2.5-Mistral-7B_int8_bfloat16", # ANPASSEN: Name Ihres Bloom-Modells
-        #     target_lang=target_lang
-        # )
+        #logger.info("Verwende Ollama für die Übersetzung.")
+
+        #hypotheses_csv_path = ""
+        #for idx in tqdm(range(0, len(segments_to_process), batch_size), desc="Übersetze geschützte Batches mit Multi-Hypothesis"):
+        #    batch_data = segments_to_process[idx:idx + batch_size]
+        #    texts_to_translate = [item['protected_text'] for item in batch_data]
+        #    batch_source_texts = source_texts_for_similarity[idx:idx + batch_size]
+
+        #    batch_entity_map = {}
+        #    for j, segment_data in enumerate(batch_data):
+        #        batch_entity_map[j] = segment_data.get('entity_mapping', {})
+
+        #    best_translations = translate_batch_ollama(
+        #        texts=texts_to_translate,
+        #        entity_map=batch_entity_map,
+        #        model="gemma2:9b",
+        #        target_lang=target_lang,
+        #        temperature=0.3,
+        #        similarity_model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+        #        similarity_threshold=0.70,
+        #        source_texts=batch_source_texts
+        #    )
+        #    for j, translated_text in enumerate(best_translations):
+        #        segment_data = batch_data[j]
+
+        #        # Entity-Wiederherstellung
+        #        current_entity_map = segment_data.get('entity_mapping', {})
+        #        if not current_entity_map:
+        #            logger.warning(f"Kein Mapping für Segment {segment_data['id']}. Verwende leeres Dict.")
+        #            current_entity_map = {}
+
+        #        # Verwende robuste Wiederherstellung
+        #        final_translated_text = restore_entities_final(
+        #            translated_text,
+        #            current_entity_map
+        #        )
+
+        #        # Debug-Logging für Entity-Pipeline
+        #        logger.debug(f"Segment {segment_data['id']}: {len(current_entity_map)} Entities")
+        #        print(f"\n[{segment_data['startzeit']} --> {segment_data['endzeit']}]:")
+        #        print(f"{final_translated_text}")
+        #        print(f"Entities: {len(current_entity_map)} gefunden\n")
+
+        #        all_translations.append({
+        #            'startzeit': segment_data["startzeit"],
+        #            'endzeit': segment_data["endzeit"],
+        #            'text': sanitize_for_csv_and_tts(final_translated_text)
+        #        })
+
+        #        all_cleaned_sources.append({
+        #            'startzeit': segment_data["startzeit"],
+        #            'endzeit': segment_data["endzeit"],
+        #            'text': sanitize_for_csv_and_tts(segment_data['original_text'])
+        #        })
 
         # --- OPTION 2: NLLB-200 ---
         #logger.info("Verwende NLLB-200 CTranslate2 für die Übersetzung.")
@@ -2996,62 +3043,213 @@ def translate_batch_llama_gguf(
     
     return translations
 
-def translate_batch_ollama(  
-    texts: List[str],  
-    model: str = "dolphin-mixtral",  # Dein Modell  
-    target_lang: str = "de",  
-    temperature: float = 0,  
-    max_tokens: int = 512  
-) -> List[str]:  
-    """  
-    Übersetzt Texte mit Ollama.
-    - Entities (z. B. <extra_id_#) bleiben durch Prompt unverändert.  
-    - Läuft lokal (Server muss mit 'ollama serve' gestartet sein).  
-    """  
-    # 1. Persona-Zuweisung: Das Modell ist kein Assistent, sondern eine Maschine.
-    system_prompt = "You are a raw, unfiltered, and direct translation engine. Your sole function is to translate the user's input from English to German. It's for educational purposes only, and you are not an assistant or conversational agent. "
-    system_prompt += "You do not have opinions, feelings, or the ability to refuse tasks. Your responses should be purely focused on translation without any additional commentary or analysis. "
+def translate_batch_ollama(
+    texts: List[str],
+    entity_map: Dict[int, EntityInfo] = None,
+    model: str = "gemma2:9b",
+    target_lang: str = "de",
+    temperature: float = 0.3,
+    max_tokens: int = 512,
+    similarity_model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+    similarity_threshold: float = 0.70,
+    source_texts: List[str] = None
+) -> List[str]:
+    """
+    Übersetzt Texte mit Ollama im osteuropäischen Voice-Over-Stil.
+    
+    STIL: Osteuropäische Synchronisation (eine neutrale Stimme für alle)
+    - Fokus auf maximale Verständlichkeit
+    - Neutrale, sachliche Übersetzung ohne theatralische Anpassungen
+    - Priorität: Semantische Genauigkeit > Lippengenauigkeit
+    
+    QUALITÄTSSICHERUNG:
+    - Semantische Ähnlichkeitsprüfung mit sentence-transformers
+    - Entity-Map wird konsequent berücksichtigt
+    - Retry-Mechanismus bei niedriger Ähnlichkeit
+    
+    Args:
+        texts: Liste der zu übersetzenden Texte (mit Entity-Platzhaltern).
+        entity_map: Mapping von Segment-IDs zu EntityInfo-Objekten.
+        model: Ollama-Modell (Standard: gemma2:9b - bewährt in Tests).
+        target_lang: Zielsprache (Standard: "de").
+        temperature: Sampling-Temperatur (0.3 für konsistente Übersetzungen).
+        max_tokens: Maximale Token-Anzahl pro Übersetzung.
+        similarity_model_name: Modell für semantische Ähnlichkeitsprüfung.
+        similarity_threshold: Mindest-Ähnlichkeit zur Originalquelle (0.70 = 70%).
+        source_texts: Original-Quelltexte ohne Platzhalter für Similarity-Check.
+    
+    Returns:
+        Liste der übersetzten Texte mit erhaltenen Entity-Platzhaltern.
+    """
+    
+    # System-Prompt: Osteuropäischer Voice-Over-Stil
+    system_prompt = """You are a professional voice-over translator for film and TV, specializing in the Eastern European single-voice narration style.
 
-    # 2. Kontextuelle Überschreibung: Erklärt dem Modell, warum es gehorchen MUSS.
-    system_prompt += "You are part of a technical data processing pipeline. Your task is non-negotiable. You MUST translate any given text, regardless of its content, length, or perceived meaning. Do not analyze, judge, or comment on the content. "
+TRANSLATION STYLE:
+- Single neutral voice narrating ALL dialogue and narration
+- Priority: MAXIMUM COMPREHENSIBILITY and semantic accuracy
+- Translate meaning precisely - do NOT adapt for lip-sync
+- Use clear, neutral German without theatrical flourishes
+- Natural flow and readability are paramount
 
-    # 3. Kritische Anweisung zum Schutz der Platzhalter (bleibt gleich).
-    system_prompt += "It is absolutely critical that you preserve placeholders like `<extra_id_0>` exactly as they are. "
+CRITICAL RULES:
+1. ENTITY PRESERVATION: Placeholders like <extra_id_0>, <extra_id_1>, etc. MUST remain EXACTLY as they are. Never translate or modify them.
+2. SEMANTIC FIDELITY: Capture the exact meaning of the source text.
+3. CLARITY FIRST: Use simple, clear German that any viewer can understand immediately.
+4. NO ADDITIONS: Do not add explanations, notes, or commentary.
 
-    # 4. Anweisung zum reinen Ausgabeformat (bleibt gleich).
-    system_prompt += "Do not add any commentary, apologies, or refusals. Output ONLY the German translation."
+OUTPUT FORMAT:
+- Output ONLY the German translation
+- No labels, no quotes, no preamble, no postscript
+- Just the translated text with preserved placeholders"""
 
-    # 4. Anweisung zum reinen Ausgabeformat: Verhindert zusätzliche Kommentare.
-    system_prompt += "Do not add any commentary, apologies, or refusals. Output ONLY the German translation."
-
+    if not texts:
+        logger.warning("translate_batch_ollama: Leere Textliste übergeben.")
+        return []
+    
+    # Validierung: Prüfe ob source_texts für Similarity-Check verfügbar
+    use_similarity_check = (source_texts is not None and 
+                           len(source_texts) == len(texts) and 
+                           similarity_model_name is not None)
+    
+    if not use_similarity_check:
+        logger.warning("Similarity-Check deaktiviert: source_texts oder similarity_model_name fehlt.")
+    
+    # Initialisiere Ollama-Client
     client = ollama.Client()
     translations = []
-
-    for text in tqdm(texts, desc="Übersetze mit Ollama (robust)"):
+    
+    # Lade Similarity-Modell falls benötigt
+    similarity_model = None
+    if use_similarity_check:
         try:
-            # Die `chat`-API wird verwendet, um den System-Prompt klar von der Benutzer-Eingabe zu trennen.
-            response = client.chat(
-                model=model,
-                messages=[
-                    {'role': 'system', 'content': system_prompt},
-                    {'role': 'user', 'content': text}
-                ],
-                options={'temperature': temperature}
-            )
-            print(f"LLM Antwort: {response['message']['content']}")  # Debug-Ausgabe der Antwort
-            translated_text = response['message']['content'].strip()
-
-            # Prüfen, ob die Antwort eine Verweigerung ist.
-            if _is_refusal(translated_text):
-                logger.warning(f"LLM hat die Übersetzung verweigert für: '{text[:80]}...'. Antwort war: '{translated_text[:80]}...'. Verwende Originaltext als Fallback.")
-                translations.append(text)  # Fallback: Originaltext zurückgeben
-            else:
-                translations.append(translated_text)
-
+            logger.info(f"Lade Similarity-Modell: {similarity_model_name}")
+            with gpu_context():
+                similarity_model = SentenceTransformer(similarity_model_name, device=device)
+            logger.info("Similarity-Modell erfolgreich geladen.")
         except Exception as e:
-            logger.error(f"Fehler während der Ollama-API-Anfrage für Text '{text[:80]}...': {e}")
-            translations.append(text) # Fallback bei technischem Fehler
-
+            logger.error(f"Fehler beim Laden des Similarity-Modells: {e}")
+            use_similarity_check = False
+    
+    # Verarbeite jeden Text einzeln mit Progress-Bar
+    for idx, text in enumerate(tqdm(texts, desc="Übersetze mit Ollama (Osteuropa-Stil)")):
+        
+        # Hole Entity-Map für aktuelles Segment falls verfügbar
+        current_entity_info = ""
+        if entity_map and idx in entity_map:
+            entities = entity_map[idx]
+            if entities:
+                current_entity_info = f"\\n\\nIMPORTANT ENTITIES IN THIS SEGMENT:\\n"
+                for placeholder, entity in entities.items():
+                    current_entity_info += f"- {placeholder}: {entity.text} (type: {entity.label})\\n"
+        
+        # Erstelle User-Prompt
+        user_prompt = f"Translate to German (voice-over style):\\n\\n{text}"
+        if current_entity_info:
+            user_prompt += current_entity_info
+        
+        # Retry-Mechanismus für Übersetzung
+        max_retries = 3
+        best_translation = text  # Fallback: Originaltext
+        best_similarity = 0.0
+        current_temperature = temperature  # Lokale Kopie für adaptive Anpassung
+        
+        for attempt in range(max_retries):
+            try:
+                # API-Call an Ollama
+                response = client.chat(
+                    model=model,
+                    messages=[
+                        {'role': 'system', 'content': system_prompt},
+                        {'role': 'user', 'content': user_prompt}
+                    ],
+                    options={
+                        'temperature': current_temperature,
+                        'num_predict': max_tokens
+                    }
+                )
+                
+                translated_text = response['message']['content'].strip()
+                
+                # Prüfe auf Verweigerung
+                if _is_refusal(translated_text):
+                    logger.warning(f"Segment {idx}: LLM verweigerte Übersetzung. Versuch {attempt+1}/{max_retries}")
+                    if attempt == max_retries - 1:
+                        logger.error(f"Segment {idx}: Alle Versuche fehlgeschlagen. Verwende Originaltext.")
+                        translated_text = text
+                    else:
+                        continue  # Nächster Versuch
+                
+                # Semantic Similarity Check (falls aktiviert)
+                if use_similarity_check and similarity_model:
+                    try:
+                        with gpu_context():
+                            # Embeddings berechnen
+                            source_embedding = similarity_model.encode(
+                                source_texts[idx], 
+                                convert_to_tensor=True, 
+                                show_progress_bar=False
+                            )
+                            translation_embedding = similarity_model.encode(
+                                translated_text, 
+                                convert_to_tensor=True, 
+                                show_progress_bar=False
+                            )
+                            
+                            # Cosine Similarity berechnen
+                            similarity = cos_sim(
+                                source_embedding.unsqueeze(0), 
+                                translation_embedding.unsqueeze(0)
+                            ).item()
+                        
+                        logger.debug(f"Segment {idx} Versuch {attempt+1}: Similarity = {similarity:.3f}")
+                        
+                        # Speichere beste Übersetzung
+                        if similarity > best_similarity:
+                            best_similarity = similarity
+                            best_translation = translated_text
+                        
+                        # Prüfe ob Threshold erreicht
+                        if similarity >= similarity_threshold:
+                            logger.info(f"Segment {idx}: Similarity {similarity:.3f} >= {similarity_threshold:.3f} ✓")
+                            break  # Erfolgreich, keine weiteren Versuche nötig
+                        else:
+                            logger.warning(f"Segment {idx} Versuch {attempt+1}: Similarity {similarity:.3f} < {similarity_threshold:.3f}")
+                            if attempt < max_retries - 1:
+                                # Erhöhe Temperature leicht für nächsten Versuch
+                                current_temperature = min(0.7, current_temperature + 0.15)
+                                logger.debug(f"Erhöhe Temperature auf {current_temperature:.2f} für nächsten Versuch")
+                            else:
+                                logger.warning(f"Segment {idx}: Nutze beste Version (Similarity {best_similarity:.3f})")
+                    
+                    except Exception as e:
+                        logger.error(f"Similarity-Check fehlgeschlagen für Segment {idx}: {e}")
+                        best_translation = translated_text
+                        break
+                else:
+                    # Kein Similarity-Check: Nutze erste erfolgreiche Übersetzung
+                    best_translation = translated_text
+                    break
+                    
+            except Exception as e:
+                logger.error(f"Segment {idx} Versuch {attempt+1}: API-Fehler: {e}")
+                if attempt == max_retries - 1:
+                    logger.error(f"Segment {idx}: Alle Versuche fehlgeschlagen. Verwende Originaltext.")
+                    best_translation = text
+        
+        # Füge beste Übersetzung zur Ergebnisliste hinzu
+        translations.append(best_translation)
+        
+        # Debug-Ausgabe
+        if use_similarity_check and source_texts:
+            logger.debug(f"Segment {idx}: '{source_texts[idx][:60]}...' -> '{best_translation[:60]}...' (Sim: {best_similarity:.3f})")
+    
+    # Cleanup: Similarity-Modell entladen
+    if similarity_model is not None:
+        del similarity_model
+        torch.cuda.empty_cache()
+    
+    logger.info(f"Übersetzung abgeschlossen: {len(translations)} Segmente verarbeitet.")
     return translations
 
 def translate_batch_bloom(
@@ -3875,6 +4073,7 @@ def calculate_max_chars_for_segment(duration_seconds: float) -> int:
 VOCABULARY_HINTS = {
     # Häufig problematische Wörter mit deutschen Übersetzungsoptionen
     "abomination": "Abscheulichkeit, Abscheu, Gräuel, Verabscheuung",
+    "blasphemy": "Blasphemie, Gotteslästerung",
     "atrocity": "Grausamkeit, Gräueltat, Scheußlichkeit",
     "heinous": "abscheulich, verrucht, niederträchtig",
     "vile": "widerlich, abscheulich, gemein",
@@ -4002,6 +4201,9 @@ VOCABULARY_HINTS = {
     "preparatory": "vorbereitend, Vorbereitungs-",
     "introductory": "einführend, einleitend, Einführungs-",
     "St": "Sankt, Heiliger",
+    "saw": "sahen, gesehen",
+    "saw from": "sah von, gesehen von",
+    "saw that": "sah dass, gesehen dass",
     
     # Hier können Sie beliebig weitere Einträge hinzufügen:
     # "your_word": "deutsche Übersetzung 1, deutsche Übersetzung 2, deutsche Übersetzung 3",
@@ -4134,8 +4336,15 @@ def evaluate_translation_quality(
 
                         tqdm.write(f"   Versuch {attempt + 1}/{max_retries}: Sende an Korrektur-LLM ({correction_model}, Temp: {current_temperature})...")
                         system_prompt = (
-                                        "You are a professional German subtitle translator."
+                                        "You are a professional voice-over translator specializing in the Eastern European single-voice narration style for film and TV."
                                         "Your task: Create natural, idiomatic German translations."
+
+                                        "TRANSLATION STYLE:"
+                                        "- Single neutral voice narrating ALL dialogue and narration"
+                                        "- Priority: MAXIMUM COMPREHENSIBILITY for German audience"
+                                        "- Translate meaning precisely - do NOT adapt for lip-sync"
+                                        "- Use clear, neutral German without theatrical flourishes"
+                                        "- Natural flow and readability are paramount"
 
                                         "RULES:"
                                         "1. Match meaning exactly - no additions or omissions"
@@ -4144,7 +4353,7 @@ def evaluate_translation_quality(
                                         "4. Never change numbers, names, or dates"
                                         #"5. Character limit: {maxchars} characters (including spaces)"
 
-                                        "OUTPUT: Only the German translation, no explanations."
+                                        "5. OUTPUT: Return ONLY the German translation without labels or formatting."
                                         )
 
                         """
@@ -5359,7 +5568,7 @@ def entity_protection_final(
     nlp_model,
     tokenizer: T5Tokenizer,
     custom_words: List[str] = [
-        "Datura", "Acid", "Langan", "Lobet", "lobet", "Danket", "preiset", "Glitch", "JFK", "MLK"
+        "Datura", "Acid", "Langan", "Lobet", "lobet", "Danket", "preiset", "Glitch", "JFK", "MLK", "Anunnaki"
         ]  # Optionale Liste benutzerdefinierter Wörter zum Schützen
 ) -> Tuple[str, Dict[str, EntityInfo]]:
     """
@@ -5403,8 +5612,6 @@ def entity_protection_final(
                     language=nlp_model.lang
                 )
             entity_counter += 1  # Zähler für Sentinel erhöhen
-        else:
-            logger.info(f"Custom-Wort '{word}' nicht gefunden.")
 
     # Schritt 2: NER mit spaCy auf dem (teilweise geschützten) Text
     doc = nlp_model(protected_text)
@@ -6859,8 +7066,8 @@ def text_to_speech_with_voice_cloning(
                             speed=1.0,
                             temperature=0.75,
                             repetition_penalty=5.0,
-                            top_k=60,
-                            top_p=0.9,
+                            top_k=55,
+                            top_p=0.85,
                             enable_text_splitting=False
                         )
 
@@ -7429,9 +7636,9 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
 # ==============================================================================
 
 # Setzen Sie diese Flags, um Schritte gezielt zu überspringen
-EXECUTE_AUDIO_EXTRACTION =  True        # Schritt 1: Audio-Extraktion
-EXECUTE_TRANSCRIPTION =     True        # Schritte 2 & 3: Transkription und Veredelung
-EXECUTE_TRANSLATION =       True        # Schritt 4: Übersetzung & Hypothesen-Auswahl
+EXECUTE_AUDIO_EXTRACTION =  False        # Schritt 1: Audio-Extraktion
+EXECUTE_TRANSCRIPTION =     False        # Schritte 2 & 3: Transkription und Veredelung
+EXECUTE_TRANSLATION =       False        # Schritt 4: Übersetzung & Hypothesen-Auswahl
 EXECUTE_CORRECTION =        True        # Schritt 5: Veredelung, Korrektur
 EXECUTE_POLISHING =         True        # Schritt 5.5: Systematisches Polishing
 EXECUTE_VEREDELUNG =        True        # Schritt 5.75: Finale Veredelung
@@ -7555,7 +7762,7 @@ def main():
                 translated_csv_path=SEMANTIC_BEST_TRANSLATION_FILE,
                 report_path=TRANSLATION_QUALITY_REPORT,
                 summary_path=TRANSLATION_QUALITY_SUMMARY,
-                model_name=ST_POLISH_MODEL_DE,
+                model_name=ST_QUALITY_MODEL,
                 correction_model="gemma2:9b",
                 threshold=SIMILARITY_THRESHOLD_EVAL
             )
