@@ -1363,7 +1363,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
                 condition_on_previous_text=False,           # Kontext zwischen Segmenten
                 
                 # === BESTEHENDE PARAMETER ===
-                chunk_length=45,
+                #chunk_length=45,
                 language="en",
                 task="transcribe"
             )
@@ -2642,7 +2642,8 @@ def translate_segments_optimized_safe(
                 tokenizer=tokenizer_madlad,
                 target_lang=target_lang,
                 num_hypotheses=num_hypotheses,
-                source_texts=batch_source_texts
+                source_texts=batch_source_texts,
+                start_segment_id=idx
             )
             for j, translated_text in enumerate(best_translations):
                 segment_data = batch_data[j]
@@ -2698,7 +2699,8 @@ def translate_batch_madlad(
     target_lang: str = "de",
     num_hypotheses: int = 10,
     source_texts: List[str] = None,
-    similarity_model_name: str = ST_QUALITY_MODEL
+    similarity_model_name: str = ST_QUALITY_MODEL,
+    start_segment_id: int = 0
 ) -> Tuple[List[str], str]:
     """
     KORRIGIERTE VERSION: Führt eine Batch-Übersetzung mit dem MADLAD-CT2-Modell durch.
@@ -2749,7 +2751,7 @@ def translate_batch_madlad(
     for result_idx, result in enumerate(results):
         # Datenstruktur für dieses Segment erstellen
         segment_data = {
-            "segment_id": result_idx,  # Eindeutige Segment-ID
+            "segment_id": start_segment_id + result_idx,  # Eindeutige Segment-ID
             "source_text": source_texts[result_idx] if source_texts and result_idx < len(source_texts) else texts[result_idx],
             "hypotheses": []
         }
@@ -4074,13 +4076,17 @@ VOCABULARY_HINTS = {
     # Häufig problematische Wörter mit deutschen Übersetzungsoptionen
     "abomination": "Abscheulichkeit, Abscheu, Gräuel, Verabscheuung",
     "blasphemy": "Blasphemie, Gotteslästerung",
+    "Ark of the Covenant": "Bundeslade",
     "atrocity": "Grausamkeit, Gräueltat, Scheußlichkeit",
+    "atrocious": "grausam, entsetzlich, abscheulich",
     "heinous": "abscheulich, verrucht, niederträchtig",
     "vile": "widerlich, abscheulich, gemein",
     "despicable": "verachtenswert, niederträchtig, abscheulich",
     "grotesque": "grotesk, abstoßend, bizarr",
     "macabre": "makaber, grausig, düster",
     "sinister": "finster, unheilverkündend, bedrohlich",
+    "menacing": "bedrohlich, unheilverkündend, drohend",
+    "foreboding": "unheilvoll, unheilverkündend, düster",
     "ominous": "unheilverkündend, bedrohlich, düster",
     "eerie": "unheimlich, gespenstisch, schauerlich",
     "uncanny": "unheimlich, seltsam, merkwürdig",
@@ -4144,9 +4150,11 @@ VOCABULARY_HINTS = {
     "magnificence": "Pracht, Herrlichkeit, Großartigkeit",
     "splendor": "Pracht, Glanz, Herrlichkeit",
     "grandeur": "Pracht, Großartigkeit, Erhabenheit",
+    "meditated": "nachgedacht, sinniert, überlegt",
     "majesty": "Majestät, Erhabenheit, Würde",
     "dignity": "Würde, Anstand, Ehre",
     "nobility": "Adel, Vornehmheit, Edelmut",
+    "honor": "Ehre, Ansehen, Würde",
     "integrity": "Integrität, Ehrlichkeit, Aufrichtigkeit",
     "sincerity": "Aufrichtigkeit, Ehrlichkeit, Offenheit",
     "authenticity": "Authentizität, Echtheit, Glaubwürdigkeit",
@@ -4154,6 +4162,7 @@ VOCABULARY_HINTS = {
     "candor": "Offenheit, Aufrichtigkeit, Ehrlichkeit",
     "transparency": "Transparenz, Durchsichtigkeit, Offenheit",
     "lucidity": "Klarheit, Durchsichtigkeit, Verständlichkeit",
+    "explicitness": "Eindeutigkeit, Deutlichkeit, Klarheit",
     "clarity": "Klarheit, Deutlichkeit, Verständlichkeit",
     "coherence": "Kohärenz, Zusammenhang, Stimmigkeit",
     "consistency": "Konsistenz, Beständigkeit, Folgerichtigkeit",
@@ -4201,11 +4210,12 @@ VOCABULARY_HINTS = {
     "preparatory": "vorbereitend, Vorbereitungs-",
     "introductory": "einführend, einleitend, Einführungs-",
     "St": "Sankt, Heiliger",
+    "mark of the beast": "Malzeichen des Tieres",
     "saw": "sahen, gesehen",
     "saw from": "sah von, gesehen von",
     "saw that": "sah dass, gesehen dass",
     
-    # Hier können Sie beliebig weitere Einträge hinzufügen:
+    # weitere Einträge hinzufügen:
     # "your_word": "deutsche Übersetzung 1, deutsche Übersetzung 2, deutsche Übersetzung 3",
 }
 
@@ -4327,7 +4337,7 @@ def evaluate_translation_quality(
                 max_chars = calculate_max_chars_for_segment(segment_duration)
 
                 # Definiert die Temperatur für jeden Versuch
-                temperatures = [0.2, 0.25, 0.3]
+                temperatures = [0.6, 0.3, 0.4, 0.2]
 
                 for attempt in range(max_retries):
                     try:
@@ -4340,20 +4350,23 @@ def evaluate_translation_quality(
                                         "Your task: Create natural, idiomatic German translations."
 
                                         "TRANSLATION STYLE:"
+                                        "- Match the semantic and grammatical mode (Modus) of the English source EXACTLY"
                                         "- Single neutral voice narrating ALL dialogue and narration"
                                         "- Priority: MAXIMUM COMPREHENSIBILITY for German audience"
                                         "- Translate meaning precisely - do NOT adapt for lip-sync"
                                         "- Use clear, neutral German without theatrical flourishes"
                                         "- Natural flow and readability are paramount"
+                                        "- native German word order required"
 
                                         "RULES:"
-                                        "1. Match meaning exactly - no additions or omissions"
-                                        "2. Use natural German word order"
-                                        "3. Keep translations concise for subtitles"
-                                        "4. Never change numbers, names, or dates"
-                                        #"5. Character limit: {maxchars} characters (including spaces)"
+                                        "1. VOCABULARY SUPPORT: Use the provided vocabulary hints for commonly mistranslated terms."
+                                        "2. Match meaning exactly - no additions or omissions"
+                                        "3. Use natural German word order"
+                                        "4. Keep translations concise for subtitles"
+                                        "5. Never change numbers, names, or dates"
+                                        #"6. Character limit: {maxchars} characters (including spaces)"
 
-                                        "5. OUTPUT: Return ONLY the German translation without labels or formatting."
+                                        "6. OUTPUT: Return ONLY the German translation without labels or formatting."
                                         )
 
                         """
@@ -4363,11 +4376,12 @@ def evaluate_translation_quality(
                                         "Your task is to create idiomatic, native German text that feels like it was originally written or spoken in German, not translated."
                                         
                                         "TRANSLATION PRINCIPLES (priority order):"
-                                        "1) SEMANTIC FIDELITY: The meaning must match the English source exactly. This is the highest priority."
-                                        "2) NATURAL GERMAN: Use native German word order and phrasing. Restructure sentences if needed for idiomatic flow."
-                                        "3) CONCISENESS: Prefer shorter, clearer phrasing. Subtitles must be readable at a glance."
-                                        "4) NO ADDITIONS/OMISSIONS: Keep all key information, but remove English filler words if they don't translate naturally."
-                                        "5) ENTITIES: Never alter numbers, dates, or proper names."
+                                        "1) VOCABULARY SUPPORT: Use the provided vocabulary hints for commonly mistranslated terms."
+                                        "2) SEMANTIC FIDELITY: The meaning must match the English source exactly. This is the highest priority."
+                                        "3) NATURAL GERMAN: Use native German word order and phrasing. Restructure sentences if needed for idiomatic flow."
+                                        "4) CONCISENESS: Prefer shorter, clearer phrasing. Subtitles must be readable at a glance."
+                                        "5) NO ADDITIONS/OMISSIONS: Keep all key information, but remove English filler words if they don't translate naturally."
+                                        "6) ENTITIES: Never alter numbers, dates, or proper names."
                                         
                                         "STYLE GUIDANCE:"
                                         "- Use natural German verb placement (V2 in main clauses, verb-final in subordinate clauses)"
@@ -4396,15 +4410,20 @@ def evaluate_translation_quality(
                         vocabulary_support = create_vocabulary_support()
                         system_prompt += vocabulary_support
                         system_prompt += (
-                            f"\n\nCRITICAL CHARACTER LIMIT: "
-                            f"The German translation MUST NOT exceed {max_chars} characters. "
+                            #f"\n\nCRITICAL CHARACTER LIMIT: "
+                            #f"The German translation MUST NOT exceed {max_chars} characters. "
                             f"Use shorter synonyms, remove filler words if needed."
                         )
 
-                        user_prompt = (
-                                            f"SOURCE TEXT (ENGLISH): {source_texts[i]}\n"
+                        user_prompt = (f"""
+                                            SOURCE TEXT (ENGLISH): {source_texts[i]}                                            
+                                            Please provide a corrected German translation that:
+                                            - Matches the English meaning exactly
+                                            - Uses INDICATIVE (not subjunctive) if source is "declare that they have..."
+                                            - Does NOT add or remove information
+                                            """
                                             #f"TRANSLATION TO CORRECT OR SHORTEN (GERMAN): {translated_texts[i]}\n"
-                                            f"SEGMENT DURATION: {segment_duration:.2f} seconds → MAX {max_chars} characters (spaces included)"
+                                            #f"SEGMENT DURATION: {segment_duration:.2f} seconds → MAX {max_chars} characters (spaces included)"
                                         )
 
                         response = ollama.chat(
@@ -7638,9 +7657,9 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
 # Setzen Sie diese Flags, um Schritte gezielt zu überspringen
 EXECUTE_AUDIO_EXTRACTION =  False        # Schritt 1: Audio-Extraktion
 EXECUTE_TRANSCRIPTION =     False        # Schritte 2 & 3: Transkription und Veredelung
-EXECUTE_TRANSLATION =       False        # Schritt 4: Übersetzung & Hypothesen-Auswahl
+EXECUTE_TRANSLATION =       True        # Schritt 4: Übersetzung & Hypothesen-Auswahl
 EXECUTE_CORRECTION =        True        # Schritt 5: Veredelung, Korrektur
-EXECUTE_POLISHING =         True        # Schritt 5.5: Systematisches Polishing
+EXECUTE_POLISHING =         False        # Schritt 5.5: Systematisches Polishing
 EXECUTE_VEREDELUNG =        True        # Schritt 5.75: Finale Veredelung
 EXECUTE_TTS_FORMATTING =    True        # Schritt 6: TTS-Formatierung
 EXECUTE_TTS =               True        # Schritt 7: TTS-Synthese
@@ -7790,7 +7809,7 @@ def main():
         if EXECUTE_VEREDELUNG:
             # SCHRITT 5: VEREDELUNG DER DEUTSCHEN ÜBERSETZUNG
             refine_text_pipeline(
-                input_file=POLISHED_TRANSLATION_CSV or CORRECTED_TRANSLATION_FILE,
+                input_file=CORRECTED_TRANSLATION_FILE,
                 output_file=REFINED_TRANSLATION_FILE,
                 spacy_model_name="de_dep_news_trf",
                 lang_code='de-DE',
