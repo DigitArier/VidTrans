@@ -1,13 +1,17 @@
 # Dateipfade
-AUDIO_PATH = "1_the SERPENT god of FORBIDDEN knowledge (DOCUMENTARY) (PART 1)_HD_(Vocals).wav"
-VIDEO_PATH = "the SERPENT god of FORBIDDEN knowledge (DOCUMENTARY) (PART 1)_HD.mp4"
-FINAL_VIDEO_PATH = "the SERPENT god of FORBIDDEN knowledge (DOCUMENTARY) (PART 1)_HD_deutsch.mp4"
+from re import S
+AUDIO_PATH =        "1_can YOU handle this TRUTH_ (Documentary)_HD_(Vocals).wav"
+VIDEO_PATH =        "can YOU handle this TRUTH_ (Documentary)_HD.mp4"
+FINAL_VIDEO_PATH =  "can YOU handle this TRUTH_ (Documentary)_HD_deutsch.mp4"
 ORIGINAL_AUDIO_PATH = "00_original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
-SAMPLE_PATH_1 = "ich_sample-01.wav"
-SAMPLE_PATH_2 = "ich_sample-02.wav"
-SAMPLE_PATH_3 = "ich_sample-03.wav"
+#SAMPLE_PATH_1 = "ich_sample-01.wav"
+#SAMPLE_PATH_2 = "ich_sample-02.wav"
+#SAMPLE_PATH_3 = "ich_sample-03.wav"
+SAMPLE_PATH_1 = "servant_sample-01-2.wav"
+SAMPLE_PATH_2 = "servant_sample-02-2.wav"
+SAMPLE_PATH_3 = "servant_sample-03-2.wav"
 #SAMPLE_PATH_4 = "ich_sample-04.wav"
 #SAMPLE_PATH_5 = "papa_sample-05.wav"
 SPEECH_TIMESTAMPS = "speech_timestamps.json"
@@ -37,13 +41,18 @@ MARIANMT_MODEL_DIR = "opus-mt-en-de-ct2"
 MARIANMT_HYPOTHESES_CSV = "02_hypotheses_marianmt.csv"
 HYPOTHESES_CSV = "02_translation_hypotheses_detailed.csv"
 TRANSLATION_FILE = "03_translation.csv"
-REFINED_TRANSLATION_FILE = "03a_refined_translation.csv"
+SEMANTIC_BEST_TRANSLATION_FILE = "03b_translation_semantic_best.csv"
+REFINED_TRANSLATION_FILE = "05_refined_translation.csv"
+CORRECTED_TRANSLATION_FILE = "03c_translation_corrected.csv"
 MERGED_TRANSLATION_FILE = "06_merged_translation.csv"
 REPAIRED_TRANSLATION_FILE = "repaired_translation_file.csv"
 CLEAN_TRANSLATION_FILE = "clean_translation.csv"
 PUNCTED_TRANSLATION_FILE = "puncted_translation.csv"
+PROVISIONAL_TRANSLATION_CSV = "provisional_translation.csv"
+CLEANED_SOURCE_CSV = "cleaned_source.csv"
+POLISHED_TRANSLATION_CSV = "04b_translation_polished.csv"
 CHAR_LIMIT_TRANSLATION = 210
-TTS_FORMATTED_TRANSLATION_FILE = "05_tts_formatted_translation.csv"
+TTS_FORMATTED_TRANSLATION_FILE = "06_tts_formatted_translation.csv"
 # Zusammenführung Übersetzung
 MIN_DUR_TRANSLATION = 3.0# Minimale Segmentdauer in Sekunden
 MAX_DUR_TRANSLATION = 15 # Maximale Segmentdauer in Sekunden
@@ -57,8 +66,6 @@ TRANSLATION_QUALITY_SUMMARY = "04_translation_quality_summary.txt"
 CLEANED_SOURCE_FOR_QUALITY_CHECK = "04a_cleaned_source_for_quality_check.csv"
 EMBEDDINGS_FILE_NPZ = "08_german_text_embeddings.npz"
 TRANSLATION_WITH_EMBEDDINGS_CSV = "08_german_text_embeddings.csv"
-# Schwellenwert für die Kosinus-Ähnlichkeit (experimentell bestimmen, z.B. 0.6 - 0.8)
-SIMILARITY_THRESHOLD = 0.88
 #TTS
 TTS_TEMP_CHUNKS_DIR = "tts_temp_chunks"
 TTS_PROGRESS_MANIFEST = "tts_progress_manifest.csv"
@@ -75,16 +82,6 @@ PAD_TOKEN_ID = 2
 # ---------------------------------
 NLLB_MODEL_DIR = "nllb-200-1.3B-bfloat16"   # Pfad zum konvertierten CT2-Modell
 NLLB_BATCH_MAX_TOKENS = 2048               # konservativ für RTX-40-Laptop-8 GB
-# ---------- OpenVoice Settings ----------
-OV_BASE_SPEAKER_CFG = "openvoice/checkpoints/base_speakers/EN/config.json"
-OV_BASE_SPEAKER_CKPT = "openvoice/checkpoints/base_speakers/EN/checkpoint.pth"
-OV_CONVERTER_CFG     = "openvoice/checkpoints/converter/config.json"
-OV_CONVERTER_CKPT    = "openvoice/checkpoints/converter/checkpoint.pth"
-# Liste zulässiger Emotionen laut OpenVoice-Demo[19]
-OV_ALLOWED_EMOTIONS = [
-    "default", "whispering", "shouting", "excited",
-    "cheerful", "terrified", "angry", "sad", "friendly"
-]
 
 # Vocoderpfade für XTTS
 vocoder_pth = r"D:\Modelle\Vocoder\bigvgan_v2_24khz_100band_256x\bigvgan_generator.pt"
@@ -98,18 +95,27 @@ SENTENCE_TRANSFORMER_MODELS = {
     "quality_big": "intfloat/multilingual-e5-large",
     "embedding": "sentence-transformers/distiluse-base-multilingual-cased-v2", 
     "embedding_big": "intfloat/multilingual-e5-large-instruct",
-    "speed": "sentence-transformers/all-MiniLM-L6-v2",
+    "mini": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     "multi_speed": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     "latest": "Alibaba-NLP/gte-large-en-v1.5"
 }
+CORRECTION_LLM_MODELS = {
+    "gemma": "gemma2:9b",
+    "qwen2.5": "qwen2.5:7b",
+    "qwen3": "qwen3:8b"
+}
+SIMILARITY_THRESHOLD_EVAL = 0.78
+SIMILARITY_THRESHOLD_POLISHING = 0.9
+# Standard-Modelle für verschiedene Aufgaben
+ST_QUALITY_MODEL = SENTENCE_TRANSFORMER_MODELS["quality_LaBSE"]
+ST_POLISH_MODEL_DE = SENTENCE_TRANSFORMER_MODELS["quality"]
+ST_MINI_MODEL = SENTENCE_TRANSFORMER_MODELS["mini"]
+GEMMA= CORRECTION_LLM_MODELS["gemma"]
+QWEN2_5= CORRECTION_LLM_MODELS["qwen2.5"]
+QWEN3= CORRECTION_LLM_MODELS["qwen3"]
 
 # Globale 4-Wort-Grenze gegen Ein-Wort-Segmente
 MIN_WORDS_GLOBAL = 4
-
-# Standard-Modelle für verschiedene Aufgaben
-ST_QUALITY_MODEL = SENTENCE_TRANSFORMER_MODELS["quality_big"]
-ST_EMBEDDING_MODEL_DE = SENTENCE_TRANSFORMER_MODELS["embedding"]
-ST_SPEED_MODEL = SENTENCE_TRANSFORMER_MODELS["multi_speed"]
 
 # TTS Text-Validierung
 MIN_TTS_TEXT_LENGTH = 5

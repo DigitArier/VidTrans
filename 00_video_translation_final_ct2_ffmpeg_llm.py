@@ -211,9 +211,9 @@ os.environ["CT2_CPU_PREFETCH"] = "32"    # Cache-Prefetching optimieren
 # Geschwindigkeits- und Lautstärkeeinstellungen
 SPEED_FACTOR_RESAMPLE_16000 = 1.0   # Geschwindigkeitsfaktor für 22.050 Hz (Mono)
 SPEED_FACTOR_RESAMPLE_44100 = 1.0   # Geschwindigkeitsfaktor für 44.100 Hz (Stereo)
-SPEED_FACTOR_PLAYBACK = 1.0     # Geschwindigkeitsfaktor für die Wiedergabe des Videos
-VOLUME_ADJUSTMENT_44100 = 1.0   # Lautstärkefaktor für 44.100 Hz (Stereo)
-VOLUME_ADJUSTMENT_VIDEO = 0.03   # Lautstärkefaktor für das Video
+SPEED_FACTOR_PLAYBACK = 1.0         # Geschwindigkeitsfaktor für die Wiedergabe des Videos
+VOLUME_ADJUSTMENT_44100 = 1.0       # Lautstärkefaktor für 44.100 Hz (Stereo)
+VOLUME_ADJUSTMENT_VIDEO = 0.03      # Lautstärkefaktor für das Video
 
 # ============================== 
 # Hilfsfunktionen
@@ -551,6 +551,132 @@ def load_madlad400_translator_ct2(model_path: str = MADLAD400_MODEL_DIR, device:
 
     logger.info("✅ CTranslate2-Übersetzer und Tokenizer erfolgreich geladen.")
     return translator, tokenizer
+
+def load_madlad400_translator_hf(
+    model_repo: str = "enacimie/madlad400-7b-mt-Q4_K_M-GGUF",
+    gguf_file: str = "madlad400-7b-mt-q4_k_m.gguf",
+    device: str = "cuda",
+    offload_folder: str = "madlad_weights"
+) -> Tuple[T5ForConditionalGeneration, T5Tokenizer]:
+    """
+    Lädt das MADLAD-400 GGUF-Modell mit der Hugging Face Transformers-Bibliothek.
+    
+    Das GGUF-Modell wird automatisch zu FP32 dequantisiert und kann dann
+    wie ein normales Transformers-Modell verwendet werden.
+    
+    WICHTIG: Bei begrenztem VRAM (6 GB) wird automatisch CPU-Offloading aktiviert.
+    
+    Args:
+        model_repo (str): HuggingFace Repository des GGUF-Modells
+        gguf_file (str): Dateiname des GGUF-Modells im Repository
+        device (str): Zielgerät ("cuda" oder "cpu")
+        offload_folder (str): Ordner für CPU/Disk-Offloading (Standard: "madlad_weights")
+    
+    Returns:
+        Tuple[T5ForConditionalGeneration, T5Tokenizer]: Modell und Tokenizer
+    
+    Hinweis:
+        - GGUF-Dateien werden automatisch zu FP32 dequantisiert
+        - Benötigt gguf>=0.10.0 und transformers>=4.45.0
+        - Unterstützt Q4_K_M und andere Quantisierungsformate
+        - Bei device="cuda" wird automatisch CPU-Offloading aktiviert für VRAM-Limits
+        - Offload-Ordner wird automatisch im Projektverzeichnis erstellt
+    """
+    logger.info(f"Lade MADLAD-400 GGUF-Modell von {model_repo}")
+    logger.info(f"Datei: {gguf_file}")
+    
+    # Offload-Ordner im Projektverzeichnis erstellen falls nicht vorhanden
+    if not os.path.exists(offload_folder):
+        os.makedirs(offload_folder)
+        logger.info(f"Erstelle Offload-Ordner: {offload_folder}")
+    else:
+        logger.info(f"Nutze vorhandenen Offload-Ordner: {offload_folder}")
+    
+    try:
+        # Tokenizer laden
+        logger.info("Lade Tokenizer...")
+        special_tokens_to_add = [f"<extra_id_{i}>" for i in range(100)]
+
+        # Der Tokenizer wird nun mit der Kenntnis über die speziellen Platzhalter initialisiert.
+        tokenizer = transformers.T5TokenizerFast.from_pretrained(
+            MADLAD400_MODEL_DIR,
+            extra_ids=0,  # Wird durch die Liste unten abgedeckt, zur Sicherheit auf 0.
+            additional_special_tokens=special_tokens_to_add
+        )
+        
+        # GPU VRAM prüfen (falls CUDA verfügbar)
+        available_vram_gb = 0
+        if device == "cuda" and torch.cuda.is_available():
+            available_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            logger.info(f"Verfügbares VRAM: {available_vram_gb:.2f} GB")
+        
+        # Modell-Ladestrategien basierend auf VRAM
+        if device == "cuda" and available_vram_gb > 0:
+            # Strategie für begrenzte VRAM (<=8 GB)
+            if available_vram_gb <= 8:
+                logger.warning(f"Begrenztes VRAM ({available_vram_gb:.2f} GB) erkannt!")
+                logger.info("Aktiviere CPU-Offloading + low_cpu_mem_usage...")
+                
+                # Modell mit maximalem CPU-Offloading laden
+                model = T5ForConditionalGeneration.from_pretrained(
+                    model_repo,
+                    gguf_file=gguf_file,
+                    device_map="auto",  # Automatische Verteilung GPU/CPU
+                    offload_folder=offload_folder,  # Disk-Offloading in madlad_weights
+                    offload_buffers=True,  # Buffer auch auslagern
+                    torch_dtype=torch.bfloat16,  # FP16 statt FP32 für VRAM-Einsparung
+                    low_cpu_mem_usage=True,  # Reduziert CPU-RAM-Spitzen beim Laden
+                    max_memory={
+                        0: f"{int(available_vram_gb * 0.75)}GB",  # 75% VRAM nutzen (4.5 GB bei 6 GB)
+                        "cpu": "30GB"  # CPU-RAM-Limit (System hat 64 GB)
+                    }
+                )
+                logger.info("CPU-Offloading aktiviert - Modell verteilt auf GPU/CPU/Disk")
+                
+            # Strategie für ausreichend VRAM (>8 GB)
+            else:
+                logger.info("Ausreichend VRAM vorhanden - Lade komplett auf GPU")
+                model = T5ForConditionalGeneration.from_pretrained(
+                    model_repo,
+                    gguf_file=gguf_file,
+                    device_map="auto",
+                    torch_dtype=torch.float32,  # FP32 für beste Qualität
+                    low_cpu_mem_usage=True
+                )
+        
+        # CPU-only Modus
+        else:
+            logger.info("Lade Modell auf CPU (keine CUDA-Geräte verfügbar)")
+            model = T5ForConditionalGeneration.from_pretrained(
+                model_repo,
+                gguf_file=gguf_file,
+                device_map="cpu",
+                torch_dtype=torch.float32,
+                low_cpu_mem_usage=True
+            )
+        
+        # Modell-Device-Verteilung loggen
+        if hasattr(model, "hf_device_map"):
+            logger.info(f"Device-Map: {model.hf_device_map}")
+        
+        logger.info("MADLAD-400 GGUF-Modell erfolgreich geladen")
+        
+        # GPU-Speicher-Statistik
+        if device == "cuda" and torch.cuda.is_available():
+            allocated_vram = torch.cuda.memory_allocated(0) / (1024**3)
+            reserved_vram = torch.cuda.memory_reserved(0) / (1024**3)
+            logger.info(f"VRAM verwendet: {allocated_vram:.2f} GB / Reserviert: {reserved_vram:.2f} GB")
+        
+        return model, tokenizer
+        
+    except Exception as e:
+        logger.error(f"Fehler beim Laden des GGUF-Modells: {e}")
+        logger.error("Mögliche Lösungen:")
+        logger.error("1. Prüfe ob safetensors installiert ist: pip install safetensors")
+        logger.error("2. Prüfe ob genug freier Festplattenspeicher im madlad_weights Ordner vorhanden ist")
+        logger.error("3. Reduziere max_memory['cpu'] auf 20GB")
+        logger.error("4. Nutze kleineres Modell: madlad400-3b-mt-Q4_K_M-GGUF")
+        raise
 
 def load_nllb200_translator_ct2(model_dir: str = "nllb-200-1.3B-bfloat16", device: str = "cuda") -> tuple[ctranslate2.Translator, PreTrainedTokenizerFast]:
     """
@@ -1330,11 +1456,11 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
             
             # VAD-Parameter für die Sprachsegmentierung definieren
             vad_params = {
-                    "threshold": 0.1,                      # Sensitiver für bessere Erkennung
+                    "threshold": 0.05,                      # Sensitiver für bessere Erkennung
                     "neg_threshold":0.08,
-                    "min_speech_duration_ms": 500,          # Kürzere Sprachsegmente erkennen
+                    "min_speech_duration_ms": 300,          # Kürzere Sprachsegmente erkennen
                     "max_speech_duration_s": 25,            # Begrenzung der max. Sprachdauer
-                    "min_silence_duration_ms": 150,        # Kürzere Pausen erlauben
+                    "min_silence_duration_ms": 100,        # Kürzere Pausen erlauben
                     "speech_pad_ms": 150,                    # Optimales Padding
                 }
             
@@ -2692,6 +2818,171 @@ def translate_segments_optimized_safe(
 
     return translation_output_file, cleaned_source_output_file, hypotheses_csv_path
 
+def translate_segments_optimized_safe_hf(
+    refined_transcription_path: str,
+    master_entity_map,  # Dict[int, Dict[str, EntityInfo]]
+    translation_output_file: str,
+    cleaned_source_output_file: str,
+    source_lang: str = "en",
+    target_lang: str = "de",
+    model_repo: str = "enacimie/madlad400-7b-mt-Q4_K_M-GGUF",
+    gguf_file: str = "madlad400-7b-mt-q4_k_m.gguf",
+    device: str = "cuda",
+    batch_size: int = 1,
+    num_hypotheses: int = 10,
+    offload_folder: str = "madlad_weights"
+) -> Tuple[str, str, str]:
+    """
+    Übersetzt Segmente mit MADLAD-400 GGUF-Modell (HF Transformers).
+    
+    Diese Funktion ist ein Drop-in-Ersatz für die CTranslate2-basierte
+    translate_segments_optimized_safe-Funktion, nutzt aber GGUF via HF Transformers.
+    
+    Args:
+        refined_transcription_path (str): Pfad zur veredelten Quell-CSV
+        master_entity_map: Entity-Mapping von refine_text_pipeline
+        translation_output_file (str): Zieldatei für Übersetzung
+        cleaned_source_output_file (str): Zieldatei für bereinigten Quelltext
+        source_lang (str): Quellsprache
+        target_lang (str): Zielsprache
+        model_repo (str): HuggingFace Repository des GGUF-Modells
+        gguf_file (str): Dateiname des GGUF-Modells
+        device (str): Zielgerät ("cuda" oder "cpu")
+        batch_size (int): Batch-Größe (empfohlen: 1 für VRAM-Beschränkungen)
+        num_hypotheses (int): Anzahl Übersetzungshypothesen
+    
+    Returns:
+        Tuple[str, str, str]: Pfade zu Übersetzung, bereinigtem Quelltext, Hypothesen-CSV
+    """
+
+    if os.path.exists(translation_output_file) and not ask_overwrite(translation_output_file):
+        logger.info(f"Verwende vorhandenen Übersetzungsbericht: {translation_output_file}")
+        return translation_output_file, cleaned_source_output_file, HYPOTHESES_CSV
+    else:
+        # Der Benutzer möchte überschreiben, also räumen wir auf.
+        logger.info(f"Benutzer hat dem Überschreiben von '{translation_output_file}' zugestimmt. Alte temporäre Dateien werden entfernt.")
+        if os.path.exists(cleaned_source_output_file): os.remove(cleaned_source_output_file)
+        if os.path.exists(translation_output_file): os.remove(translation_output_file)
+        if os.path.exists(HYPOTHESES_CSV): os.remove(HYPOTHESES_CSV)
+
+    should_continue_translation, processed_keys = handle_key_based_continuation(
+        translation_output_file, refined_transcription_path, key_column_index=0
+    )
+
+    # Zusätzliche Abfrage, falls die Datei vollständig ist
+    if not should_continue_translation:
+        logger.info("Übersetzung wird übersprungen, da die Zieldatei vollständig ist.")
+        return translation_output_file, cleaned_source_output_file, ""
+
+    df_source = pd.read_csv(refined_transcription_path, sep='|', dtype=str).fillna('')
+
+    segments_to_process = []
+    source_texts_for_similarity = []
+    
+    for i, row in df_source.iterrows():
+        if row['startzeit'] not in processed_keys:
+            entity_map_str = row.get('entity_map', '{}')
+            current_entity_map = _json_str_to_entity_map(entity_map_str)
+            # Der Text aus der Veredelungs-Pipeline enthält bereits die Platzhalter.
+            protected_text = row['text']
+            clean_source = restore_entities_final(protected_text, current_entity_map)
+            segments_to_process.append({
+                "id": i,
+                "startzeit": row['startzeit'],
+                "endzeit": row['endzeit'],
+                "original_text": row['text'],
+                "protected_text": protected_text,
+                "entity_mapping": current_entity_map,
+                "clean_source_text": clean_source
+            })
+            source_texts_for_similarity.append(clean_source)
+
+
+    if not segments_to_process:
+        logger.info("Keine Segmente zu übersetzen")
+        return translation_output_file, cleaned_source_output_file, "hypotheses_madlad_hf.csv"
+
+
+    logger.info(f"Übersetze {len(segments_to_process)} Segmente...")
+
+
+    # Übersetzung durchführen
+    all_translations = [] if not os.path.exists(translation_output_file) else pd.read_csv(translation_output_file, sep='|', dtype=str).to_dict('records')
+    all_cleaned_sources = [] if not os.path.exists(cleaned_source_output_file) else pd.read_csv(cleaned_source_output_file, sep='|', dtype=str).to_dict('records')
+
+    translate_start_time = time.time()
+
+    # Modell und Tokenizer laden
+    logger.info(f"Verwende MADLAD-400 GGUF via HF Transformers für die Übersetzung")
+    model, tokenizer = load_madlad400_translator_hf(
+        model_repo=model_repo,
+        gguf_file=gguf_file,
+        device=device,
+        offload_folder=offload_folder
+    )
+
+    for idx in tqdm(range(0, len(segments_to_process), batch_size), desc="Übersetze Batches"):
+        batch_data = segments_to_process[idx:idx + batch_size]
+        texts_to_translate = [item["protected_text"] for item in batch_data]
+        batch_source_texts = source_texts_for_similarity[idx:idx + batch_size]
+        
+        # Batch übersetzen
+        best_translations = translate_batch_madlad_hf(
+            texts=texts_to_translate,
+            model=model,
+            tokenizer=tokenizer,
+            target_lang=target_lang
+        )
+        
+        # Ergebnisse speichern
+        for j, translated_text in enumerate(best_translations):
+            segment_data = batch_data[j]
+            current_entity_map = segment_data.get("entity_mapping", {})
+            
+            if not current_entity_map:
+                logger.warning(f"Kein Mapping für Segment {segment_data['id']}")
+                current_entity_map = {}
+            
+            # Entity-Wiederherstellung
+            final_translated_text = restore_entities_final(translated_text, current_entity_map)
+            
+            logger.debug(f"Segment {segment_data['id']}: {len(current_entity_map)} Entities")
+            print(f"{segment_data['startzeit']} -- {segment_data['endzeit']}")
+            print(f"{final_translated_text}")
+            print(f"Entities: {len(current_entity_map)} gefunden")
+            
+            all_translations.append({
+                "startzeit": segment_data["startzeit"],
+                "endzeit": segment_data["endzeit"],
+                "text": sanitize_for_csv_and_tts(final_translated_text)
+            })
+            
+            all_cleaned_sources.append({
+                "startzeit": segment_data["startzeit"],
+                "endzeit": segment_data["endzeit"],
+                "text": sanitize_for_csv_and_tts(segment_data["original_text"])
+            })
+        
+        # Fortschritt speichern
+        save_progress_csv(all_translations, translation_output_file)
+        save_progress_csv(all_cleaned_sources, cleaned_source_output_file)
+
+
+    # Ressourcen freigeben
+    del model
+    del tokenizer
+    torch.cuda.empty_cache()
+
+
+    translate_end_time = time.time() - translate_start_time
+    logger.info(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden")
+    print("---------------------------------")
+    print("Übersetzung abgeschlossen!")
+    print("---------------------------------")
+    print(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden = {translate_end_time/60:.2f} Minuten")
+    
+    return translation_output_file, cleaned_source_output_file, translation_output_file
+
 def translate_batch_madlad(
     texts: List[str],
     translator: ctranslate2.Translator,
@@ -2744,7 +3035,7 @@ def translate_batch_madlad(
         return_scores=True
     )
 
-    # KORRIGIERTE STRUKTUR: Erstelle korrekte Datenstruktur für save_all_hypotheses_csv
+    # Erstelle korrekte Datenstruktur für save_all_hypotheses_csv
     all_hypotheses_for_csv = []
     provisional_translations = []
     
@@ -2795,6 +3086,143 @@ def translate_batch_madlad(
     
     logger.info(f"Multi-Hypothesis-Übersetzung abgeschlossen. {len(provisional_translations)} Segmente verarbeitet.")
     logger.info(f"Hypothesen gespeichert in: {hypotheses_csv_path}")
+    
+    return provisional_translations, hypotheses_csv_path
+
+def translate_batch_madlad_hf(
+    texts: List[str],
+    model: T5ForConditionalGeneration,
+    tokenizer: T5Tokenizer,
+    target_lang: str = "de",
+    num_hypotheses: int = 10,
+    source_texts: List[str] = None,
+    similarity_model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+    start_segment_id: int = 0
+) -> Tuple[List[str], str]:
+    """
+    Führt Batch-Übersetzung mit MADLAD-400 (GGUF via HF Transformers) durch.
+    
+    Generiert multiple Übersetzungshypothesen pro Segment und wählt die beste
+    basierend auf semantischer Ähnlichkeit zum Quelltext.
+    
+    Args:
+        texts (List[str]): Liste der zu übersetzenden Texte (mit Entity-Platzhaltern)
+        model (T5ForConditionalGeneration): Geladenes MADLAD-Modell
+        tokenizer (T5Tokenizer): Zugehöriger Tokenizer
+        target_lang (str): Zielsprache (z.B. "de" für Deutsch)
+        num_hypotheses (int): Anzahl der Übersetzungshypothesen pro Segment
+        source_texts (List[str]): Original-Quelltexte für Ähnlichkeitsprüfung
+        similarity_model_name (str): Modell für semantische Ähnlichkeitsprüfung
+        start_segment_id (int): Start-ID für Segmente (für Fortschrittsanzeige)
+    
+    Returns:
+        Tuple[List[str], str]: Beste Übersetzungen und Pfad zur Hypothesen-CSV
+    """
+    logger.info(f"Starte Multi-Hypothesis MADLAD-Übersetzung (HF Transformers)")
+    logger.info(f"Anzahl Hypothesen: {num_hypotheses} pro Segment")
+    
+    # Similarity-Modell laden (falls Quelltexte vorhanden)
+    similarity_model = None
+    if source_texts is not None:
+        logger.info(f"Lade Similarity-Modell: {similarity_model_name}")
+        similarity_model = SentenceTransformer(similarity_model_name)
+    
+    # Sprachpräfix hinzufügen
+    prefixed_texts = [f"<2{target_lang}> {txt}" for txt in texts]
+    
+    # Batch-Verarbeitung
+    all_hypotheses_for_csv = []
+    provisional_translations = []
+    
+    for idx, text in enumerate(tqdm(prefixed_texts, desc="Übersetze Segmente")):
+        segment_id = start_segment_id + idx
+        
+        # Tokenisierung
+        input_ids = tokenizer(
+            text,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512
+        ).input_ids.to(model.device)
+        
+        # Generierung mit Beam Search
+        outputs = model.generate(
+            input_ids,
+            max_length=512,
+            num_beams=max(10, num_hypotheses),
+            num_return_sequences=num_hypotheses,
+            early_stopping=True,
+            no_repeat_ngram_size=3,
+            length_penalty=0.01,
+            repetition_penalty=1.5,
+            do_sample=False  # Deterministisch für Beam Search
+        )
+
+
+        # Dekodierung der Hypothesen
+        # outputs ist ein Tensor mit Shape [num_hypotheses, sequence_length]
+        hypotheses_texts = [
+            tokenizer.decode(output, skip_special_tokens=True)
+            for output in outputs
+        ]
+
+
+        # Beste Hypothese auswählen (mit Similarity-Check falls verfügbar)
+        best_translation = hypotheses_texts[0]  # Default: erste Hypothese
+        best_similarity = 0.0
+
+
+        if similarity_model is not None and source_texts is not None:
+            source_text = source_texts[idx]
+            source_emb = similarity_model.encode(source_text, convert_to_tensor=True)
+            
+            for hyp_text in hypotheses_texts:
+                hyp_emb = similarity_model.encode(hyp_text, convert_to_tensor=True)
+                sim_score = cos_sim(source_emb, hyp_emb).item()
+                
+                if sim_score > best_similarity:
+                    best_similarity = sim_score
+                    best_translation = hyp_text
+
+
+        # Beste Übersetzung speichern
+        provisional_translations.append(best_translation)
+
+
+        # Erstelle Datenstruktur für save_all_hypotheses_csv
+        segment_data = {
+            "segment_id": segment_id,
+            "source_text": source_texts[idx] if source_texts and idx < len(source_texts) else texts[idx],
+            "hypotheses": []
+        }
+        
+        # Alle Hypothesen für dieses Segment speichern
+        for hyp_idx, hyp_text in enumerate(hypotheses_texts):
+            hypothesis_data = {
+                "hypothesis_id": hyp_idx,
+                "text": hyp_text,
+                "score": best_similarity if hyp_text == best_translation else 0.0
+            }
+            segment_data["hypotheses"].append(hypothesis_data)
+        
+        all_hypotheses_for_csv.append(segment_data)
+
+
+    # Hypothesen-CSV speichern (Kompatibel mit Original-Funktion)
+    hypotheses_csv_path = HYPOTHESES_CSV
+    try:
+        save_all_hypotheses_csv(all_hypotheses_for_csv, hypotheses_csv_path)
+        logger.info(f"Hypothesen gespeichert: {hypotheses_csv_path}")
+    except Exception as e:
+        logger.warning(f"Konnte Hypothesen-CSV nicht speichern: {e}")
+    
+    # Cleanup
+    if similarity_model is not None:
+        del similarity_model
+        torch.cuda.empty_cache()
+    
+    logger.info(f"Übersetzung abgeschlossen: {len(provisional_translations)} Segmente")
     
     return provisional_translations, hypotheses_csv_path
 
@@ -4075,6 +4503,8 @@ def calculate_max_chars_for_segment(duration_seconds: float) -> int:
 VOCABULARY_HINTS = {
     # Häufig problematische Wörter mit deutschen Übersetzungsoptionen
     "abomination": "Abscheulichkeit, Abscheu, Gräuel, Verabscheuung",
+    "straw man argument": "Strohmann-Argument, Scheinargument",
+    "heresy": "Ketzerei, Häresie",
     "blasphemy": "Blasphemie, Gotteslästerung",
     "Ark of the Covenant": "Bundeslade",
     "atrocity": "Grausamkeit, Gräueltat, Scheußlichkeit",
@@ -4101,6 +4531,12 @@ VOCABULARY_HINTS = {
     "unbearable": "unerträglich, nicht zu ertragen",
     "relentless": "unerbittlich, gnadenlos, unaufhörlich",
     "ruthless": "rücksichtslos, unbarmherzig, gnadenlos",
+    "mason": "Freimaurer",
+    "masonic": "freimaurerisch",
+    "illuminati": "Illuminaten",
+    "secret society": "Geheimgesellschaft",
+    "shadow government": "Schattenregierung",
+    "deep state": "Tiefer Staat",
     "merciless": "gnadenlos, erbarmungslos, unbarmherzig",
     "callous": "gefühllos, herzlos, abgestumpft",
     "indifferent": "gleichgültig, teilnahmslos, uninteressiert",
@@ -7082,7 +7518,7 @@ def text_to_speech_with_voice_cloning(
                             language="de",
                             gpt_cond_latent=gpt_cond_latent,
                             speaker_embedding=speaker_embedding,
-                            speed=1.0,
+                            speed=1.05,
                             temperature=0.75,
                             repetition_penalty=5.0,
                             top_k=55,
@@ -7655,12 +8091,13 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
 # ==============================================================================
 
 # Setzen Sie diese Flags, um Schritte gezielt zu überspringen
-EXECUTE_AUDIO_EXTRACTION =  False        # Schritt 1: Audio-Extraktion
-EXECUTE_TRANSCRIPTION =     False        # Schritte 2 & 3: Transkription und Veredelung
+EXECUTE_AUDIO_EXTRACTION =  True        # Schritt 1: Audio-Extraktion
+EXECUTE_TRANSCRIPTION =     True        # Schritte 2 & 3: Transkription und Veredelung
 EXECUTE_TRANSLATION =       True        # Schritt 4: Übersetzung & Hypothesen-Auswahl
+USE_GGUF =                  False        # Ob GGUF-optimierte Modelle verwendet werden sollen
 EXECUTE_CORRECTION =        True        # Schritt 5: Veredelung, Korrektur
-EXECUTE_POLISHING =         False        # Schritt 5.5: Systematisches Polishing
-EXECUTE_VEREDELUNG =        True        # Schritt 5.75: Finale Veredelung
+EXECUTE_POLISHING =         True       # Schritt 5.5: Systematisches Polishing
+EXECUTE_VEREDELUNG =        False        # Schritt 5.75: Finale Veredelung
 EXECUTE_TTS_FORMATTING =    True        # Schritt 6: TTS-Formatierung
 EXECUTE_TTS =               True        # Schritt 7: TTS-Synthese
 EXECUTE_VIDEO_ADJUSTMENT =  True        # Schritt 8: Video-Geschwindigkeitsanpassung
@@ -7746,17 +8183,25 @@ def main():
         if EXECUTE_TRANSLATION:
             # SCHRITT 3: ÜBERSETZUNG
             if os.path.exists(REFINED_TRANSCRIPTION_FILE) or ask_overwrite(REFINED_TRANSCRIPTION_FILE):
-                translate_segments_optimized_safe(
-                    refined_transcription_path=REFINED_TRANSCRIPTION_FILE,
-                    master_entity_map=master_entity_map_en,
-                    translation_output_file=TRANSLATION_FILE,
-                    cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
-                    source_lang=source_lang,
-                    target_lang=target_lang,
-                    src_lang=src_lang,
-                    tgt_lang=tgt_lang,
-                    num_hypotheses=10
-                )
+                if USE_GGUF:
+                    translate_segments_optimized_safe_hf(
+                        refined_transcription_path=REFINED_TRANSCRIPTION_FILE,
+                        master_entity_map=master_entity_map_en,
+                        translation_output_file=TRANSLATION_FILE,
+                        cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
+                        source_lang=source_lang,
+                        target_lang=target_lang
+                    )
+                else:
+                    translate_segments_optimized_safe(
+                        refined_transcription_path=REFINED_TRANSCRIPTION_FILE,
+                        master_entity_map=master_entity_map_en,
+                        translation_output_file=TRANSLATION_FILE,
+                        cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
+                        source_lang=source_lang,
+                        target_lang=target_lang,
+                        num_hypotheses=13
+                    )
             else:
                 logger.warning(f'Skipping Übersetzung: {REFINED_TRANSCRIPTION_FILE} nicht gefunden.')
 
@@ -7765,7 +8210,7 @@ def main():
 
             logger.info("Starte entkoppelten Schritt: Semantische Hypothesen-Auswahl...")
             select_best_hypotheses_post_translation(
-                hypotheses_csv_path=HYPOTHESES_CSV,
+                hypotheses_csv_path=HYPOTHESES_CSV or TRANSLATION_FILE,
                 translation_output_file=SEMANTIC_BEST_TRANSLATION_FILE,
                 report_output_path="hypothesis_selection_report.txt",
                 similarity_model_name=ST_QUALITY_MODEL
@@ -7782,11 +8227,11 @@ def main():
                 report_path=TRANSLATION_QUALITY_REPORT,
                 summary_path=TRANSLATION_QUALITY_SUMMARY,
                 model_name=ST_QUALITY_MODEL,
-                correction_model="gemma2:9b",
+                correction_model=QWEN3,
                 threshold=SIMILARITY_THRESHOLD_EVAL
             )
 
-            clear_spacy_cache_and_free_vram()
+            clear_spacy_cache_and_free_vram()   
             time.sleep(3)
 
         if EXECUTE_POLISHING:
