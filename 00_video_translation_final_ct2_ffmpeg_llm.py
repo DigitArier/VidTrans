@@ -170,6 +170,22 @@ def setup_global_torch_optimizations():
         torch.backends.cuda.enable_math_sdp(False)
         logger.info("Optimierte Attention-Backends (Flash Attention) aktiviert.") # Loggt die Aktivierung.
 
+        logger.info("Konfiguriere Ollama für RTX 4050...")
+        
+        # Erzwinge GPU-Nutzung für Ollama
+        os.environ["OLLAMA_GPU"] = "1"
+        os.environ["OLLAMA_FLASH_ATTENTION"] = "1"
+        os.environ["OLLAMA_KV_CACHE_TYPE"] = "f16"
+        os.environ["OLLAMA_NUM_GPU"] = "1"
+        os.environ["OLLAMA_MAX_VRAM"] = "5000"
+        
+        # RTX 4050 spezifische Optimierungen
+        os.environ["OLLAMA_CUDA_ARCH"] = "8.9"  # Ada Lovelace Architektur
+        os.environ["OLLAMA_CUDA_STREAMS"] = "4"  # Parallele CUDA-Streams
+        os.environ["OLLAMA_CUDA_MEMORY_FRACTION"] = "0.85"  # 85% des VRAM nutzen
+
+        logger.info("Ollama-GPU-Konfiguration für RTX 4050 aktiviert.")
+
         # Erlaubt PyTorch, den TensorFloat-32 (TF32) Datentyp auf Ampere-GPUs (wie der RTX 4050) für MatMul zu nutzen. Beschleunigt stark.
         torch.backends.cuda.matmul.allow_tf32 = True
         # Erlaubt der cuDNN-Bibliothek ebenfalls die Nutzung von TF32 für Convolution-Operationen.
@@ -545,6 +561,7 @@ def load_madlad400_translator_ct2(model_path: str = MADLAD400_MODEL_DIR, device:
     # Der Tokenizer wird nun mit der Kenntnis über die speziellen Platzhalter initialisiert.
     tokenizer = transformers.T5TokenizerFast.from_pretrained(
         model_path,
+        local_files_only=True,
         extra_ids=0,  # Wird durch die Liste unten abgedeckt, zur Sicherheit auf 0.
         additional_special_tokens=special_tokens_to_add
     )
@@ -599,7 +616,8 @@ def load_madlad400_translator_hf(
 
         # Der Tokenizer wird nun mit der Kenntnis über die speziellen Platzhalter initialisiert.
         tokenizer = transformers.T5TokenizerFast.from_pretrained(
-            MADLAD400_MODEL_DIR,
+            MADLAD400_MODEL_DIR, 
+            local_files_only=True,
             extra_ids=0,  # Wird durch die Liste unten abgedeckt, zur Sicherheit auf 0.
             additional_special_tokens=special_tokens_to_add
         )
@@ -620,6 +638,7 @@ def load_madlad400_translator_hf(
                 # Modell mit maximalem CPU-Offloading laden
                 model = T5ForConditionalGeneration.from_pretrained(
                     model_repo,
+                    local_files_only=True,
                     gguf_file=gguf_file,
                     device_map="auto",  # Automatische Verteilung GPU/CPU
                     offload_folder=offload_folder,  # Disk-Offloading in madlad_weights
@@ -638,6 +657,7 @@ def load_madlad400_translator_hf(
                 logger.info("Ausreichend VRAM vorhanden - Lade komplett auf GPU")
                 model = T5ForConditionalGeneration.from_pretrained(
                     model_repo,
+                    local_files_only=True,
                     gguf_file=gguf_file,
                     device_map="auto",
                     torch_dtype=torch.float32,  # FP32 für beste Qualität
@@ -649,6 +669,7 @@ def load_madlad400_translator_hf(
             logger.info("Lade Modell auf CPU (keine CUDA-Geräte verfügbar)")
             model = T5ForConditionalGeneration.from_pretrained(
                 model_repo,
+                local_files_only=True,
                 gguf_file=gguf_file,
                 device_map="cpu",
                 torch_dtype=torch.float32,
@@ -1318,6 +1339,42 @@ def _restore_placeholders(text: str, mapping: dict) -> str:
         text = text.replace(ph, original)
     return text
 
+def split_sentences_english(text: str) -> list[str]:
+    """
+    Abkürzungs-sichere Satzaufteilung für Englisch.
+    
+    Funktionsweise:
+    1. Schützt englische Abkürzungen (z.B. "Mr.", "e.g.", "Inc.") vor Splitting
+    2. Schützt Dezimalzahlen (z.B. "3.14", "19.99")
+    3. Teilt Text an Satzenden (.!?) gefolgt von Großbuchstaben
+    4. Stellt geschützte Elemente wieder her
+    
+    Args:
+        text: Zu teilender englischer Text
+        
+    Returns:
+        Liste von Sätzen (Strings)
+    """
+    
+    # Schritt 1: Schütze englische Abkürzungen
+    protected, map_abbr = _protect_placeholders(text, ENGLISH_ABBREVIATIONS, "ABBR")
+    
+    # Schritt 2: Schütze Zahlen mit Dezimalpunkt (z.B. 3.14, 19.99)
+    protected, map_num = _protect_placeholders(
+        protected,
+        set(re.findall(r"\b\d+\.\d+\b", protected)),
+        "NUM"
+    )
+    
+    # Schritt 3: Teile an Satzgrenzen (.!?) gefolgt von Whitespace und Großbuchstaben
+    # Berücksichtigt auch mehrere Satzzeichen (z.B. "What?!")
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z])", protected.strip())
+    
+    # Schritt 4: Platzhalter zurückwandeln (kombiniere beide Mappings)
+    combined_map = {**map_abbr, **map_num}
+    return [_restore_placeholders(s.strip(), combined_map)
+            for s in sentences if s.strip()]
+
 def split_sentences_german(text: str) -> list[str]:
     """Abkürzungs-sichere Satzaufteilung für Deutsch."""
     protected, map_abbr = _protect_placeholders(text, GERMAN_ABBREVIATIONS, "ABBR")
@@ -1456,12 +1513,12 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
             
             # VAD-Parameter für die Sprachsegmentierung definieren
             vad_params = {
-                    "threshold": 0.05,                      # Sensitiver für bessere Erkennung
-                    "neg_threshold":0.08,
-                    "min_speech_duration_ms": 300,          # Kürzere Sprachsegmente erkennen
-                    "max_speech_duration_s": 25,            # Begrenzung der max. Sprachdauer
-                    "min_silence_duration_ms": 100,        # Kürzere Pausen erlauben
-                    "speech_pad_ms": 150,                    # Optimales Padding
+                    "threshold": 0.02,                      # Sensitiver für bessere Erkennung
+                    #"neg_threshold":0.08,
+                    "min_speech_duration_ms": 0,          # Kürzere Sprachsegmente erkennen
+                    "max_speech_duration_s": 35,            # Begrenzung der max. Sprachdauer
+                    "min_silence_duration_ms": 0,        # Kürzere Pausen erlauben
+                    "speech_pad_ms": 300,                    # Optimales Padding
                 }
             
             segments_generator, info = pipeline.transcribe(
@@ -2440,7 +2497,12 @@ def start_ollama_server() -> Optional[subprocess.Popen]:
     if not shutil.which("ollama"):
         logger.error("Ollama-Befehl nicht im System-PATH gefunden. Bitte stellen Sie sicher, dass Ollama korrekt installiert ist.")
         return None
-
+    env = os.environ.copy()
+    env["OLLAMA_GPU"] = "1"  # Erzwingt GPU-Nutzung
+    env["OLLAMA_FLASH_ATTENTION"] = "1"  # Aktiviert Flash Attention für RTX 4050
+    env["OLLAMA_KV_CACHE_TYPE"] = "f16"  # FP16 für bessere Performance
+    env["OLLAMA_NUM_GPU"] = "1"  # Anzahl der zu nutzenden GPUs
+    
     command = ["ollama", "serve"]
     logger.info("Starte Ollama-Server...")
     
@@ -2449,7 +2511,8 @@ def start_ollama_server() -> Optional[subprocess.Popen]:
         process = subprocess.Popen(
             command,
             stdout=ollama_log,
-            stderr=subprocess.STDOUT
+            stderr=subprocess.STDOUT,
+            env=env
         )
 
     logger.info(f"Ollama-Server-Prozess gestartet (PID: {process.pid}). Warte auf Bereitschaft...")
@@ -2918,6 +2981,7 @@ def translate_segments_optimized_safe_hf(
         model_repo=model_repo,
         gguf_file=gguf_file,
         device=device,
+        local_files_only=True,
         offload_folder=offload_folder
     )
 
@@ -3125,7 +3189,7 @@ def translate_batch_madlad_hf(
     similarity_model = None
     if source_texts is not None:
         logger.info(f"Lade Similarity-Modell: {similarity_model_name}")
-        similarity_model = SentenceTransformer(similarity_model_name)
+        similarity_model = SentenceTransformer(similarity_model_name, device=device, local_files_only=True)
     
     # Sprachpräfix hinzufügen
     prefixed_texts = [f"<2{target_lang}> {txt}" for txt in texts]
@@ -3555,7 +3619,7 @@ OUTPUT FORMAT:
         try:
             logger.info(f"Lade Similarity-Modell: {similarity_model_name}")
             with gpu_context():
-                similarity_model = SentenceTransformer(similarity_model_name, device=device)
+                similarity_model = SentenceTransformer(similarity_model_name, device=device, local_files_only=True)
             logger.info("Similarity-Modell erfolgreich geladen.")
         except Exception as e:
             logger.error(f"Fehler beim Laden des Similarity-Modells: {e}")
@@ -3710,8 +3774,8 @@ def translate_batch_bloom(
     """
 
     logger.info(f"Lade BLOOM-Modell: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")  # GPU-Autozuweisung (RTX 4050)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", local_files_only=True)  # GPU-Autozuweisung (RTX 4050)
     model.eval()  # Inferenz-Modus für Geschwindigkeit
 
     translations = []
@@ -3781,8 +3845,8 @@ def translate_batch_dolphin(
     """
 
     logger.info(f"Lade Dolphin-Modell: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")  # GPU-Autozuweisung (RTX 4050)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", local_files_only=True)  # GPU-Autozuweisung (RTX 4050)
     model.eval()  # Inferenz-Modus für Geschwindigkeit
 
     # Deaktiviere SDPA und Flash Attention global für diesen Aufruf
@@ -3889,7 +3953,7 @@ def translate_batch_dolphin_ct2_local(
         else:
             raise
 
-    tokenizer = AutoTokenizer.from_pretrained("cognitivecomputations/dolphin-2.9-llama3-8b")  # Basis-Tokenizer (nicht konvertiert)
+    tokenizer = AutoTokenizer.from_pretrained("cognitivecomputations/dolphin-2.9-llama3-8b", local_files_only=True)  # Basis-Tokenizer (nicht konvertiert)
 
     translations = []
     for i in range(0, len(texts), batch_size):
@@ -3998,7 +4062,7 @@ def translate_batch_bloom_ct2_local(
         else:
             raise
 
-    tokenizer = AutoTokenizer.from_pretrained("bigscience/bloom")  # Basis-Tokenizer (nicht konvertiert)
+    tokenizer = AutoTokenizer.from_pretrained("bigscience/bloom", local_files_only=True)  # Basis-Tokenizer (nicht konvertiert)
 
     translations = []
     for i in range(0, len(texts), batch_size):
@@ -4107,7 +4171,7 @@ def translate_batch_openhermes_ct2_local(
         else:
             raise
 
-    tokenizer = AutoTokenizer.from_pretrained("NousResearch/Hermes-2-Pro-Mistral-7B")  # Basis-Tokenizer für OpenHermes-2.5 (basierend auf Mistral-7B)
+    tokenizer = AutoTokenizer.from_pretrained("NousResearch/Hermes-2-Pro-Mistral-7B", local_files_only=True)  # Basis-Tokenizer für OpenHermes-2.5 (basierend auf Mistral-7B)
 
     translations = []
     for i in range(0, len(texts), batch_size):
@@ -4383,7 +4447,7 @@ def select_best_hypotheses_post_translation(
     
     with gpu_context():
         logger.info(f"Lade Similarity-Modell: {similarity_model_name}")
-        similarity_model = SentenceTransformer(similarity_model_name, device=device)
+        similarity_model = SentenceTransformer(similarity_model_name, device=device, local_files_only=True)
 
         for seg_id, seg_data in tqdm(segments_with_hypotheses.items(), desc="Wähle beste Hypothesen"):
             source_text = seg_data['source_text']
@@ -4699,8 +4763,10 @@ def evaluate_translation_quality(
 
     try:
         # Daten laden
-        df_source = pd.read_csv(source_csv_path, sep='|', dtype=str).fillna('')
-        df_translated = pd.read_csv(translated_csv_path, sep='|', dtype=str).fillna('')
+        with tqdm(total=1, desc="📂 CSV-Dateien laden", bar_format='{l_bar}{bar}| {elapsed}') as pbar:
+            df_source = pd.read_csv(source_csv_path, sep='|', dtype=str).fillna('')
+            df_translated = pd.read_csv(translated_csv_path, sep='|', dtype=str).fillna('')
+            pbar.update(1)
 
         # Originalspaltennamen sichern
         original_source_columns = df_source.columns.tolist()
@@ -4722,10 +4788,25 @@ def evaluate_translation_quality(
 
         # KI-basierte Prüfung
         with gpu_context():
-            model = SentenceTransformer(model_name, device=device)
+            print(f"\n🤖 Lade Sentence Transformer: {model_name}")
+            print("   (Dies kann 5-30 Sekunden dauern...)")
+            with tqdm(total=1, desc="🔄 Modell initialisieren", bar_format='{l_bar}{bar}| {elapsed}') as pbar:
+                model = SentenceTransformer(model_name, device=device, local_files_only=True)
+                pbar.update(1)
+
+            print(f"\n📊 Berechne Embeddings für {len(source_texts)} Segmente...")
             embeddings_source = model.encode(source_texts, convert_to_tensor=True, show_progress_bar=True)
             embeddings_translated = model.encode(translated_texts, convert_to_tensor=True, show_progress_bar=True)
-            similarities = torch.diag(cos_sim(embeddings_source, embeddings_translated)).tolist()
+
+
+            print("\n🔍 Berechne semantische Ähnlichkeiten...")
+            with tqdm(total=1, desc="Similarity-Matrix", bar_format='{l_bar}{bar}| {elapsed}') as pbar:
+                similarities = torch.diag(cos_sim(embeddings_source, embeddings_translated)).tolist()
+                pbar.update(1)
+
+        model = model.to('cpu')
+        embeddings_source = embeddings_source.to('cpu')
+        torch.cuda.empty_cache()
 
         # Ergebnisse aufbereiten + Automatische Korrektur
         results = []
@@ -4741,6 +4822,11 @@ def evaluate_translation_quality(
         # Manuelle Initialisierung des tqdm-Fortschrittsbalkens.
         # Er wird nur die tatsächlichen Korrekturvorgänge zählen.
         correction_pbar = tqdm(total=segments_to_correct_count, desc="Korrektur markierter Segmente")
+
+        print("\n📖 Erstelle Vocabulary-Support...")
+        with tqdm(total=1, desc="VOCABULARY_HINTS formatieren", bar_format='{l_bar}{bar}| {elapsed}') as pbar:
+            vocabulary_support = create_vocabulary_support()
+            pbar.update(1)
 
         for i in range(len(df_source)):
             similarity = similarities[i]
@@ -4843,7 +4929,6 @@ def evaluate_translation_quality(
                         """
                         
                         # ✅ VOKABULAR-UNTERSTÜTZUNG HINZUFÜGEN
-                        vocabulary_support = create_vocabulary_support()
                         system_prompt += vocabulary_support
                         system_prompt += (
                             #f"\n\nCRITICAL CHARACTER LIMIT: "
@@ -4870,7 +4955,13 @@ def evaluate_translation_quality(
                             ],
                             options={
                                 'temperature': current_temperature,
-                                'num_ctx': 4096
+                                'num_ctx': 8192,
+                                'num_gpu': 33,  # Anzahl GPU-Layer für RTX 4050 (ca. 70% des Modells)
+                                'num_thread': 6,  # CPU-Threads für Restverarbeitung
+                                'main_gpu': 0,  # Primäre GPU (RTX 4050)
+                                'tensor_split': [1.0],  # GPU-Lastverteilung
+                                'use_mmap': True,  # Memory Mapping aktivieren
+                                'use_mlock': False,  # Nicht sperren, um Speicher zu sparen
                             },
                             think=False
                         )
@@ -5036,7 +5127,7 @@ def polish_all_translations(
     
     # Berechne Similarity für Skip-Logik
     with gpu_context():
-        model = SentenceTransformer(sp_model_name, device=device)
+        model = SentenceTransformer(sp_model_name, device=device, local_files_only=True)
         embeddings_source = model.encode(source_texts, convert_to_tensor=True, show_progress_bar=False)
         embeddings_translated = model.encode(translated_texts, convert_to_tensor=True, show_progress_bar=False)
         similarities = torch.diag(cos_sim(embeddings_source, embeddings_translated)).tolist()
@@ -5468,7 +5559,7 @@ def evaluate_translation_quality_llamacpp(
         # KI-basierte Prüfung
         logger.info(f"Lade Similarity-Modell: {model_name}")
         with torch.cuda.device(device) if device == "cuda" else torch.no_grad():
-            model = SentenceTransformer(model_name, device=device)
+            model = SentenceTransformer(model_name, device=device, local_files_only=True)
             
             embeddings_source = model.encode(source_texts, convert_to_tensor=True, show_progress_bar=True)
             embeddings_translated = model.encode(translated_texts, convert_to_tensor=True, show_progress_bar=True)
@@ -5493,6 +5584,7 @@ def evaluate_translation_quality_llamacpp(
                 repo_id="Liontix/Qwen3-8B-Gemini-2.5-Pro-Distill-GGUF",
                 filename=model_path,
                 local_dir="D:\Modelle\Translate\Qwen3-8B-Gemini-2.5-Pro-Distill-GGUF",
+                local_files_only=True,
                 n_ctx=4096,      # Kontext-Länge
                 n_gpu_layers=-1, # Alle Layer auf GPU (-1 = automatisch)
                 n_batch=512,     # Batch-Größe
@@ -5844,7 +5936,7 @@ def generate_semantic_embeddings(input_csv_path, output_npz_path, output_csv_pat
         # Sentence Transformer Modell laden
         with gpu_context():
             logger.info(f"Lade Sentence Transformer Modell: {model_name}")
-            st_model = SentenceTransformer(model_name, device=device)
+            st_model = SentenceTransformer(model_name, device=device, local_files_only=True)
 
             # Embeddings berechnen
             logger.info(f"Berechne Embeddings für {len(texts)} Segmente...")
@@ -6023,7 +6115,7 @@ def entity_protection_final(
     nlp_model,
     tokenizer: T5Tokenizer,
     custom_words: List[str] = [
-        "Datura", "Acid", "Langan", "Lobet", "lobet", "Danket", "preiset", "Glitch", "JFK", "MLK", "Anunnaki"
+        "Datura", "Acid", "Langan", "Lobet", "lobet", "Danket", "preiset", "Glitch", "JFK", "MLK", "Anunnaki", "Airtag", "AirTag", "Air tag", "air tag", "airtag"
         ]  # Optionale Liste benutzerdefinierter Wörter zum Schützen
 ) -> Tuple[str, Dict[str, EntityInfo]]:
     """
@@ -6186,7 +6278,8 @@ def refine_text_pipeline(
     spacy_model_name: str,
     lang_code: str,
     tokenizer_path: str,
-    min_words: int = 5  # Mindestwortanzahl pro Segment (verhindert zu kurze Fragmente)
+    min_words: int = 5,  # Mindestwortanzahl pro Segment (verhindert zu kurze Fragmente)
+    language: str = 'de'
 ) -> Tuple[str, Dict[int, Dict[str, EntityInfo]]]:
     """
     FINALE HOCHPERFORMANTE VERSION: Nutzt Batch-Verarbeitung und manuelle Parallelisierung
@@ -6202,6 +6295,7 @@ def refine_text_pipeline(
     lang_code: LanguageTool-Code (z. B. 'en-US')
     tokenizer_path: Pfad zum Tokenizer
     min_words: Mindestanzahl Wörter pro Segment (verhindert zu kurze Segmente)
+    language: Sprache für Satztrennung - 'de' für Deutsch, 'en' für Englisch
     
     Returns:
     Tuple[str, Dict]: Pfad zur Ausgabedatei und Entity-Map
@@ -6236,7 +6330,7 @@ def refine_text_pipeline(
         punctuation_model = PunctuationModel()
 
         # Lade den Tokenizer mit der sauberen Methode
-        tokenizer = transformers.T5Tokenizer.from_pretrained(tokenizer_path, legacy=False, extra_ids=100, additional_special_tokens=None)
+        tokenizer = transformers.T5Tokenizer.from_pretrained(tokenizer_path, legacy=False, extra_ids=100, additional_special_tokens=None, local_files_only=True)
 
         logger.info("Stufe 1/4: Interpunktion im Batch wiederherstellen...")
         punctuated_texts = [safe_punctuate(text, punctuation_model, logger) for text in tqdm(original_texts, desc="Interpunktion")]
@@ -6273,6 +6367,11 @@ def refine_text_pipeline(
 
         # Stufe 5: Ein-Satz-Splitting mit proportionalen Zeitstempeln, Entity-Übertragung und Mindestwort-Merge
         logger.info(f"Stufe 5/5: Teile Segmente in Ein-Satz-Segmente (mind. {min_words} Wörter) mit proportionalen Zeiten...")
+        logger.info(f"Verwende Satztrennung für Sprache: {language.upper()}")
+        
+        # Wähle die richtige Splitting-Funktion basierend auf der Sprache
+        split_function = split_sentences_german if language == 'de' else split_sentences_english
+        
         split_rows = []
         for idx, row in final_df.iterrows():
             # Hole Original-Zeiten und Entity-Map
@@ -6282,8 +6381,8 @@ def refine_text_pipeline(
             orig_text = row['text']
             orig_entity_map = _json_str_to_entity_map(row['entity_map'])
 
-            # Splitte in Sätze (verwende englische Variante von split_sentences_german)
-            sentences = split_sentences_german(orig_text)  # Annahme: Funktion arbeitet auch für Englisch
+            # Splitte in Sätze mit der gewählten Funktion (Deutsch oder Englisch)
+            sentences = split_function(orig_text)
 
             if len(sentences) == 0:
                 split_rows.append(row.to_dict())  # Leeres Segment: Behalte original
@@ -7518,11 +7617,11 @@ def text_to_speech_with_voice_cloning(
                             language="de",
                             gpt_cond_latent=gpt_cond_latent,
                             speaker_embedding=speaker_embedding,
-                            speed=1.05,
-                            temperature=0.75,
+                            speed=1.1,
+                            temperature=0.9,
                             repetition_penalty=5.0,
-                            top_k=55,
-                            top_p=0.85,
+                            top_k=60,
+                            top_p=0.9,
                             enable_text_splitting=False
                         )
 
@@ -7912,7 +8011,15 @@ def adjust_playback_speed(video_path, adjusted_video_path, speed_factor):
 
             (
                 ffmpeg
-                .input(video_path, hwaccel="cuda", hwaccel_output_format="cuda")
+                .input(
+                    video_path,
+                    hwaccel="cuda",
+                    hwaccel_output_format="cuda",
+                    **{
+                        'err_detect': 'ignore_err',      # Ignoriere Decoder-Warnungen
+                        'fflags': '+genpts+igndts',      # Generiere fehlende PTS/DTS
+                    }
+                )
                 .output(
                     temp_output,
                     vcodec="h264_nvenc",
@@ -7944,10 +8051,8 @@ def adjust_playback_speed(video_path, adjusted_video_path, speed_factor):
                     # FFmpeg 8.0: Optimierte Parameter
                     preset="p4",
                     tune="hq",
-                    **{
-                        "max_muxing_queue_size": "9999",  # FFmpeg 8.0: Größeres Queue-Limit
-                        "b:a": "192k"  # Audio-Bitrate
-                    }
+                    err_detect='ignore_err',
+                    fflags='+genpts+igndts'
                 )
                 .run(overwrite_output=True)
             )
@@ -8022,20 +8127,20 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
             f"[1:a]volume={VOLUME_ADJUSTMENT_44100}[a2];"
             "[a1][a2]amix=inputs=2:duration=longest:dropout_transition=2"  # FFmpeg 8.0: dropout_transition für sanfte Übergänge
         )
-
-        # Eingabe-Streams mit Hardware-Beschleunigung
-        video_path = ffmpeg.input(
-            adjusted_video_path,
-            hwaccel="cuda",
-            hwaccel_output_format="cuda"
-        )
-        audio_path = ffmpeg.input(
-            translated_audio_path
-        )
-
         with gpu_context():
-            logger.info("Kombiniere Video + Audio mit Hardware-Beschleunigung (CUDA)")
+            # Eingabe-Streams mit Hardware-Beschleunigung
+            video_path = ffmpeg.input(
+                adjusted_video_path,
+                hwaccel="cuda",
+                hwaccel_output_format="cuda",
+                err_detect='ignore_err',
+                fflags='+genpts+igndts'
+            )
+            audio_path = ffmpeg.input(
+                translated_audio_path
+            )
 
+            logger.info("Kombiniere Video + Audio mit Hardware-Beschleunigung (CUDA)")
             (
                 ffmpeg
                 .output(
@@ -8096,8 +8201,8 @@ EXECUTE_TRANSCRIPTION =     True        # Schritte 2 & 3: Transkription und Vere
 EXECUTE_TRANSLATION =       True        # Schritt 4: Übersetzung & Hypothesen-Auswahl
 USE_GGUF =                  False        # Ob GGUF-optimierte Modelle verwendet werden sollen
 EXECUTE_CORRECTION =        True        # Schritt 5: Veredelung, Korrektur
-EXECUTE_POLISHING =         True       # Schritt 5.5: Systematisches Polishing
-EXECUTE_VEREDELUNG =        False        # Schritt 5.75: Finale Veredelung
+EXECUTE_POLISHING =         False       # Schritt 5.5: Systematisches Polishing
+EXECUTE_VEREDELUNG =        True        # Schritt 5.75: Finale Veredelung
 EXECUTE_TTS_FORMATTING =    True        # Schritt 6: TTS-Formatierung
 EXECUTE_TTS =               True        # Schritt 7: TTS-Synthese
 EXECUTE_VIDEO_ADJUSTMENT =  True        # Schritt 8: Video-Geschwindigkeitsanpassung
@@ -8172,7 +8277,9 @@ def main():
                 output_file=REFINED_TRANSCRIPTION_FILE,
                 spacy_model_name="en_core_web_trf",
                 lang_code='en-US',
-                tokenizer_path="madlad400-3b-mt-int8_bfloat16"
+                tokenizer_path="madlad400-3b-mt-int8_bfloat16",
+                min_words=2,
+                language='en'
             )
             if not refined_transcription_path:
                 logger.error("Veredelung der Transkription fehlgeschlagen."); return
@@ -8200,7 +8307,7 @@ def main():
                         cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
                         source_lang=source_lang,
                         target_lang=target_lang,
-                        num_hypotheses=13
+                        num_hypotheses=5
                     )
             else:
                 logger.warning(f'Skipping Übersetzung: {REFINED_TRANSCRIPTION_FILE} nicht gefunden.')
@@ -8242,7 +8349,7 @@ def main():
                 translated_csv_path=CORRECTED_TRANSLATION_FILE,
                 output_csv_path=POLISHED_TRANSLATION_CSV,
                 sp_model_name=ST_POLISH_MODEL_DE,
-                llm_model_name="gemma2:9b",
+                llm_model_name=QWEN3,
                 skip_threshold=SIMILARITY_THRESHOLD_POLISHING
             )
         else:
@@ -8258,7 +8365,9 @@ def main():
                 output_file=REFINED_TRANSLATION_FILE,
                 spacy_model_name="de_dep_news_trf",
                 lang_code='de-DE',
-                tokenizer_path="madlad400-3b-mt-int8_bfloat16"
+                tokenizer_path="madlad400-3b-mt-int8_bfloat16",
+                min_words=20,
+                language='de'
             )
 
             clear_spacy_cache_and_free_vram()
@@ -8269,8 +8378,8 @@ def main():
             format_for_tts_splitting(
                 input_file=REFINED_TRANSLATION_FILE,
                 output_file=TTS_FORMATTED_TRANSLATION_FILE,
-                target_char_range=(130, 180),  # Optimale Länge: 150, Maximale Länge: 200
-                min_words_for_final_segment=3
+                target_char_range=(110, 150),  # Optimale Länge: 150, Maximale Länge: 200
+                min_words_for_final_segment=5
                 )
 
             clear_spacy_cache_and_free_vram()
