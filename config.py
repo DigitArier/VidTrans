@@ -1,17 +1,17 @@
 # Dateipfade
 from re import S
-AUDIO_PATH =        "1_can YOU handle this TRUTH_ (Documentary)_HD_(Vocals).wav"
-VIDEO_PATH =        "can YOU handle this TRUTH_ (Documentary)_HD.mp4"
-FINAL_VIDEO_PATH =  "can YOU handle this TRUTH_ (Documentary)_HD_deutsch.mp4"
+AUDIO_PATH =        "1_Population- 0_Full-HD_60fps_(Vocals).wav"
+VIDEO_PATH =        "Population- 0_Full-HD_60fps.mp4"
+FINAL_VIDEO_PATH =  "Population- 0_Full-HD_60fps_deutsch.mp4"
 ORIGINAL_AUDIO_PATH = "00_original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
-#SAMPLE_PATH_1 = "ich_sample-01.wav"
-#SAMPLE_PATH_2 = "ich_sample-02.wav"
-#SAMPLE_PATH_3 = "ich_sample-03.wav"
-SAMPLE_PATH_1 = "servant_sample-01-2.wav"
-SAMPLE_PATH_2 = "servant_sample-02-2.wav"
-SAMPLE_PATH_3 = "servant_sample-03-2.wav"
+SAMPLE_PATH_1 = "ich_sample-01.wav"
+SAMPLE_PATH_2 = "ich_sample-02.wav"
+SAMPLE_PATH_3 = "ich_sample-03.wav"
+#SAMPLE_PATH_1 = "servant_sample-01-2.wav"
+#SAMPLE_PATH_2 = "servant_sample-02-2.wav"
+#SAMPLE_PATH_3 = "servant_sample-03-2.wav"
 #SAMPLE_PATH_4 = "ich_sample-04.wav"
 #SAMPLE_PATH_5 = "papa_sample-05.wav"
 SPEECH_TIMESTAMPS = "speech_timestamps.json"
@@ -63,6 +63,7 @@ ITERATIONS_TRANSLATION = 3 # Durchläufe
 #Quality_Report
 TRANSLATION_QUALITY_REPORT = "04_translation_quality_report.csv"
 TRANSLATION_QUALITY_SUMMARY = "04_translation_quality_summary.txt"
+POLISHED_TRANSLATION_SUMMARY = "04b_polished_translation_summary.txt"
 CLEANED_SOURCE_FOR_QUALITY_CHECK = "04a_cleaned_source_for_quality_check.csv"
 EMBEDDINGS_FILE_NPZ = "08_german_text_embeddings.npz"
 TRANSLATION_WITH_EMBEDDINGS_CSV = "08_german_text_embeddings.csv"
@@ -104,7 +105,7 @@ CORRECTION_LLM_MODELS = {
     "qwen2.5": "qwen2.5:7b",
     "qwen3": "qwen3:8b"
 }
-SIMILARITY_THRESHOLD_EVAL = 0.78
+SIMILARITY_THRESHOLD_EVAL = 0.85
 SIMILARITY_THRESHOLD_POLISHING = 0.9
 # Standard-Modelle für verschiedene Aufgaben
 ST_QUALITY_MODEL = SENTENCE_TRANSFORMER_MODELS["quality_LaBSE"]

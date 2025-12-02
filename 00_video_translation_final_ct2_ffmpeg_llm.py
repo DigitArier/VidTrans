@@ -2638,7 +2638,7 @@ def translate_segments_optimized_safe(
     target_lang: str = "de",
     src_lang: str = "eng_Latn",
     tgt_lang: str = "deu_Latn",
-    batch_size: int = 1,
+    batch_size: int = 2,
     num_hypotheses: int = 10
 ) -> Tuple[str, str]:
     """
@@ -3089,7 +3089,7 @@ def translate_batch_madlad(
         source=tokenized_texts,
         batch_type="tokens",
         max_batch_size=1024,
-        beam_size=max(10, num_hypotheses),
+        beam_size=max(5, num_hypotheses),
         num_hypotheses=num_hypotheses,
         patience=1.0,
         length_penalty=0.01,
@@ -4558,7 +4558,7 @@ def calculate_max_chars_for_segment(duration_seconds: float) -> int:
     max_chars = int(duration_seconds * CPS_TARGET)
     
     # Begrenzung: Max 84 Zeichen (2 Zeilen à 42 Zeichen)
-    return min(max_chars, 84)
+    return max(max_chars, 20)
 
 # =================================================================
 # ERWEITERBARES VOKABULAR-UNTERSTÜTZUNGSSYSTEM
@@ -4742,7 +4742,7 @@ def evaluate_translation_quality(
     model_name,
     threshold,
     correction_model="gemma2:9b",
-    max_retries=5
+    max_retries=3
 ) -> Tuple[str, str]:
     """
     Prüft semantische Ähnlichkeit, korrigiert niedrige Segmente automatisch via Ollama
@@ -4859,7 +4859,7 @@ def evaluate_translation_quality(
                 max_chars = calculate_max_chars_for_segment(segment_duration)
 
                 # Definiert die Temperatur für jeden Versuch
-                temperatures = [0.6, 0.3, 0.4, 0.2]
+                temperatures = [0.4, 0.5, 0.6]
 
                 for attempt in range(max_retries):
                     try:
@@ -4955,7 +4955,7 @@ def evaluate_translation_quality(
                             ],
                             options={
                                 'temperature': current_temperature,
-                                'num_ctx': 8192,
+                                'num_ctx': 5120,  # Kontextgröße
                                 'num_gpu': 33,  # Anzahl GPU-Layer für RTX 4050 (ca. 70% des Modells)
                                 'num_thread': 6,  # CPU-Threads für Restverarbeitung
                                 'main_gpu': 0,  # Primäre GPU (RTX 4050)
@@ -5035,6 +5035,18 @@ def evaluate_translation_quality(
 
         # Detaillierten Bericht speichern
         df_report = pd.DataFrame(results)
+
+        # Ersetze doppelte Anführungszeichen durch einfache, um CSV-Konflikte zu vermeiden
+        def clean_text_for_output(text):
+            if not isinstance(text, str): 
+                return str(text)
+            return text.replace('"', "'")
+        
+        if 'Uebersetzung' in df_report.columns:
+            df_report['Uebersetzung'] = df_report['Uebersetzung'].apply(clean_text_for_output)
+        if 'Quelltext' in df_report.columns:
+            df_report['Quelltext'] = df_report['Quelltext'].apply(clean_text_for_output)
+
         df_report.to_csv(report_path, sep='|', index=False, encoding='utf-8')
         logger.info(f"Detaillierter Qualitätsbericht gespeichert: {report_path}")
 
@@ -5077,12 +5089,13 @@ def evaluate_translation_quality(
 
         # Speichere die korrigierte Übersetzung als CSV für refine_text_pipeline
         corrected_df = df_translated.copy()  # Kopiere Originalstruktur
-        corrected_df['text'] = [res['Uebersetzung'] for res in results]  # Aktualisiere Texte mit Korrekturen
+        cleaned_translations = [clean_text_for_output(res['Uebersetzung']) for res in results]
+        corrected_df['text'] = cleaned_translations
         corrected_translation_csv = CORRECTED_TRANSLATION_FILE
         corrected_df.to_csv(corrected_translation_csv, sep='|', index=False, encoding='utf-8')
         logger.info(f"Korrigierte Übersetzung als CSV gespeichert: {corrected_translation_csv}")
 
-        del correction_model
+        del model
         del model_name
 
         return report_path, corrected_translation_csv
@@ -5091,27 +5104,75 @@ def evaluate_translation_quality(
         logger.error(f"Fehler bei der Qualitätsprüfung der Übersetzung: {e}", exc_info=True)
         return None, None
 
+def save_polishing_summary(
+    polishing_results: List[Dict],
+    stats: Dict,
+    summary_path: str
+) -> str:
+    """
+    Erstellt Polishing-Zusammenfassung als TXT (analog evaluate_translation_quality).
+    
+    Returns:
+        str: summary_path
+    """
+    
+    # Similarity-Statistiken
+    similarities_before = [r['similarity_before'] for r in polishing_results]
+    similarities_after = [r['similarity_after'] for r in polishing_results]
+    avg_sim_before = sum(similarities_before) / len(similarities_before) if similarities_before else 0
+    avg_sim_after = sum(similarities_after) / len(similarities_after) if similarities_after else 0
+    
+    # Polierte Segmente extrahieren
+    polished_segments = [r for r in polishing_results if r['status'] == 'POLISHED']
+    
+    # ========== SUMMARY-TEXT (exakt wie evaluate_translation_quality) ==========
+    summary_content = (
+        f"Polishing der Übersetzung - Zusammenfassung\n"
+        f"====================================================\n"
+        f"Datum der Prüfung: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Quell-Segmente: {len(polishing_results)}\n"
+        f"Übersprungen (Ähnlichkeit > {stats['skip_threshold']}): {stats['skipped_count']}\n"
+        f"Poliert: {stats['polished_count']}\n"
+        f"Abgelehnt: {stats['rejected_count']}\n"
+        f"Unverändert: {stats['unchanged_count']}\n"
+        f"Durchschnittliche Ähnlichkeit (vorher): {avg_sim_before:.4f}\n"
+        f"Durchschnittliche Ähnlichkeit (nachher): {avg_sim_after:.4f}\n"
+        f"Verbesserung: {((avg_sim_after - avg_sim_before) / avg_sim_before * 100) if avg_sim_before > 0 else 0:.1f}%\n"
+        f"====================================================\n"
+        f"\nPolierte Segmente\n"
+        f"--------------------------------\n"
+    )
+    
+    if polished_segments:
+        for item in polished_segments:
+            summary_content += (
+                f"- Segment {item['index']}: {item['similarity_before']:.3f} -> {item['similarity_after']:.3f}\n"
+                f"  EN Original : {item['source_text']}\n"
+                f"  DE vorher   : {item['text_before']}\n"
+                f"  DE nachher  : {item['text_after']}\n\n"
+            )
+    else:
+        summary_content += "- (keine)\n"
+    
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(summary_content)
+    logger.info(f"Polishing-Zusammenfassung gespeichert: {summary_path}")
+    
+    return summary_path
+
 def polish_all_translations(
     source_csv_path: str,
     translated_csv_path: str,
     output_csv_path: str,
-    sp_model_name: str,
+    summary_path: str,
+    model_name: str,
     llm_model_name: str = "gemma2:9b",
     skip_threshold: float = None
-) -> str:
+) -> Tuple[str, str]:
     """
     Systematisches Polishing aller Übersetzungen für maximale Natürlichkeit.
     
-    Args:
-        source_csv_path: Original-Englisch CSV
-        translated_csv_path: MadLad400-Übersetzung CSV
-        output_csv_path: Polierte Ausgabe CSV
-        sp_model_name: SentenceTransformer-Modell für Similarity-Berechnung
-        llm_model_name: Ollama-Modell für Polishing
-        skip_threshold: Überspringe Segmente über diesem Similarity-Score
-        
-    Returns:
-        Pfad zur polierten CSV
+    Fokus: Semantische Treue + natürliche Kürze (ohne Hard-Limit).
     """
     logger.info("Starte systematisches Translation-Polishing für alle Segmente...")
     
@@ -5124,92 +5185,114 @@ def polish_all_translations(
     
     source_texts = df_source['text'].tolist()
     translated_texts = df_translated['text'].tolist()
+    total_segments = len(source_texts)
     
-    # Berechne Similarity für Skip-Logik
+    # ========== EMBEDDING + SIMILARITY ==========
     with gpu_context():
-        model = SentenceTransformer(sp_model_name, device=device, local_files_only=True)
-        embeddings_source = model.encode(source_texts, convert_to_tensor=True, show_progress_bar=False)
-        embeddings_translated = model.encode(translated_texts, convert_to_tensor=True, show_progress_bar=False)
-        similarities = torch.diag(cos_sim(embeddings_source, embeddings_translated)).tolist()
+        print(f"\n🤖 Lade Sentence Transformer: {model_name}")
+        print("   (Dies kann 5-30 Sekunden dauern...)")
+        with tqdm(total=1, desc="🔄 Modell initialisieren", bar_format='{l_bar}{bar}| {elapsed}') as pbar:
+            model = SentenceTransformer(model_name, device=device, local_files_only=True)
+            pbar.update(1)
+
+        print(f"\n📊 Berechne Embeddings für {total_segments} Segmente...")
+        embeddings_source = model.encode(source_texts, convert_to_tensor=True, show_progress_bar=True)
+        embeddings_translated = model.encode(translated_texts, convert_to_tensor=True, show_progress_bar=True)
+
+        print("\n🔍 Berechne semantische Ähnlichkeiten...")
+        with tqdm(total=1, desc="Similarity-Matrix", bar_format='{l_bar}{bar}| {elapsed}') as pbar:
+            similarities = torch.diag(cos_sim(embeddings_source, embeddings_translated)).tolist()
+            pbar.update(1)
+
+    model = model.to('cpu')
+    embeddings_source = embeddings_source.to('cpu')
+    torch.cuda.empty_cache()
     
+    # ========== POLISHING-LOOP ==========
     polished_texts = []
     skipped_count = 0
     polished_count = 0
     rejected_count = 0
     unchanged_count = 0
+    polishing_results = []
+    
+    print("\n📖 Erstelle Vocabulary-Support...")
+    with tqdm(total=1, desc="VOCABULARY_HINTS formatieren", bar_format='{l_bar}{bar}| {elapsed}') as pbar:
+        vocabulary_support = create_vocabulary_support()
+        pbar.update(1)
 
+    # ✅ HAUPTFORTSCHRITTSBALKEN für gesamten Prozess
+    pbar_main = tqdm(total=total_segments, desc="🎯 Polishing Gesamt", 
+                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]', 
+                    position=0)
 
-    # Erstelle manuellen Progress-Bar für bessere Kontrolle
-    pbar = tqdm(total=len(source_texts), desc="Polishing Translations")
-
-
-    for i in range(len(source_texts)):
+    for i in range(total_segments):
         similarity = similarities[i]
         
-        # Skip sehr hochqualitative Segmente
+        # ========== SKIP HOCHQUALITATIVE SEGMENTE ==========
         if similarity > skip_threshold:
             polished_texts.append(translated_texts[i])
             skipped_count += 1
-            pbar.update(1)
+            
+            polishing_results.append({
+                'index': i,
+                'status': 'SKIPPED',
+                'similarity_before': float(similarity),
+                'similarity_after': float(similarity),
+                'source_text': source_texts[i],
+                'text_before': translated_texts[i],
+                'text_after': translated_texts[i]
+            })
+
+            pbar_main.update(1)
             continue
         
-        # Berechne CPS-Limit
+        # ========== CPS-LIMIT BERECHNUNG (nur für Info) ==========
         segment_start = parse_time(df_source.iloc[i]['startzeit'])
         segment_end = parse_time(df_source.iloc[i]['endzeit'])
         segment_duration = segment_end - segment_start
         max_chars = calculate_max_chars_for_segment(segment_duration)
         
-        # Live-Ausgabe vor Polishing
-        tqdm.write(f"\\n{'='*80}")
+        # ========== LIVE-AUSGABE ==========
+        tqdm.write(f"\n{'='*80}")
         tqdm.write(f"🔧 Segment {i} wird poliert (Similarity: {similarity:.3f} < {skip_threshold})")
         tqdm.write(f"   Zeit: {df_source.iloc[i]['startzeit']} → {df_source.iloc[i]['endzeit']} (Dauer: {segment_duration:.1f}s)")
         tqdm.write(f"   Original (EN): '{source_texts[i]}'")
         tqdm.write(f"   MadLad (DE):   '{translated_texts[i]}' ({len(translated_texts[i])} Zeichen)")
-        tqdm.write(f"   Max. erlaubt:  {max_chars} Zeichen (CPS-Limit: 20 Zeichen/Sekunde)")
+        tqdm.write(f"   Info: Ideal ≤ {max_chars} Zeichen (CPS-Limit: 20 Zeichen/Sekunde)")
         tqdm.write(f"{'-'*80}")
         
-        # Polishing-System-Prompt (optimiert für Naturalness)
+        # ========== POLISHING SYSTEM-PROMPT (OHNE Hard-Limit) ==========
         polishing_system_prompt = (
-            "You are a professional German subtitle translator."
-            "Your task: Create natural, idiomatic German translations."
-
-
-            "RULES:"
-            "1. Match meaning exactly - no additions or omissions"
-            "2. Use natural German word order"
-            "3. Keep translations concise for subtitles"
-            "4. Never change numbers, names, or dates"
-            f"5. Character limit: {max_chars} characters (including spaces)"
-
-
+            "You are a professional German subtitle translator. "
+            "Your task: Create natural, idiomatic German translations that are as concise as possible.\n\n"
+            "RULES:\n"
+            "1. Match meaning exactly - no additions or omissions\n"
+            "2. Use natural German word order\n"
+            "3. Keep translations concise for subtitles - shorter is better\n"
+            "4. Never change numbers, names, or dates\n"
+            "5. Prefer shorter synonyms and remove filler words when possible\n\n"
             "OUTPUT: Only the German translation, no explanations."
         )
-
-
-        # ✅ VOKABULAR-UNTERSTÜTZUNG HINZUFÜGEN
-        vocabulary_support = create_vocabulary_support()
+        
+        # ✅ VOKABULAR-UNTERSTÜTZUNG
         polishing_system_prompt += vocabulary_support
-        polishing_system_prompt += (
-            f"\\n\\nCRITICAL CHARACTER LIMIT: "
-            f"The German translation MUST NOT exceed {max_chars} characters. "
-            f"Use shorter synonyms, remove filler words if needed."
-        )
         
         user_prompt = (
-            f"SOURCE (EN): {source_texts[i]}\\n"
-            f"MAX CHARACTERS: {max_chars}\\n"
-            f"CURRENT QUALITY SCORE: {similarity:.3f}"
+            f"SOURCE (EN): {source_texts[i]}\n"
+            f"CURRENT GERMAN: {translated_texts[i]}\n"
+            f"QUALITY SCORE: {similarity:.3f}\n"
+            f"\nMake the German translation shorter and more natural if possible."
         )
         
-        # ✅ 2 Versuche mit Temperaturen 0.3 und 0.4
-        temperatures = [0.3, 0.4]
+        # ========== 2 VERSUCHE MIT VERSCHIEDENEN TEMPERATUREN ==========
+        temperatures = [0.4, 0.6]
         best_polished = translated_texts[i]
         best_similarity = similarity
         original_similarity = similarity
         
         try:
             for attempt, temp in enumerate(temperatures, start=1):
-                # Zeige dass Ollama arbeitet
                 tqdm.write(f"   ⏳ Versuch {attempt}/{len(temperatures)}: Sende an Ollama ({llm_model_name}, Temp: {temp})...")
                 
                 response = ollama.chat(
@@ -5228,119 +5311,104 @@ def polish_all_translations(
                 polished = response['message']['content'].strip()
                 tqdm.write(f"   📝 Poliert (V{attempt}): '{polished}' ({len(polished)} Zeichen)")
 
-
-                # ✅ Berechne Similarity des polierten Texts
-                with gpu_context():
-                    polished_embedding = model.encode([polished], convert_to_tensor=True, show_progress_bar=False)
-                    polished_similarity = cos_sim(embeddings_source[i:i+1], polished_embedding).item()
+                # ✅ SIMILARITY-BERECHNUNG
+                polished_embedding = model.encode([polished], convert_to_tensor=True, show_progress_bar=False)
+                polished_similarity = cos_sim(embeddings_source[i:i+1], polished_embedding).item()
                 
                 tqdm.write(f"   📊 Similarity: Original={original_similarity:.3f}, Poliert={polished_similarity:.3f}, Δ={polished_similarity - original_similarity:.3f}")
                 
-                # ✅ Prüfe semantische Verschlechterung
+                # ✅ SEMANTISCHE VERSCHLECHTERUNG PRÜFEN
                 if polished_similarity < (original_similarity - 0.1):
-                    tqdm.write(f"   ❌ ABGELEHNT: Semantische Verschlechterung > -0.1 (Δ={polished_similarity - original_similarity:.3f})")
-                    continue  # Nächster Versuch
+                    tqdm.write(f"   ❌ ABGELEHNT: Semantische Verschlechterung > -0.1")
+                    continue
                 
-                # Wenn besser als bisheriger Best: Speichern
+                # Wenn besser: speichern
                 if polished_similarity > best_similarity:
                     best_similarity = polished_similarity
                     best_polished = polished
                     tqdm.write(f"   ✅ NEUE BESTE VERSION (Similarity: {best_similarity:.3f})")
 
-
-            # Nach allen Versuchen: Finale Entscheidung
+            # ========== FINALE ENTSCHEIDUNG ==========
             original_len = len(translated_texts[i])
             polished_len = len(best_polished)
 
-
-            # ✅ Prüfe zuerst ob semantisch verschlechtert (< -0.1)
+            # ❌ FALL: Semantisch verschlechtert
             if best_similarity < (original_similarity - 0.1):
-                tqdm.write(f"   ❌ ALLE VERSUCHE ABGELEHNT: Keine akzeptable Version gefunden (beste Δ={best_similarity - original_similarity:.3f})")
+                tqdm.write(f"   ❌ ALLE VERSUCHE ABGELEHNT: Keine akzeptable Version (beste Δ={best_similarity - original_similarity:.3f})")
                 tqdm.write(f"   → Behalte Original")
                 polished_texts.append(translated_texts[i])
                 rejected_count += 1
                 
-            # ✅ Wenn semantisch OK (≥ -0.1), dann prüfe Länge und Veränderung
+            # ✅ FALL: Text unverändert
+            elif best_polished == translated_texts[i]:
+                tqdm.write(f"   ✅ UNVERÄNDERT: Ollama bestätigt Original als optimal (Similarity: {best_similarity:.3f})")
+                polished_texts.append(translated_texts[i])
+                unchanged_count += 1
+                
+            # ✅ FALL: Text verändert - Länge egal, Kürze bevorzugt
             else:
-                # FALL A: Text unverändert (Ollama bestätigt Qualität)
-                if best_polished == translated_texts[i]:
-                    tqdm.write(f"   ✅ UNVERÄNDERT: Ollama bestätigt Original als optimal (Similarity: {best_similarity:.3f})")
-                    tqdm.write(f"   → Verwende Original (bereits beste Version)")
-                    polished_texts.append(translated_texts[i])
-                    unchanged_count += 1  # ✅ NEU: Separater Zähler
-
-
-                # FALL B: Text verändert - prüfe CPS-Limit
+                reduction = original_len - polished_len
+                reduction_pct = (reduction / original_len * 100) if original_len > 0 else 0
+                
+                if polished_len <= max_chars:
+                    tqdm.write(f"   ✨ PERFEKT! {reduction_pct:.1f}% kürzer ({polished_len} ≤ {max_chars})")
+                elif polished_len < original_len:
+                    tqdm.write(f"   ✅ ANGENOMMEN: {reduction_pct:.1f}% kürzer ({polished_len} Zeichen, ideal {max_chars})")
                 else:
-                    # FALL B1: Perfekt innerhalb Limit
-                    if polished_len <= max_chars:
-                        tqdm.write(f"   ✨ PERFEKT! Innerhalb Limit ({polished_len} ≤ {max_chars})")
-                        polished_texts.append(best_polished)
-                        polished_count += 1
-
-
-                    # FALL B2: Bis zu +10 Zeichen bei semantischer Verbesserung
-                    elif polished_len <= (max_chars + 10) and best_similarity > original_similarity:
-                        overage = polished_len - max_chars
-                        improvement = best_similarity - original_similarity
-                        
-                        tqdm.write(f"   ✅ TOLERIERT: +{overage} Zeichen über Limit, ABER Verbesserung (+{improvement:.3f})!")
-                        tqdm.write(f"   → Verwende polierte Version ({polished_len} ≤ {max_chars + 10})")
-                        polished_texts.append(best_polished)
-                        polished_count += 1
-
-
-                    # FALL B3: Zu lang, ABER kürzer als Original
-                    elif polished_len < original_len:
-                        reduction = original_len - polished_len
-                        reduction_pct = (reduction / original_len * 100)
-                        
-                        tqdm.write(f"   ⚠️  Noch {polished_len - max_chars} über Limit, ABER {reduction_pct:.1f}% kürzer!")
-                        tqdm.write(f"   → Verwende polierte Version (Kürzung!)")
-                        polished_texts.append(best_polished)
-                        polished_count += 1
-
-
-                    # FALL B4: Zu lang UND nicht kürzer
-                    else:
-                        increase = polished_len - original_len
-                        tqdm.write(f"   ❌ LÄNGENPROBLEM! Polished {increase:+d} Zeichen ({polished_len} vs {original_len})")
-                        tqdm.write(f"   → Behalte Original")
-                        polished_texts.append(translated_texts[i])
-                        rejected_count += 1
+                    tqdm.write(f"   ⚠️  LÄNGENPROBLEM: Nicht kürzer als Original ({polished_len} vs {original_len})")
+                    tqdm.write(f"   → Behalte Original")
+                    polished_texts.append(translated_texts[i])
+                    rejected_count += 1
+                    pbar_main.update(1)
+                    continue
+                
+                polished_texts.append(best_polished)
+                polished_count += 1
                 
         except Exception as e:
             tqdm.write(f"   ❌ FEHLER: {e}")
-            tqdm.write(f"   → Behalte Original-Übersetzung")
             logger.error(f"Polishing fehlgeschlagen für Segment {i}: {e}")
             polished_texts.append(translated_texts[i])
             rejected_count += 1
         
-        # Update Progress-Bar
-        pbar.update(1)
+        # ========== HAUPTFORTSCHRITT UPDATE ==========
+        pbar_main.update(1)
 
+    pbar_main.close()
 
-    # Schließe Progress-Bar
-    pbar.close()
-
-
-    
-    # Speichere polierte Version
+    # ========== SPEICHERN CSV ==========
     df_polished = df_translated.copy()
     df_polished['text'] = polished_texts
-    df_polished.to_csv(output_csv_path, sep='|', index=False)
-    del sp_model_name
-    del llm_model_name
+    df_polished.to_csv(output_csv_path, sep='|', index=False, encoding='utf-8')
+    logger.info(f"Polierte Übersetzung gespeichert: {output_csv_path}")
+
+    # ========== METRIKEN BERECHNEN (VOR SUMMARY) ==========
+    # ✅ Diese Variablen waren nicht definiert – jetzt explizit hier
+    similarities_before = [r['similarity_before'] for r in polishing_results]
+    similarities_after = [r['similarity_after'] for r in polishing_results]
+    avg_sim_before = sum(similarities_before) / len(similarities_before) if similarities_before else 0
+    avg_sim_after = sum(similarities_after) / len(similarities_after) if similarities_after else 0
+
+    # ========== SUMMARY ERSTELLEN ==========
+    if summary_path is None:
+        summary_path = POLISHED_TRANSLATION_SUMMARY
     
-    logger.info(
-        f"Polishing abgeschlossen. "
-        f"Übersprungen: {skipped_count}, "
-        f"Poliert: {polished_count}, "
-        f"Abgelehnt: {rejected_count}, "
-        f"Gesamt: {len(polished_texts)}. "
-        f"Gespeichert: {output_csv_path}"
-    )
-    return output_csv_path
+    summary_stats = {
+        'skipped_count': skipped_count,
+        'polished_count': polished_count,
+        'rejected_count': rejected_count,
+        'unchanged_count': unchanged_count,
+        'skip_threshold': skip_threshold
+    }
+    
+    save_polishing_summary(polishing_results, summary_stats, summary_path)
+
+    print(f"\nPolishing abgeschlossen. CSV: {output_csv_path}, Zusammenfassung: {summary_path}")
+    print(f"Übersprungen: {skipped_count}, Poliert: {polished_count}, Abgelehnt: {rejected_count}, Unverändert: {unchanged_count}")
+    print(f"Semantische Verbesserung: {((avg_sim_after - avg_sim_before) / avg_sim_before * 100) if avg_sim_before > 0 else 0:.1f}%")
+    print("-------------------------------------------")
+
+    return output_csv_path, summary_path
 
 def evaluate_translation_quality_llamacpp(
     source_csv_path: str,
@@ -6369,85 +6437,101 @@ def refine_text_pipeline(
         logger.info(f"Stufe 5/5: Teile Segmente in Ein-Satz-Segmente (mind. {min_words} Wörter) mit proportionalen Zeiten...")
         logger.info(f"Verwende Satztrennung für Sprache: {language.upper()}")
         
-        # Wähle die richtige Splitting-Funktion basierend auf der Sprache
-        split_function = split_sentences_german if language == 'de' else split_sentences_english
-        
-        split_rows = []
-        for idx, row in final_df.iterrows():
-            # Hole Original-Zeiten und Entity-Map
-            orig_start = parse_time(row['startzeit'])
-            orig_end = parse_time(row['endzeit'])
-            orig_duration = orig_end - orig_start
-            orig_text = row['text']
-            orig_entity_map = _json_str_to_entity_map(row['entity_map'])
-
-            # Splitte in Sätze mit der gewählten Funktion (Deutsch oder Englisch)
-            sentences = split_function(orig_text)
-
-            if len(sentences) == 0:
-                split_rows.append(row.to_dict())  # Leeres Segment: Behalte original
-                continue
-
-            # Proportionale Verteilung: Basierend auf Zeichenlänge
-            total_chars = sum(len(s) for s in sentences)
-            current_time = orig_start
-            temp_segments = []  # Temporäre Liste für Split-Segmente (vor Merge)
-            for j, sentence in enumerate(sentences):
-                sentence_chars = len(sentence)
-                proportion = sentence_chars / total_chars if total_chars > 0 else 1 / len(sentences)
-                sentence_duration = orig_duration * proportion
-                sentence_end = current_time + sentence_duration
-                if j == len(sentences) - 1:
-                    sentence_end = orig_end  # Letztes Segment: Exakt zum Original-Ende
-
-                # Entities auf neues Segment übertragen (relative Positionen anpassen)
-                new_entity_map = {}
-                for placeholder, entity_info in orig_entity_map.items():
-                    # Passe Start/End relativ zum neuen Satz an
-                    rel_start = max(0, entity_info.start - sum(len(s) for s in sentences[:j]))
-                    rel_end = rel_start + (entity_info.end - entity_info.start)
-                    if rel_start < len(sentence):  # Nur wenn Entity im neuen Satz liegt
-                        new_entity_map[placeholder] = EntityInfo(
-                            text=entity_info.text,
-                            label=entity_info.label,
-                            start=rel_start,
-                            end=rel_end,
-                            language=entity_info.language
-                        )
-
-                temp_segments.append({
-                    'startzeit': format_time(current_time),
-                    'endzeit': format_time(sentence_end),
-                    'text': sentence.strip(),
-                    'entity_map': _entity_map_to_json_str(new_entity_map)
-                })
-                current_time = sentence_end
-
-            # Post-Splitting-Merge: Kombiniere zu kurze Segmente (< min_words)
-            merged_segments = []
-            current_merged = None
-            for seg in temp_segments:
-                seg_text = seg['text']
-                seg_words = len(seg_text.split())  # Wortanzahl zählen
-                if current_merged is None:
-                    current_merged = seg.copy()  # Starte neuen Merge
-                else:
-                    if seg_words < min_words:  # Zu kurz: Merge mit aktuellem
-                        # Text und Entity-Map kombinieren
-                        current_merged['text'] += " " + seg_text
-                        current_merged['entity_map'] = _entity_map_to_json_str({**_json_str_to_entity_map(current_merged['entity_map']), **_json_str_to_entity_map(seg['entity_map'])})
-                        current_merged['endzeit'] = seg['endzeit']  # Endzeit aktualisieren
+        if language.lower() == 'de':
+            logger.info(f"Stufe 5/5: Teile Segmente in Ein-Satz-Segmente (mind. {min_words} Wörter) mit proportionalen Zeiten...")
+            logger.info(f"Verwende Satztrennung für Sprache: {language.upper()}")
+            
+            # Wähle die richtige Splitting-Funktion basierend auf der Sprache
+            split_function = split_sentences_german
+            
+            split_rows = []
+            
+            for idx, row in final_df.iterrows():
+                # Hole Original-Zeiten und Entity-Map
+                orig_start = parse_time(row['startzeit'])
+                orig_end = parse_time(row['endzeit'])
+                orig_duration = orig_end - orig_start
+                orig_text = row['text']
+                orig_entity_map = _json_str_to_entity_map(row['entity_map'])
+                
+                # Splitte in Sätze mit der gewählten Funktion
+                sentences = split_function(orig_text)
+                
+                if len(sentences) == 0:
+                    split_rows.append(row.to_dict())  # Leeres Segment: Behalte original
+                    continue
+                
+                # Proportionale Verteilung: Basierend auf Zeichenlänge
+                total_chars = sum(len(s) for s in sentences)
+                current_time = orig_start
+                temp_segments = []
+                
+                for j, sentence in enumerate(sentences):
+                    sentence_chars = len(sentence)
+                    proportion = sentence_chars / total_chars if total_chars > 0 else 1 / len(sentences)
+                    sentence_duration = orig_duration * proportion
+                    sentence_end = current_time + sentence_duration
+                    
+                    if j == len(sentences) - 1:
+                        sentence_end = orig_end
+                    
+                    # Entities auf neues Segment übertragen
+                    new_entity_map = {}
+                    for placeholder, entity_info in orig_entity_map.items():
+                        rel_start = max(0, entity_info.start - sum(len(s) for s in sentences[:j]))
+                        rel_end = rel_start + (entity_info.end - entity_info.start)
+                        if rel_start < len(sentence):
+                            new_entity_map[placeholder] = EntityInfo(
+                                text=entity_info.text,
+                                label=entity_info.label,
+                                start=rel_start,
+                                end=rel_end,
+                                language=entity_info.language
+                            )
+                    
+                    temp_segments.append({
+                        'startzeit': format_time(current_time),
+                        'endzeit': format_time(sentence_end),
+                        'text': sentence.strip(),
+                        'entity_map': _entity_map_to_json_str(new_entity_map)
+                    })
+                    current_time = sentence_end
+                
+                # Post-Splitting-Merge: Kombiniere zu kurze Segmente
+                merged_segments = []
+                current_merged = None
+                
+                for seg in temp_segments:
+                    seg_text = seg['text']
+                    seg_words = len(seg_text.split())
+                    
+                    if current_merged is None:
+                        current_merged = seg.copy()
                     else:
-                        merged_segments.append(current_merged)  # Speichere abgeschlossenen Merge
-                        current_merged = seg.copy()  # Starte neuen
+                        if seg_words < min_words:
+                            current_merged['text'] += " " + seg_text
+                            current_merged['entity_map'] = _entity_map_to_json_str({
+                                **_json_str_to_entity_map(current_merged['entity_map']),
+                                **_json_str_to_entity_map(seg['entity_map'])
+                            })
+                            current_merged['endzeit'] = seg['endzeit']
+                        else:
+                            merged_segments.append(current_merged)
+                            current_merged = seg.copy()
+                
+                if current_merged:
+                    merged_segments.append(current_merged)
+                
+                split_rows.extend(merged_segments)
+                logger.debug(f"Segment {idx} in {len(sentences)} Sätze gesplittet, nach Merge: {len(merged_segments)} Segmente")
+            
+            final_df = pd.DataFrame(split_rows)
+        
+        else:
+            # FÜR ENGLISCH (und andere Sprachen): Überspringen Sie das Splitting komplett
+            logger.info(f"Stufe 5/5: Überspringen Sie Ein-Satz-Splitting für Sprache: {language.upper()}")
+            logger.info("✓ Englische Texte behalten ihre Original-Segmentierung.")
 
-            if current_merged:  # Letzten Merge hinzufügen
-                merged_segments.append(current_merged)
-
-            split_rows.extend(merged_segments)  # Zu finaler Liste hinzufügen
-            logger.debug(f"Segment {idx} in {len(sentences)} Sätze gesplittet, nach Merge: {len(merged_segments)} Segmente (mind. {min_words} Wörter).")
-
-    final_df = pd.DataFrame(split_rows)
     final_df.to_csv(output_file, sep='|', index=False, encoding='utf-8')
 
     total_entities = sum(len(mapping) for mapping in master_entity_map.values())
@@ -7618,8 +7702,8 @@ def text_to_speech_with_voice_cloning(
                             gpt_cond_latent=gpt_cond_latent,
                             speaker_embedding=speaker_embedding,
                             speed=1.1,
-                            temperature=0.9,
-                            repetition_penalty=5.0,
+                            temperature=0.87,
+                            repetition_penalty=10.0,
                             top_k=60,
                             top_p=0.9,
                             enable_text_splitting=False
@@ -8201,7 +8285,7 @@ EXECUTE_TRANSCRIPTION =     True        # Schritte 2 & 3: Transkription und Vere
 EXECUTE_TRANSLATION =       True        # Schritt 4: Übersetzung & Hypothesen-Auswahl
 USE_GGUF =                  False        # Ob GGUF-optimierte Modelle verwendet werden sollen
 EXECUTE_CORRECTION =        True        # Schritt 5: Veredelung, Korrektur
-EXECUTE_POLISHING =         False       # Schritt 5.5: Systematisches Polishing
+EXECUTE_POLISHING =         True       # Schritt 5.5: Systematisches Polishing
 EXECUTE_VEREDELUNG =        True        # Schritt 5.75: Finale Veredelung
 EXECUTE_TTS_FORMATTING =    True        # Schritt 6: TTS-Formatierung
 EXECUTE_TTS =               True        # Schritt 7: TTS-Synthese
@@ -8278,7 +8362,7 @@ def main():
                 spacy_model_name="en_core_web_trf",
                 lang_code='en-US',
                 tokenizer_path="madlad400-3b-mt-int8_bfloat16",
-                min_words=2,
+                min_words=5,
                 language='en'
             )
             if not refined_transcription_path:
@@ -8307,7 +8391,8 @@ def main():
                         cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
                         source_lang=source_lang,
                         target_lang=target_lang,
-                        num_hypotheses=5
+                        num_hypotheses=2,
+                        batch_size=2
                     )
             else:
                 logger.warning(f'Skipping Übersetzung: {REFINED_TRANSCRIPTION_FILE} nicht gefunden.')
@@ -8348,7 +8433,8 @@ def main():
                 source_csv_path=CLEANED_SOURCE_FOR_QUALITY_CHECK,
                 translated_csv_path=CORRECTED_TRANSLATION_FILE,
                 output_csv_path=POLISHED_TRANSLATION_CSV,
-                sp_model_name=ST_POLISH_MODEL_DE,
+                summary_path=POLISHED_TRANSLATION_SUMMARY,
+                model_name=ST_POLISH_MODEL_DE,
                 llm_model_name=QWEN3,
                 skip_threshold=SIMILARITY_THRESHOLD_POLISHING
             )
@@ -8361,7 +8447,7 @@ def main():
         if EXECUTE_VEREDELUNG:
             # SCHRITT 5: VEREDELUNG DER DEUTSCHEN ÜBERSETZUNG
             refine_text_pipeline(
-                input_file=CORRECTED_TRANSLATION_FILE,
+                input_file=POLISHED_TRANSLATION_CSV or CORRECTED_TRANSLATION_FILE,
                 output_file=REFINED_TRANSLATION_FILE,
                 spacy_model_name="de_dep_news_trf",
                 lang_code='de-DE',
