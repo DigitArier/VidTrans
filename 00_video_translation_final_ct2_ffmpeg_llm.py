@@ -730,7 +730,7 @@ def load_xtts_v2():
     """
     # 1) Konfiguration lesen
     config = XttsConfig()
-    config.load_json("D:\\Modelle\\v203_\\config.json")
+    config.load_json("D:\\Modelle\\v203\\config.json")
     # 2) Modell initialisieren
     xtts_model = Xtts.init_from_config(
         config,
@@ -739,7 +739,7 @@ def load_xtts_v2():
     )
     xtts_model.load_checkpoint(
         config,
-        checkpoint_dir="D:\\Modelle\\v203_",  # Pfad anpassen
+        checkpoint_dir="D:\\Modelle\\v203",  # Pfad anpassen
         use_deepspeed=False
     )
     xtts_model.to(torch.device(0))
@@ -1534,7 +1534,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
                 
                 # === HALLUZINATIONS-REDUKTION ===
                 hallucination_silence_threshold=0.15,     # Frühe Erkennung
-                compression_ratio_threshold=2.3,           # Verschärft von 2.8
+                compression_ratio_threshold=2.5,           # Verschärft von 2.8
                 log_prob_threshold=-0.15,                  # Höhere Schwelle
                 no_speech_threshold=0.6,                   # Konservativer
                 
@@ -2981,7 +2981,6 @@ def translate_segments_optimized_safe_hf(
         model_repo=model_repo,
         gguf_file=gguf_file,
         device=device,
-        local_files_only=True,
         offload_folder=offload_folder
     )
 
@@ -3092,10 +3091,12 @@ def translate_batch_madlad(
         beam_size=max(5, num_hypotheses),
         num_hypotheses=num_hypotheses,
         patience=1.0,
-        length_penalty=0.01,
-        coverage_penalty=0,
-        repetition_penalty=1.5,
-        no_repeat_ngram_size=3,
+        length_penalty=1.0,
+        coverage_penalty=0.1,
+        repetition_penalty=1.2,
+        no_repeat_ngram_size=0,
+        max_decoding_length=512,
+        max_input_length=2048,
         return_scores=True
     )
 
@@ -4568,7 +4569,16 @@ VOCABULARY_HINTS = {
     # Häufig problematische Wörter mit deutschen Übersetzungsoptionen
     "abomination": "Abscheulichkeit, Abscheu, Gräuel, Verabscheuung",
     "straw man argument": "Strohmann-Argument, Scheinargument",
+    "mark of the beast": "Malzeichen des Tieres",
+    "the mark of the beast": "das Malzeichen des Tieres",
+    "janitor": "Hausmeister",
+    "janitors": "Hausmeister",
     "heresy": "Ketzerei, Häresie",
+    "km/h": "Kilometer pro Stunde",
+    "kph": "Kilometer pro Stunde",
+    "kmh": "Kilometer pro Stunde",
+    "m/s": "Meter pro Sekunde",
+    "mph": "Meilen pro Stunde",
     "blasphemy": "Blasphemie, Gotteslästerung",
     "Ark of the Covenant": "Bundeslade",
     "atrocity": "Grausamkeit, Gräueltat, Scheußlichkeit",
@@ -4710,7 +4720,6 @@ VOCABULARY_HINTS = {
     "preparatory": "vorbereitend, Vorbereitungs-",
     "introductory": "einführend, einleitend, Einführungs-",
     "St": "Sankt, Heiliger",
-    "mark of the beast": "Malzeichen des Tieres",
     "saw": "sahen, gesehen",
     "saw from": "sah von, gesehen von",
     "saw that": "sah dass, gesehen dass",
@@ -4955,7 +4964,7 @@ def evaluate_translation_quality(
                             ],
                             options={
                                 'temperature': current_temperature,
-                                'num_ctx': 5120,  # Kontextgröße
+                                'num_ctx': 4096,  # Kontextgröße
                                 'num_gpu': 33,  # Anzahl GPU-Layer für RTX 4050 (ca. 70% des Modells)
                                 'num_thread': 6,  # CPU-Threads für Restverarbeitung
                                 'main_gpu': 0,  # Primäre GPU (RTX 4050)
@@ -5407,6 +5416,9 @@ def polish_all_translations(
     print(f"Übersprungen: {skipped_count}, Poliert: {polished_count}, Abgelehnt: {rejected_count}, Unverändert: {unchanged_count}")
     print(f"Semantische Verbesserung: {((avg_sim_after - avg_sim_before) / avg_sim_before * 100) if avg_sim_before > 0 else 0:.1f}%")
     print("-------------------------------------------")
+
+    del model
+    del model_name
 
     return output_csv_path, summary_path
 
@@ -6343,31 +6355,37 @@ def ensure_context_closure(df: pd.DataFrame) -> pd.DataFrame:
 def refine_text_pipeline(
     input_file: str,
     output_file: str,
-    spacy_model_name: str,
+    model_name: str,
     lang_code: str,
     tokenizer_path: str,
-    min_words: int = 5,  # Mindestwortanzahl pro Segment (verhindert zu kurze Fragmente)
-    language: str = 'de'
+    min_words: int = 5,
+    language: str = 'de',
+    enable_grammar_correction: bool = True
 ) -> Tuple[str, Dict[int, Dict[str, EntityInfo]]]:
     """
     FINALE HOCHPERFORMANTE VERSION: Nutzt Batch-Verarbeitung und manuelle Parallelisierung
     für maximale Geschwindigkeit und respektiert die Benutzerentscheidung zum Überschreiben.
-    
     Integriert Ein-Satz-Splitting mit proportionalen Zeitstempeln und Entity-Übertragung.
     ERWEITERT: Post-Splitting-Merge, falls Segmente < min_words haben (z. B. 5 Wörter).
     
+    FIX: Grammatik-Korrektur (Stufe 3) ist nun steuerbar via 'enable_grammar_correction'.
+    FIX: Explizite VRAM-Bereinigung des PunctuationModels und spaCy-Modells am Ende.
+    
     Args:
-    input_file: Eingabedatei (CSV mit Transkription)
-    output_file: Ausgabedatei (veredelte CSV)
-    spacy_model_name: spaCy-Modell (z. B. "en_core_web_trf")
-    lang_code: LanguageTool-Code (z. B. 'en-US')
-    tokenizer_path: Pfad zum Tokenizer
-    min_words: Mindestanzahl Wörter pro Segment (verhindert zu kurze Segmente)
-    language: Sprache für Satztrennung - 'de' für Deutsch, 'en' für Englisch
+        input_file (str): Eingabe-CSV mit Textsegmenten
+        output_file (str): Ausgabe-CSV mit veredelten Texten
+        model_name (str): spaCy-Modellname (z.B. 'en_core_web_trf', 'de_dep_news_trf')
+        lang_code (str): Sprachcode (z.B. 'en-US', 'de-DE')
+        tokenizer_path (str): Pfad zum T5-Tokenizer
+        min_words (int): Mindestwortanzahl pro Segment nach Merging
+        language (str): Sprache ('en' oder 'de')
+        enable_grammar_correction (bool): Grammatikkorrektur aktivieren/deaktivieren
+                                          True für Transkriptionen, False für Übersetzungen
     
     Returns:
-    Tuple[str, Dict]: Pfad zur Ausgabedatei und Entity-Map
+        Tuple[str, Dict]: (output_file_path, entity_map_dict)
     """
+    
     if os.path.exists(output_file):
         if not ask_overwrite(output_file):
             logger.info(f"Versuche, veredelte Texte aus dem Cache zu laden: {output_file}")
@@ -6393,28 +6411,50 @@ def refine_text_pipeline(
     df = pd.read_csv(input_file, sep='|', dtype=str).fillna('')
     original_texts = df['text'].tolist()
 
-    with gpu_context():
-        nlp_model = get_spacy_model(spacy_model_name)
-        punctuation_model = PunctuationModel()
+    # Initialisierung der Modelle (Variablen vorab definieren für sicheren finally-Block)
+    nlp_model = None
+    punctuation_model = None
+    tokenizer = None
 
-        # Lade den Tokenizer mit der sauberen Methode
-        tokenizer = transformers.T5Tokenizer.from_pretrained(tokenizer_path, legacy=False, extra_ids=100, additional_special_tokens=None, local_files_only=True)
+    try:
+        with gpu_context():
+            # Modelle laden
+            nlp_model = get_spacy_model(model_name)
+            punctuation_model = PunctuationModel()
+            
+            # Lade den Tokenizer mit der sauberen Methode
+            tokenizer = transformers.T5Tokenizer.from_pretrained(
+                tokenizer_path, 
+                legacy=False, 
+                extra_ids=100, 
+                additional_special_tokens=None, 
+                local_files_only=True
+            )
 
-        logger.info("Stufe 1/4: Interpunktion im Batch wiederherstellen...")
-        punctuated_texts = [safe_punctuate(text, punctuation_model, logger) for text in tqdm(original_texts, desc="Interpunktion")]
+            logger.info("Stufe 1/4: Interpunktion im Batch wiederherstellen...")
+            punctuated_texts = [safe_punctuate(text, punctuation_model, logger) for text in tqdm(original_texts, desc="Interpunktion")]
 
-        logger.info("Stufe 2/4: Entitäten im Batch erkennen und schützen...")
-        docs = list(tqdm(nlp_model.pipe(punctuated_texts), total=len(punctuated_texts), desc="spaCy NER"))
-        protected_texts = []
-        master_entity_map = {}
-        for i, doc in enumerate(docs):
-            protected_text, entity_map = entity_protection_final(doc.text, nlp_model, tokenizer)
-            protected_texts.append(protected_text)
-            master_entity_map[i] = entity_map
+            logger.info("Stufe 2/4: Entitäten im Batch erkennen und schützen...")
+            docs = list(tqdm(nlp_model.pipe(punctuated_texts), total=len(punctuated_texts), desc="spaCy NER"))
 
-        # Stufe 3: Grammatikkorrektur im BATCH (CPU-parallelisiert)
-        logger.info("Stufe 3/4: Grammatik im Batch korrigieren (parallelisiert)...")
-        corrected_texts = correct_texts_in_parallel(protected_texts, lang_code, LT_PORT)
+            protected_texts = []
+            master_entity_map = {}
+
+            for i, doc in enumerate(docs):
+                protected_text, entity_map = entity_protection_final(doc.text, nlp_model, tokenizer)
+                protected_texts.append(protected_text)
+                master_entity_map[i] = entity_map
+
+        # --- STUFE 3: GRAMMATIKKORREKTUR (STEUERBAR) ---
+        logger.info(f"Stufe 3/4: Grammatik-Korrektur ist {'AKTIVIERT' if enable_grammar_correction else 'DEAKTIVIERT'}.")
+        
+        if enable_grammar_correction:
+            logger.info("Führe Grammatik-Korrektur durch (LanguageTool, parallelisiert)...")
+            corrected_texts = correct_texts_in_parallel(protected_texts, lang_code, LT_PORT)
+        else:
+            logger.info("Überspringe Grammatik-Korrektur (Schutz von Eigennamen und Stil bei Übersetzungen).")
+            corrected_texts = protected_texts
+        # -------------------------------------------------
 
         # Stufe 4: Entitäten wiederherstellen und Daten finalisieren
         logger.info("Stufe 4/4: Entitäten wiederherstellen und Daten finalisieren...")
@@ -6431,51 +6471,42 @@ def refine_text_pipeline(
         final_df = pd.DataFrame(processed_rows)
         final_df = ensure_context_closure(final_df)
         final_df['text'] = final_df['text'].apply(lambda x: (sanitize_for_csv_and_tts_preserve_placeholders(x)))
+        
+        # Erneute Nutzung des PunctuationModels (wichtig: muss noch existieren!)
         final_df['text'] = [safe_punctuate(text, punctuation_model, logger) for text in tqdm(final_df['text'], desc="Interpunktion")]
 
-        # Stufe 5: Ein-Satz-Splitting mit proportionalen Zeitstempeln, Entity-Übertragung und Mindestwort-Merge
+        # Stufe 5: Ein-Satz-Splitting
         logger.info(f"Stufe 5/5: Teile Segmente in Ein-Satz-Segmente (mind. {min_words} Wörter) mit proportionalen Zeiten...")
         logger.info(f"Verwende Satztrennung für Sprache: {language.upper()}")
-        
+
         if language.lower() == 'de':
-            logger.info(f"Stufe 5/5: Teile Segmente in Ein-Satz-Segmente (mind. {min_words} Wörter) mit proportionalen Zeiten...")
-            logger.info(f"Verwende Satztrennung für Sprache: {language.upper()}")
-            
-            # Wähle die richtige Splitting-Funktion basierend auf der Sprache
             split_function = split_sentences_german
-            
             split_rows = []
             
             for idx, row in final_df.iterrows():
-                # Hole Original-Zeiten und Entity-Map
                 orig_start = parse_time(row['startzeit'])
                 orig_end = parse_time(row['endzeit'])
                 orig_duration = orig_end - orig_start
                 orig_text = row['text']
                 orig_entity_map = _json_str_to_entity_map(row['entity_map'])
-                
-                # Splitte in Sätze mit der gewählten Funktion
+
                 sentences = split_function(orig_text)
-                
                 if len(sentences) == 0:
-                    split_rows.append(row.to_dict())  # Leeres Segment: Behalte original
+                    split_rows.append(row.to_dict())
                     continue
-                
-                # Proportionale Verteilung: Basierend auf Zeichenlänge
+
                 total_chars = sum(len(s) for s in sentences)
                 current_time = orig_start
                 temp_segments = []
-                
+
                 for j, sentence in enumerate(sentences):
                     sentence_chars = len(sentence)
                     proportion = sentence_chars / total_chars if total_chars > 0 else 1 / len(sentences)
                     sentence_duration = orig_duration * proportion
                     sentence_end = current_time + sentence_duration
-                    
                     if j == len(sentences) - 1:
                         sentence_end = orig_end
-                    
-                    # Entities auf neues Segment übertragen
+
                     new_entity_map = {}
                     for placeholder, entity_info in orig_entity_map.items():
                         rel_start = max(0, entity_info.start - sum(len(s) for s in sentences[:j]))
@@ -6496,15 +6527,12 @@ def refine_text_pipeline(
                         'entity_map': _entity_map_to_json_str(new_entity_map)
                     })
                     current_time = sentence_end
-                
-                # Post-Splitting-Merge: Kombiniere zu kurze Segmente
+
                 merged_segments = []
                 current_merged = None
-                
                 for seg in temp_segments:
                     seg_text = seg['text']
                     seg_words = len(seg_text.split())
-                    
                     if current_merged is None:
                         current_merged = seg.copy()
                     else:
@@ -6518,31 +6546,64 @@ def refine_text_pipeline(
                         else:
                             merged_segments.append(current_merged)
                             current_merged = seg.copy()
-                
                 if current_merged:
                     merged_segments.append(current_merged)
-                
+
                 split_rows.extend(merged_segments)
-                logger.debug(f"Segment {idx} in {len(sentences)} Sätze gesplittet, nach Merge: {len(merged_segments)} Segmente")
-            
+
             final_df = pd.DataFrame(split_rows)
-        
         else:
-            # FÜR ENGLISCH (und andere Sprachen): Überspringen Sie das Splitting komplett
             logger.info(f"Stufe 5/5: Überspringen Sie Ein-Satz-Splitting für Sprache: {language.upper()}")
             logger.info("✓ Englische Texte behalten ihre Original-Segmentierung.")
 
-    final_df.to_csv(output_file, sep='|', index=False, encoding='utf-8')
+        final_df.to_csv(output_file, sep='|', index=False, encoding='utf-8')
 
-    total_entities = sum(len(mapping) for mapping in master_entity_map.values())
-    logger.info(f"Hochperformante Text-Veredelung abgeschlossen. {total_entities} Entitäten verarbeitet.")
-    logger.info(f"Ergebnis in: {output_file}")
+        total_entities = sum(len(mapping) for mapping in master_entity_map.values())
+        logger.info(f"Hochperformante Text-Veredelung abgeschlossen. {total_entities} Entitäten verarbeitet.")
+        logger.info(f"Ergebnis in: {output_file}")
 
-    del nlp_model
-    del punctuation_model
-    del tokenizer
+        return output_file, master_entity_map
 
-    return output_file, master_entity_map
+    except Exception as e:
+        logger.error(f"Fehler in refine_text_pipeline: {e}", exc_info=True)
+        raise e
+
+    finally:
+        # --- Aggressive Bereinigung ---
+        logger.info("Starte aggressive Ressourcen-Freigabe in refine_text_pipeline...")
+        
+        # 1. PunctuationModel (Häufigste Ursache für VRAM-Leaks)
+        if 'punctuation_model' in locals() and punctuation_model is not None:
+            try:
+                # Versuche, das interne PyTorch-Modell auf die CPU zu schieben
+                if hasattr(punctuation_model, 'model'):
+                    logger.info("Verschiebe PunctuationModel auf CPU...")
+                    punctuation_model.model.to('cpu')
+                del punctuation_model
+            except Exception as e:
+                logger.warning(f"Fehler beim Bereinigen des PunctuationModels: {e}")
+        
+        # 2. Tokenizer (meist CPU, aber sicher ist sicher)
+        if 'tokenizer' in locals() and tokenizer is not None:
+            try:
+                del tokenizer
+            except Exception:
+                pass
+
+        # 3. spaCy Model (Referenz löschen, globaler Cache wird separat geleert)
+        if 'nlp_model' in locals() and nlp_model is not None:
+            try:
+                del nlp_model
+            except Exception:
+                pass
+
+        # 4. Garbage Collection und CUDA Cache
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()  # Hilft bei Shared Memory Fragmentierung
+        
+        logger.info("Lokale VRAM-Bereinigung in refine_text_pipeline abgeschlossen.")
 
 def refine_text_batch(batch: Dict[str, List], nlp_model, lt_tool, punctuation_model) -> Dict[str, List[str]]:
     """
@@ -6806,10 +6867,10 @@ def format_for_tts_splitting(
     for seg in final_segments:
         seg['startzeit'] = format_time(seg['startzeit'])
         seg['endzeit'] = format_time(seg['endzeit'])
-        # Stelle sicher, dass jeder Eintrag mit einem Satzzeichen endet
+        # ✅ GEÄNDERT: Entferne Punkte statt hinzuzufügen
         cleaned_text = seg['text'].strip()
-        if cleaned_text and not re.search(r'[.!?]$', cleaned_text):
-            cleaned_text += '.'
+        # Entferne alle abschließenden Punkte (., !, ?)
+        cleaned_text = re.sub(r'[.]+$', '...', cleaned_text).strip()
         seg['text'] = cleaned_text
 
     # Speichern des Ergebnisses
@@ -7597,11 +7658,12 @@ def text_to_speech_with_voice_cloning(
     sample_path_1,
     sample_path_2,
     sample_path_3,
-    #sample_path_4,
+    sample_path_4,
     #sample_path_5,
+    #sample_path_6,
     output_path,
     speaker_name=None
-):
+    ):
     """
     Optimiert Text-to-Speech mit Voice Cloning und verschiedenen Beschleunigungen.
 
@@ -7664,7 +7726,9 @@ def text_to_speech_with_voice_cloning(
                 sample_path_1,
                 sample_path_2,
                 sample_path_3,
-                #sample_path_4
+                sample_path_4,
+                #sample_path_5,
+                #sample_path_6
                 ]
             gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(
                 audio_path=sample_paths, gpt_cond_len=10, load_sr=22050, sound_norm_refs=False
@@ -7675,6 +7739,7 @@ def text_to_speech_with_voice_cloning(
             logger.info(f"TTS-Modell und Conditioning-Latents erfolgreich geladen...({sample_paths})")
             print(f"TTS-Modell und Conditioning-Latents erfolgreich geladen...({sample_paths})")
 
+            """
             # DeepSpeed Inferenz-Engine initialisieren
             print("🚀 DeepSpeed-Initialisierung...")
             ds_engine = deepspeed.init_inference(
@@ -7687,7 +7752,7 @@ def text_to_speech_with_voice_cloning(
             )
             optimized_tts_model = ds_engine.module
             logger.info("✅ DeepSpeed erfolgreich initialisiert")
-            
+            """
 
             # Erstelle einen dedizierten CUDA-Stream
             stream = create_cuda_stream()
@@ -7701,10 +7766,10 @@ def text_to_speech_with_voice_cloning(
                             language="de",
                             gpt_cond_latent=gpt_cond_latent,
                             speaker_embedding=speaker_embedding,
-                            speed=1.1,
+                            speed=1.05,
                             temperature=0.87,
                             repetition_penalty=10.0,
-                            top_k=60,
+                            top_k=55,
                             top_p=0.9,
                             enable_text_splitting=False
                         )
@@ -7747,7 +7812,6 @@ def text_to_speech_with_voice_cloning(
             
         except Exception as e:
             logger.critical(f"Ein schwerwiegender Fehler ist im TTS-Prozess aufgetreten: {e}", exc_info=True)
-        # Am Ende des `with gpu_context()`-Blocks wird der Speicher automatisch geleert.
 
 def create_conditioning_tensors_on_device(
     xtts_model, 
@@ -8280,10 +8344,10 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
 # ==============================================================================
 
 # Setzen Sie diese Flags, um Schritte gezielt zu überspringen
+USE_GGUF =                  False        # Ob GGUF-optimierte Modelle verwendet werden sollen
 EXECUTE_AUDIO_EXTRACTION =  True        # Schritt 1: Audio-Extraktion
 EXECUTE_TRANSCRIPTION =     True        # Schritte 2 & 3: Transkription und Veredelung
 EXECUTE_TRANSLATION =       True        # Schritt 4: Übersetzung & Hypothesen-Auswahl
-USE_GGUF =                  False        # Ob GGUF-optimierte Modelle verwendet werden sollen
 EXECUTE_CORRECTION =        True        # Schritt 5: Veredelung, Korrektur
 EXECUTE_POLISHING =         True       # Schritt 5.5: Systematisches Polishing
 EXECUTE_VEREDELUNG =        True        # Schritt 5.75: Finale Veredelung
@@ -8359,11 +8423,12 @@ def main():
             refined_transcription_path, master_entity_map_en = refine_text_pipeline(
                 input_file=TRANSCRIPTION_FILE,
                 output_file=REFINED_TRANSCRIPTION_FILE,
-                spacy_model_name="en_core_web_trf",
+                model_name="en_core_web_trf",
                 lang_code='en-US',
                 tokenizer_path="madlad400-3b-mt-int8_bfloat16",
                 min_words=5,
-                language='en'
+                language='en',
+                enable_grammar_correction=True
             )
             if not refined_transcription_path:
                 logger.error("Veredelung der Transkription fehlgeschlagen."); return
@@ -8391,8 +8456,8 @@ def main():
                         cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
                         source_lang=source_lang,
                         target_lang=target_lang,
-                        num_hypotheses=2,
-                        batch_size=2
+                        num_hypotheses=5,
+                        batch_size=1
                     )
             else:
                 logger.warning(f'Skipping Übersetzung: {REFINED_TRANSCRIPTION_FILE} nicht gefunden.')
@@ -8434,26 +8499,40 @@ def main():
                 translated_csv_path=CORRECTED_TRANSLATION_FILE,
                 output_csv_path=POLISHED_TRANSLATION_CSV,
                 summary_path=POLISHED_TRANSLATION_SUMMARY,
-                model_name=ST_POLISH_MODEL_DE,
+                model_name=ST_QUALITY_MODEL,
                 llm_model_name=QWEN3,
                 skip_threshold=SIMILARITY_THRESHOLD_POLISHING
             )
-        else:
-            logger.info(f'✓ Verwende vorhandene polierte Übersetzung: {POLISHED_TRANSLATION_CSV}')
 
             clear_spacy_cache_and_free_vram()
             time.sleep(3)
 
+        else:
+            logger.info(f'✓ Verwende vorhandene polierte Übersetzung: {POLISHED_TRANSLATION_CSV}')
+
+
+
         if EXECUTE_VEREDELUNG:
             # SCHRITT 5: VEREDELUNG DER DEUTSCHEN ÜBERSETZUNG
+            if os.path.exists(POLISHED_TRANSLATION_CSV):
+                veredelungs_input = POLISHED_TRANSLATION_CSV
+                logger.info(f"Veredelung: Nutze Polished-Datei '{veredelungs_input}'.")
+            elif os.path.exists(CORRECTED_TRANSLATION_FILE):
+                veredelungs_input = CORRECTED_TRANSLATION_FILE
+                logger.info(f"Veredelung: Polished-Datei fehlt, Fallback auf Corrected-Datei '{veredelungs_input}'.")
+            else:
+                logger.critical(f"Veredelung nicht möglich: Weder '{POLISHED_TRANSLATION_CSV}' noch '{CORRECTED_TRANSLATION_FILE}' gefunden.")
+                return
+
             refine_text_pipeline(
-                input_file=POLISHED_TRANSLATION_CSV or CORRECTED_TRANSLATION_FILE,
+                input_file=veredelungs_input,
                 output_file=REFINED_TRANSLATION_FILE,
-                spacy_model_name="de_dep_news_trf",
+                model_name="de_dep_news_trf",
                 lang_code='de-DE',
                 tokenizer_path="madlad400-3b-mt-int8_bfloat16",
                 min_words=20,
-                language='de'
+                language='de',
+                enable_grammar_correction=False
             )
 
             clear_spacy_cache_and_free_vram()
@@ -8464,7 +8543,7 @@ def main():
             format_for_tts_splitting(
                 input_file=REFINED_TRANSLATION_FILE,
                 output_file=TTS_FORMATTED_TRANSLATION_FILE,
-                target_char_range=(110, 150),  # Optimale Länge: 150, Maximale Länge: 200
+                target_char_range=(110, 150),
                 min_words_for_final_segment=5
                 )
 
@@ -8477,7 +8556,9 @@ def main():
                 SAMPLE_PATH_1,
                 SAMPLE_PATH_2,
                 SAMPLE_PATH_3,
-                #SAMPLE_PATH_4,
+                SAMPLE_PATH_4,
+                #SAMPLE_PATH_5,
+                #SAMPLE_PATH_6,
                 TRANSLATED_AUDIO_WITH_PAUSES
             )
 
