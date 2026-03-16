@@ -1,19 +1,39 @@
 # Dateipfade
-from re import S
-AUDIO_PATH =        "1_Population- 0_Full-HD_60fps_(Vocals).wav"
-VIDEO_PATH =        "Population- 0_Full-HD_60fps.mp4"
-FINAL_VIDEO_PATH =  "Population- 0_Full-HD_60fps_deutsch.mp4"
+AUDIO_PATH =        "2_When God Is About to Give You Something Big, You Will SEE These 7 Signs!_HD_(Vocals).wav"
+VIDEO_PATH =        "When God Is About to Give You Something Big, You Will SEE These 7 Signs!_HD.mp4"
+FINAL_VIDEO_PATH =  "When God Is About to Give You Something Big, You Will SEE These 7 Signs!_HD_deutsch_.mp4"
 ORIGINAL_AUDIO_PATH = "00_original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
 SAMPLE_PATH_1 = "ich_sample-01.wav"
 SAMPLE_PATH_2 = "ich_sample-02.wav"
 SAMPLE_PATH_3 = "ich_sample-03.wav"
-#SAMPLE_PATH_1 = "servant_sample-01-2.wav"
-#SAMPLE_PATH_2 = "servant_sample-02-2.wav"
-#SAMPLE_PATH_3 = "servant_sample-03-2.wav"
-#SAMPLE_PATH_4 = "ich_sample-04.wav"
-#SAMPLE_PATH_5 = "papa_sample-05.wav"
+SAMPLE_PATH_4 = "ich_sample-04.wav"
+#SAMPLE_PATH_5 = "ich_sample-05.wav"
+#SAMPLE_PATH_6 = "ich_sample-06.wav"
+#SAMPLE_PATH_1 = "servant_sample-01.wav"
+#SAMPLE_PATH_2 = "servant_sample-02.wav"
+#SAMPLE_PATH_3 = "servant_sample-03.wav"
+#SAMPLE_PATH_4 = "servant_sample-04.wav"
+
+# ─── Qwen3-TTS Konfiguration ──────────────────────────────────────────────────
+
+# Modell-ID für Voice Cloning (3-Sek.-Referenz-Cloning)
+# VRAM-Schätzung: ~3.5 GB in bfloat16 — sicher für RTX 4050 Mobile (6 GB VRAM)
+QWEN3_TTS_CLONE_MODEL_ID: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+
+# Fallback: kleineres Modell (~1.5 GB VRAM), geringere Qualität
+QWEN3_TTS_CLONE_MODEL_ID_SMALL: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+
+# Zielsprache für TTS-Synthese (Qwen3-TTS-konformer Bezeichner)
+QWEN3_TTS_TARGET_LANGUAGE: str = "German"
+
+# Ausgabe-Samplerate von Qwen3-TTS (fest 24 kHz)
+QWEN3_TTS_SAMPLE_RATE: int = 24_000
+
+# Maximale Anzahl an Tokens pro Syntheseaufruf
+QWEN3_TTS_MAX_NEW_TOKENS: int = 2048
+
 SPEECH_TIMESTAMPS = "speech_timestamps.json"
 DOWNSAMPLED_AUDIO_PATH = "downsampled_audio.wav"
 ONLY_SPEECH = "only_speech.wav"
@@ -105,11 +125,11 @@ CORRECTION_LLM_MODELS = {
     "qwen2.5": "qwen2.5:7b",
     "qwen3": "qwen3:8b"
 }
-SIMILARITY_THRESHOLD_EVAL = 0.85
+SIMILARITY_THRESHOLD_EVAL = 0.95
 SIMILARITY_THRESHOLD_POLISHING = 0.9
 # Standard-Modelle für verschiedene Aufgaben
-ST_QUALITY_MODEL = SENTENCE_TRANSFORMER_MODELS["quality_LaBSE"]
-ST_POLISH_MODEL_DE = SENTENCE_TRANSFORMER_MODELS["quality"]
+ST_QUALITY_MODEL = SENTENCE_TRANSFORMER_MODELS["quality"]
+ST_POLISH_MODEL_DE = SENTENCE_TRANSFORMER_MODELS["quality_LaBSE"]
 ST_MINI_MODEL = SENTENCE_TRANSFORMER_MODELS["mini"]
 GEMMA= CORRECTION_LLM_MODELS["gemma"]
 QWEN2_5= CORRECTION_LLM_MODELS["qwen2.5"]

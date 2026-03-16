@@ -105,9 +105,10 @@ from transformers import (
 import transformers
 import ctranslate2
 from ctranslate2 import Translator, models
-from TTS.tts.configs.xtts_config import XttsConfig
-from TTS.tts.models.xtts import Xtts
-from TTS.api import TTS
+#from TTS.tts.configs.xtts_config import XttsConfig
+#from TTS.tts.models.xtts import Xtts
+#from TTS.api import TTS
+from qwen_tts import Qwen3TTSModel
 #import whisper
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from pydub.effects import(
@@ -724,28 +725,84 @@ def load_nllb200_translator_ct2(model_dir: str = "nllb-200-1.3B-bfloat16", devic
     tokenizer.src_lang = src_lang  # global definierte Variable
     return translator, tokenizer
 
-def load_xtts_v2():
-    """
-    Lädt Xtts v2 und konfiguriert DeepSpeed-Inferenz.
-    """
-    # 1) Konfiguration lesen
-    config = XttsConfig()
-    config.load_json("D:\\Modelle\\v203\\config.json")
-    # 2) Modell initialisieren
-    xtts_model = Xtts.init_from_config(
-        config,
-        vocoder_path=vocoder_pth,
-        vocoder_config_path=vocoder_cfg
-    )
-    xtts_model.load_checkpoint(
-        config,
-        checkpoint_dir="D:\\Modelle\\v203",  # Pfad anpassen
-        use_deepspeed=False
-    )
-    xtts_model.to(torch.device(0))
-    xtts_model.eval()
+#def load_xtts_v2():
+#    """
+#    Lädt Xtts v2 und konfiguriert DeepSpeed-Inferenz.
+#    """
+#    # 1) Konfiguration lesen
+#    config = XttsConfig()
+#    config.load_json("D:\\Modelle\\v203\\config.json")
+#    # 2) Modell initialisieren
+#    xtts_model = Xtts.init_from_config(
+#        config,
+#        vocoder_path=vocoder_pth,
+#        vocoder_config_path=vocoder_cfg
+#    )
+#    xtts_model.load_checkpoint(
+#        config,
+#        checkpoint_dir="D:\\Modelle\\v203",  # Pfad anpassen
+#        use_deepspeed=False
+#    )
+#    xtts_model.to(torch.device(0))
+#    xtts_model.eval()
+#
+#    return xtts_model
 
-    return xtts_model
+def load_qwen3_tts(
+    model_id: str = QWEN3_TTS_CLONE_MODEL_ID,
+) -> Qwen3TTSModel:
+    """Lädt das Qwen3-TTS-Base-Modell für Voice Cloning.
+
+    VRAM-Schätzung: ~3.5 GB in bfloat16 (1.7B-Modell).
+    Fallback auf bfloat16 wenn flash_attention_2 nicht verfügbar.
+
+    Args:
+        model_id: HuggingFace-Modell-ID oder lokaler Pfad.
+
+    Returns:
+        Geladenes Qwen3TTSModel-Objekt, bereit für Inferenz.
+
+    Raises:
+        RuntimeError: Wenn das Modell nicht geladen werden kann.
+    """
+    logger.info(f"Lade Qwen3-TTS-Modell: {model_id}")
+    logger.info("VRAM-Schätzung: ~3.5 GB (bfloat16) — RTX 4050 Mobile sicher.")
+
+    # Sicherheits-Cleanup vor Modell-Ladung
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # Flash Attention 2 auf Windows nur bei verfügbarem Wheel
+    try:
+        import flash_attn  # noqa: F401 — Nur Verfügbarkeit prüfen
+        attn_impl = "flash_attention_2"
+        logger.info("Flash Attention 2 verfügbar — wird aktiviert.")
+    except ImportError:
+        attn_impl = "sdpa"
+        logger.warning(
+            "flash-attn nicht installiert — Fallback auf sdpa. "
+            "Für bessere Performance: pip install flash-attn --no-build-isolation"
+        )
+
+    try:
+        model = Qwen3TTSModel.from_pretrained(
+            model_id,
+            device_map="cuda:0",   # RTX 4050 Mobile
+            dtype=torch.bfloat16,  # ~3.5 GB VRAM
+            attn_implementation=attn_impl,
+        )
+        logger.info(f"Qwen3-TTS-Modell erfolgreich geladen: {model_id}")
+        return model
+    except RuntimeError as e:
+        logger.error(f"GPU-Ladung fehlgeschlagen, versuche CPU-Offloading: {e}")
+        # CPU-Fallback: device_map="auto" verteilt Layer automatisch
+        model = Qwen3TTSModel.from_pretrained(
+            model_id,
+            device_map="auto",
+            dtype=torch.bfloat16,
+        )
+        logger.warning("Qwen3-TTS läuft im CPU-Offloading-Modus — langsamer.")
+        return model
 
 def ask_overwrite(file_path):
     """
@@ -1074,31 +1131,6 @@ def handle_continuation_logic(output_file, reference_file=None, expected_count=N
         except Exception as e:
             logger.error(f"Fehler beim Laden vorhandener Segmente aus {output_file}: {e}")
             return True, []
-
-    # Logik zur Bestimmung, ob der Prozess abgeschlossen ist
-    is_complete = False
-    if reference_file and os.path.exists(reference_file):
-        try:
-            with open(reference_file, 'r', encoding='utf-8') as ref_file:
-                # Zähle Zeilen in der Referenzdatei (ohne Header)
-                total_expected = sum(1 for line in ref_file) - 1
-                if len(processed_keys) >= total_expected:
-                    is_complete = True
-        except Exception as e:
-            logger.warning(f"Konnte Referenzdatei {reference_file} nicht vollständig prüfen: {e}")
-
-    if is_complete:
-        # Datei scheint vollständig - Benutzer fragen
-        if not ask_overwrite(output_file):
-            logger.info(f"Verwende anscheinend vollständige Datei: {output_file} ({len(processed_keys)} Segmente)")
-            return False, processed_keys # Nicht fortsetzen
-        else:
-            logger.info(f"Überschreibe vollständige Datei: {output_file}")
-            return True, set() # Fortsetzen mit leerem Schlüsselset
-    else:
-        # Datei ist unvollständig - automatisch fortsetzen
-        logger.info(f"Setze unvollständige Verarbeitung fort: {len(processed_keys)} Segmente bereits verarbeitet.")
-        return True, processed_keys
 
 def handle_key_based_continuation(output_file, reference_file=None, key_column_index=0):
     """
@@ -7653,165 +7685,375 @@ def safe_tts_inference_with_device_handling(
         raise
 
 # Synthetisieren
+#def text_to_speech_with_voice_cloning(
+#    translation_file,
+#    sample_path_1,
+#    sample_path_2,
+#    sample_path_3,
+#    sample_path_4,
+#    #sample_path_5,
+#    #sample_path_6,
+#    output_path,
+#    speaker_name=None
+#    ):
+#    """
+#    Optimiert Text-to-Speech mit Voice Cloning und verschiedenen Beschleunigungen.
+#
+#    Args:
+#        translation_file: Pfad zur CSV-Datei mit übersetzten Texten.
+#        sample_path_1, sample_path_2: Pfade zu Sprachbeispielen für die Stimmenklonung.
+#        output_path: Ausgabepfad für die generierte Audiodatei.
+#        batch_size: Größe des Batches für parallele Verarbeitung.
+#    """
+#    stretched_chunks_dir = os.path.join(TTS_TEMP_CHUNKS_DIR, "stretched")
+#    concat_list_path = "ffmpeg_concat_list.txt"
+#
+#    # === SCHRITT 1: Lade und filtere Segmente, um festzustellen, ob Arbeit zu tun ist ===
+#    processed = load_existing_progress()
+#    all_segments = load_segments_from_file(translation_file)
+#    segments_to_process = filter_new_segments(all_segments, processed)
+#    
+#    # === SCHRITT 2: Prüfen, ob überhaupt etwas zu tun ist ===
+#    if not segments_to_process:
+#        logger.info("Keine neuen Segmente zu synthetisieren.")
+#        # Wenn die Ausgabedatei bereits existiert, ist alles in Ordnung.
+#        if os.path.exists(output_path):
+#            logger.info(f"Finale TTS-Audiodatei '{output_path}' existiert bereits und es gibt nichts Neues zu tun.")
+#        pass # Funktion sicher beenden.
+#
+#    logger.info(f"{len(segments_to_process)} neue Segmente werden synthetisiert…")
+#
+#    # === SCHRITT 3: JETZT, da wir wissen, dass Arbeit zu tun ist, prüfen wir die Ausgabedatei ===
+#    if os.path.exists(output_path):
+#        if not ask_overwrite(output_path):
+#            # Der Benutzer möchte nicht überschreiben, also brechen wir ab.
+#            logger.info(f"Benutzer hat das Überschreiben der existierenden Datei '{output_path}' abgelehnt. TTS-Synthese wird abgebrochen.")
+#            return
+#        else:
+#            # Der Benutzer möchte überschreiben, also räumen wir auf.
+#            logger.info(f"Benutzer hat dem Überschreiben von '{output_path}' zugestimmt. Alte temporäre Dateien werden entfernt.")
+#            if os.path.exists(TTS_TEMP_CHUNKS_DIR): shutil.rmtree(TTS_TEMP_CHUNKS_DIR)
+#            if os.path.exists(TTS_PROGRESS_MANIFEST): os.remove(TTS_PROGRESS_MANIFEST)
+#
+#    # Stelle sicher, dass die temporären Verzeichnisse existieren
+#    os.makedirs(TTS_TEMP_CHUNKS_DIR, exist_ok=True)
+#    os.makedirs(stretched_chunks_dir, exist_ok=True)
+#
+#    with gpu_context():
+#        try:
+#            print("------------------")
+#            print("|<< Starte TTS >>|")
+#            print("------------------")
+#            tts_start_time = time.time()
+#            
+#            logger.info(f"TTS wird auf Gerät ausgeführt: {device}")
+#
+#            # Modell laden und auf das Zielgerät verschieben
+#            xtts_model = load_xtts_v2()
+#        
+#            print(f"✅ Modell auf {next(xtts_model.parameters()).device} geladen")
+#        
+#            # Conditioning-Latents direkt auf dem Zielgerät erstellen
+#            sample_paths = [
+#                sample_path_1,
+#                sample_path_2,
+#                sample_path_3,
+#                sample_path_4,
+#                #sample_path_5,
+#                #sample_path_6
+#                ]
+#            gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(
+#                audio_path=sample_paths, gpt_cond_len=10, load_sr=22050, sound_norm_refs=False
+#            )
+#            gpt_cond_latent = gpt_cond_latent.to(device)
+#            speaker_embedding = speaker_embedding.to(device)
+#            
+#            logger.info(f"TTS-Modell und Conditioning-Latents erfolgreich geladen...({sample_paths})")
+#            print(f"TTS-Modell und Conditioning-Latents erfolgreich geladen...({sample_paths})")
+#
+#            """
+#            # DeepSpeed Inferenz-Engine initialisieren
+#            print("🚀 DeepSpeed-Initialisierung...")
+#            ds_engine = deepspeed.init_inference(
+#                model=xtts_model,
+#                tensor_parallel={"tp_size": 1},
+#                dtype=torch.float32,
+#                replace_with_kernel_inject=False,
+#                use_triton=False,
+#                triton_autotune=False
+#            )
+#            optimized_tts_model = ds_engine.module
+#            logger.info("✅ DeepSpeed erfolgreich initialisiert")
+#            """
+#
+#            # Erstelle einen dedizierten CUDA-Stream
+#            stream = create_cuda_stream()
+#
+#            for segment_info in tqdm(segments_to_process, desc="Synthetisiere Audio-Chunks"):
+#                try:
+#                    with torch.inference_mode():
+#                        #result = optimized_tts_model.inference(
+#                        result = xtts_model.inference(
+#                            text=segment_info['text'],
+#                            language="de",
+#                            gpt_cond_latent=gpt_cond_latent,
+#                            speaker_embedding=speaker_embedding,
+#                            speed=1.05,
+#                            temperature=0.87,
+#                            repetition_penalty=10.0,
+#                            top_k=55,
+#                            top_p=0.9,
+#                            enable_text_splitting=False
+#                        )
+#
+#                        print(f"\n[{segment_info['start']} --> {segment_info['end']}]:\n{segment_info['text']}\n")
+#                    audio_clip = result.get("wav")
+#                    if audio_clip is None or audio_clip.size == 0:
+#                        logger.warning(f"Leeres Audio für Segment {segment_info['id']} erhalten.")
+#                        continue
+#                
+#                    # Audio speichern (nachdem der Stream synchronisiert wurde)
+#                    chunk_filename = f"chunk_{segment_info['id']}.wav"
+#                    chunk_path = os.path.join(TTS_TEMP_CHUNKS_DIR, chunk_filename)
+#                    sf.write(chunk_path, audio_clip, 24000)
+#                    log_progress(segment_info, chunk_path)
+#
+#                except Exception as e:
+#                    logger.error(f"Fehler bei der TTS-Synthese für Segment {segment_info['id']}: {e}", exc_info=True)
+#                    continue # Zum nächsten Segment springen
+#
+#            # ======================================================================
+#            # PHASE 4: Audio-Assemblierung
+#            # ======================================================================
+#            assemble_final_audio_ffmpeg_sequential(output_path)
+#
+#            logger.info(f"TTS-Prozess abgeschlossen. Finale Audiodatei: {output_path}")
+#
+#            
+#            print(f"---------------------------")
+#            print(f"|<< TTS abgeschlossen!! >>|")
+#            print(f"---------------------------")
+#            
+#            tts_end_time = time.time() - tts_start_time
+#            logger.info(f"TTS abgeschlossen in {tts_end_time:.2f} Sekunden")
+#            print(f"{(tts_end_time):.2f} Sekunden")
+#            print(f"{(tts_end_time / 60):.2f} Minuten")
+#            print(f"{(tts_end_time / 3600):.2f} Stunden")
+#            logger.info(f"TTS-Audio mit geklonter Stimme erstellt: {output_path}")
+#            logger.info("🎉 Stream-optimierte TTS-Synthese abgeschlossen")
+#            
+#        except Exception as e:
+#            logger.critical(f"Ein schwerwiegender Fehler ist im TTS-Prozess aufgetreten: {e}", exc_info=True)
+
 def text_to_speech_with_voice_cloning(
-    translation_file,
-    sample_path_1,
-    sample_path_2,
-    sample_path_3,
-    sample_path_4,
-    #sample_path_5,
-    #sample_path_6,
-    output_path,
-    speaker_name=None
-    ):
-    """
-    Optimiert Text-to-Speech mit Voice Cloning und verschiedenen Beschleunigungen.
+    translationfile: str,
+    SAMPLE_PATH_1: str,
+    SAMPLE_PATH_2: str,
+    SAMPLE_PATH_3: str,
+    SAMPLE_PATH_4: str,
+    #SAMPLE_PATH_5: str,
+    #SAMPLE_PATH_6: str,
+    outputpath: str,
+    speakername: Optional[str] = None,
+) -> None:
+    """Text-to-Speech mit Voice Cloning via Qwen3-TTS-12Hz-1.7B-Base.
+
+    Ersetzt die XTTS v2-Implementierung vollständig. Nutzt die beste
+    verfügbare Referenz-Audio-Datei für Voice Cloning. Das Voice-Clone-Prompt
+    wird einmalig erstellt und für alle Segmente wiederverwendet.
+
+    VRAM-Schätzung Laufzeit: ~3.5 GB (Modell) + ~0.2 GB (Inferenz) = ~3.7 GB.
+    Bleibt unter dem 5 GB-Limit der RTX 4050 Mobile.
 
     Args:
-        translation_file: Pfad zur CSV-Datei mit übersetzten Texten.
-        sample_path_1, sample_path_2: Pfade zu Sprachbeispielen für die Stimmenklonung.
-        output_path: Ausgabepfad für die generierte Audiodatei.
-        batch_size: Größe des Batches für parallele Verarbeitung.
+        translationfile: Pfad zur CSV mit übersetzten Textsegmenten.
+        samplepath1..6: Pfade zu Referenz-Audio-Dateien (WAV, mind. 3 Sek.).
+        outputpath: Ausgabepfad für die synthetisierte Audio-Datei.
+        speakername: Optionaler Sprecher-Name (nur für Logging).
     """
-    stretched_chunks_dir = os.path.join(TTS_TEMP_CHUNKS_DIR, "stretched")
-    concat_list_path = "ffmpeg_concat_list.txt"
+    # ── 1. Frühe Abbruch-Bedingungen ─────────────────────────────────────────
+    stretched_chunks_dir: str = os.path.join(TTS_TEMP_CHUNKS_DIR, "stretched")
+    processed: set = load_existing_progress()
+    all_segments: list = load_segments_from_file(translationfile)
+    segments_to_process: list = filter_new_segments(all_segments, processed)
 
-    # === SCHRITT 1: Lade und filtere Segmente, um festzustellen, ob Arbeit zu tun ist ===
-    processed = load_existing_progress()
-    all_segments = load_segments_from_file(translation_file)
-    segments_to_process = filter_new_segments(all_segments, processed)
-    
-    # === SCHRITT 2: Prüfen, ob überhaupt etwas zu tun ist ===
     if not segments_to_process:
         logger.info("Keine neuen Segmente zu synthetisieren.")
-        # Wenn die Ausgabedatei bereits existiert, ist alles in Ordnung.
-        if os.path.exists(output_path):
-            logger.info(f"Finale TTS-Audiodatei '{output_path}' existiert bereits und es gibt nichts Neues zu tun.")
-        pass # Funktion sicher beenden.
+        if Path(outputpath).exists():
+            logger.info(f"Finale TTS-Audiodatei {outputpath} existiert bereits.")
+            return
 
-    logger.info(f"{len(segments_to_process)} neue Segmente werden synthetisiert…")
-
-    # === SCHRITT 3: JETZT, da wir wissen, dass Arbeit zu tun ist, prüfen wir die Ausgabedatei ===
-    if os.path.exists(output_path):
-        if not ask_overwrite(output_path):
-            # Der Benutzer möchte nicht überschreiben, also brechen wir ab.
-            logger.info(f"Benutzer hat das Überschreiben der existierenden Datei '{output_path}' abgelehnt. TTS-Synthese wird abgebrochen.")
+    if Path(outputpath).exists():
+        if not ask_overwrite(outputpath):
+            logger.info(
+                f"Benutzer hat Überschreiben von {outputpath} abgelehnt. Abbruch."
+            )
             return
         else:
-            # Der Benutzer möchte überschreiben, also räumen wir auf.
-            logger.info(f"Benutzer hat dem Überschreiben von '{output_path}' zugestimmt. Alte temporäre Dateien werden entfernt.")
-            if os.path.exists(TTS_TEMP_CHUNKS_DIR): shutil.rmtree(TTS_TEMP_CHUNKS_DIR)
-            if os.path.exists(TTS_PROGRESS_MANIFEST): os.remove(TTS_PROGRESS_MANIFEST)
+            logger.info(f"Räume alte temporäre Dateien auf vor Neusynthese.")
+            if Path(TTS_TEMP_CHUNKS_DIR).exists():
+                shutil.rmtree(TTS_TEMP_CHUNKS_DIR)
+            if Path(TTS_PROGRESS_MANIFEST).exists():
+                Path(TTS_PROGRESS_MANIFEST).unlink()
 
-    # Stelle sicher, dass die temporären Verzeichnisse existieren
-    os.makedirs(TTS_TEMP_CHUNKS_DIR, exist_ok=True)
-    os.makedirs(stretched_chunks_dir, exist_ok=True)
+    Path(TTS_TEMP_CHUNKS_DIR).mkdir(parents=True, exist_ok=True)
+    Path(stretched_chunks_dir).mkdir(parents=True, exist_ok=True)
 
+    # ── 2. Beste Referenz-Audio für Voice Cloning auswählen ──────────────────
+    # Nutze das erste existierende Sample als primäre Referenz.
+    # Qwen3-TTS benötigt mind. 3 Sek. Audio — längere Clips verbessern Qualität.
+    candidate_paths: list[str] = [
+        SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3,
+        SAMPLE_PATH_4, #SAMPLE_PATH_5, #SAMPLE_PATH_6,
+    ]
+    ref_audio_path: Optional[str] = next(
+        (p for p in candidate_paths if p and Path(p).is_file()),
+        None,
+    )
+    if ref_audio_path is None:
+        logger.critical(
+            "Kein gültiges Referenz-Audio für Voice Cloning gefunden. "
+            f"Überprüfe SAMPLEPATH1–6 in config.py. Gesucht: {candidate_paths}"
+        )
+        raise FileNotFoundError(
+            "Kein Referenz-Audio für Qwen3-TTS Voice Cloning verfügbar."
+        )
+    logger.info(f"Verwende Referenz-Audio für Voice Cloning: {ref_audio_path}")
+
+    # ── 3. Referenz-Text aus dem Referenz-Audio ableiten ─────────────────────
+    # Qwen3-TTS benötigt den transkribierten Text des Referenz-Audios für
+    # bestmögliche Stimm-Replikation. Ohne ref_text fällt das Modell auf
+    # x_vector_only_mode zurück (geringere Klonqualität).
+    # Strategie: Wir prüfen, ob eine gleichnamige .txt-Datei existiert.
+    # Falls nicht, wird x_vector_only_mode=True als Fallback genutzt.
+    ref_text_path: Path = Path(ref_audio_path).with_suffix(".txt")
+    ref_text: Optional[str] = None
+    use_x_vector_only: bool = False
+
+    if ref_text_path.is_file():
+        with open(ref_text_path, encoding="utf-8") as f:
+            ref_text = f.read().strip()
+        logger.info(f"Referenz-Text geladen: {ref_text_path}")
+    else:
+        use_x_vector_only = True
+        logger.warning(
+            f"Keine Referenz-Text-Datei gefunden: {ref_text_path}. "
+            "Fallback auf x_vector_only_mode=True (geringere Klonqualität). "
+            "Erstelle eine gleichnamige .txt-Datei mit dem Transkript für "
+            "bessere Ergebnisse."
+        )
+
+    # ── 4. TTS-Synthese-Schleife ──────────────────────────────────────────────
     with gpu_context():
         try:
             print("------------------")
-            print("|<< Starte TTS >>|")
+            print("Starte Qwen3-TTS")
             print("------------------")
-            tts_start_time = time.time()
-            
-            logger.info(f"TTS wird auf Gerät ausgeführt: {device}")
+            tts_start_time: float = time.time()
 
-            # Modell laden und auf das Zielgerät verschieben
-            xtts_model = load_xtts_v2()
-        
-            print(f"✅ Modell auf {next(xtts_model.parameters()).device} geladen")
-        
-            # Conditioning-Latents direkt auf dem Zielgerät erstellen
-            sample_paths = [
-                sample_path_1,
-                sample_path_2,
-                sample_path_3,
-                sample_path_4,
-                #sample_path_5,
-                #sample_path_6
-                ]
-            gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(
-                audio_path=sample_paths, gpt_cond_len=10, load_sr=22050, sound_norm_refs=False
+            # Modell laden — VRAM-Schätzung: ~3.5 GB
+            qwen_model: Qwen3TTSModel = load_qwen3_tts()
+
+            # Voice-Clone-Prompt EINMALIG erstellen und wiederverwenden.
+            # Das verhindert die wiederholte Feature-Extraktion aus dem
+            # Referenz-Audio und spart bei vielen Segmenten erheblich Zeit.
+            logger.info("Erstelle wiederverwendbaren Voice-Clone-Prompt ...")
+            voice_clone_prompt = qwen_model.create_voice_clone_prompt(
+                ref_audio=ref_audio_path,
+                ref_text=ref_text,           # None wenn x_vector_only_mode
+                x_vector_only_mode=use_x_vector_only,
             )
-            gpt_cond_latent = gpt_cond_latent.to(device)
-            speaker_embedding = speaker_embedding.to(device)
-            
-            logger.info(f"TTS-Modell und Conditioning-Latents erfolgreich geladen...({sample_paths})")
-            print(f"TTS-Modell und Conditioning-Latents erfolgreich geladen...({sample_paths})")
-
-            """
-            # DeepSpeed Inferenz-Engine initialisieren
-            print("🚀 DeepSpeed-Initialisierung...")
-            ds_engine = deepspeed.init_inference(
-                model=xtts_model,
-                tensor_parallel={"tp_size": 1},
-                dtype=torch.float32,
-                replace_with_kernel_inject=False,
-                use_triton=False,
-                triton_autotune=False
+            logger.info(
+                f"Voice-Clone-Prompt erstellt — "
+                f"x_vector_only={use_x_vector_only}, "
+                f"Referenz: {ref_audio_path}"
             )
-            optimized_tts_model = ds_engine.module
-            logger.info("✅ DeepSpeed erfolgreich initialisiert")
-            """
 
-            # Erstelle einen dedizierten CUDA-Stream
-            stream = create_cuda_stream()
-
-            for segment_info in tqdm(segments_to_process, desc="Synthetisiere Audio-Chunks"):
+            for segment_info in tqdm(
+                segments_to_process, desc="Synthetisiere Audio-Chunks"
+            ):
                 try:
+                    # Text-Validierung (übernommen aus Original-Pipeline)
+                    text: str = segment_info["text"]
+                    if not text or len(text.strip()) < MIN_TTS_TEXT_LENGTH:
+                        logger.warning(
+                            f"Segment {segment_info['id']} übersprungen: "
+                            f"Text zu kurz ({len(text)} Zeichen)."
+                        )
+                        continue
+
+                    # VRAM-Safety vor jedem Inferenz-Aufruf
+                    torch.cuda.empty_cache()
+
+                    # Inferenz — gibt (wavs_list, sample_rate) zurück
                     with torch.inference_mode():
-                        #result = optimized_tts_model.inference(
-                        result = xtts_model.inference(
-                            text=segment_info['text'],
-                            language="de",
-                            gpt_cond_latent=gpt_cond_latent,
-                            speaker_embedding=speaker_embedding,
-                            speed=1.05,
-                            temperature=0.87,
-                            repetition_penalty=10.0,
-                            top_k=55,
-                            top_p=0.9,
-                            enable_text_splitting=False
+                        wavs, sr = qwen_model.generate_voice_clone(
+                            text=text,
+                            language=QWEN3_TTS_TARGET_LANGUAGE,
+                            voice_clone_prompt=voice_clone_prompt,
+                            max_new_tokens=QWEN3_TTS_MAX_NEW_TOKENS,
                         )
 
-                        print(f"\n[{segment_info['start']} --> {segment_info['end']}]:\n{segment_info['text']}\n")
-                    audio_clip = result.get("wav")
+                    # wavs[0] ist ein numpy-Array (float32, mono, 24 kHz)
+                    audio_clip: np.ndarray = wavs[0]
+
                     if audio_clip is None or audio_clip.size == 0:
-                        logger.warning(f"Leeres Audio für Segment {segment_info['id']} erhalten.")
+                        logger.warning(
+                            f"Leeres Audio für Segment {segment_info['id']}."
+                        )
                         continue
-                
-                    # Audio speichern (nachdem der Stream synchronisiert wurde)
-                    chunk_filename = f"chunk_{segment_info['id']}.wav"
-                    chunk_path = os.path.join(TTS_TEMP_CHUNKS_DIR, chunk_filename)
-                    sf.write(chunk_path, audio_clip, 24000)
+
+                    print(
+                        f"{segment_info['start']} --> "
+                        f"{segment_info['end']}: {text}"
+                    )
+
+                    # Chunk auf Disk schreiben (24 kHz, mono, float32)
+                    chunk_filename: str = f"chunk{segment_info['id']}.wav"
+                    chunk_path: str = os.path.join(
+                        TTS_TEMP_CHUNKS_DIR, chunk_filename
+                    )
+                    sf.write(
+                        chunk_path,
+                        audio_clip,
+                        QWEN3_TTS_SAMPLE_RATE,  # 24_000 Hz
+                    )
                     log_progress(segment_info, chunk_path)
 
                 except Exception as e:
-                    logger.error(f"Fehler bei der TTS-Synthese für Segment {segment_info['id']}: {e}", exc_info=True)
-                    continue # Zum nächsten Segment springen
+                    logger.error(
+                        f"Fehler bei TTS-Synthese für Segment "
+                        f"{segment_info['id']}: {e}",
+                        exc_info=True,
+                    )
+                    continue
 
-            # ======================================================================
-            # PHASE 4: Audio-Assemblierung
-            # ======================================================================
-            assemble_final_audio_ffmpeg_sequential(output_path)
+            # Finale Audio-Montage
+            assemble_final_audio_ffmpeg_sequential(outputpath)
+            logger.info(f"TTS-Prozess abgeschlossen. Finale Datei: {outputpath}")
 
-            logger.info(f"TTS-Prozess abgeschlossen. Finale Audiodatei: {output_path}")
+            tts_end_time: float = time.time() - tts_start_time
+            print("---------------------------")
+            print("Qwen3-TTS abgeschlossen!!")
+            print("---------------------------")
+            logger.info(
+                f"TTS abgeschlossen in {tts_end_time:.2f} Sekunden "
+                f"({tts_end_time / 60:.2f} Minuten)"
+            )
 
-            
-            print(f"---------------------------")
-            print(f"|<< TTS abgeschlossen!! >>|")
-            print(f"---------------------------")
-            
-            tts_end_time = time.time() - tts_start_time
-            logger.info(f"TTS abgeschlossen in {tts_end_time:.2f} Sekunden")
-            print(f"{(tts_end_time):.2f} Sekunden")
-            print(f"{(tts_end_time / 60):.2f} Minuten")
-            print(f"{(tts_end_time / 3600):.2f} Stunden")
-            logger.info(f"TTS-Audio mit geklonter Stimme erstellt: {output_path}")
-            logger.info("🎉 Stream-optimierte TTS-Synthese abgeschlossen")
-            
+            # VRAM freigeben nach Abschluss
+            del qwen_model
+            del voice_clone_prompt
+            gc.collect()
+            torch.cuda.empty_cache()
+            logger.info("VRAM nach TTS-Abschluss bereinigt.")
+
         except Exception as e:
-            logger.critical(f"Ein schwerwiegender Fehler ist im TTS-Prozess aufgetreten: {e}", exc_info=True)
+            logger.critical(
+                f"Schwerwiegender Fehler im Qwen3-TTS-Prozess: {e}",
+                exc_info=True,
+            )
+            raise
 
 def create_conditioning_tensors_on_device(
     xtts_model, 
@@ -8345,13 +8587,13 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
 
 # Setzen Sie diese Flags, um Schritte gezielt zu überspringen
 USE_GGUF =                  False        # Ob GGUF-optimierte Modelle verwendet werden sollen
-EXECUTE_AUDIO_EXTRACTION =  True        # Schritt 1: Audio-Extraktion
-EXECUTE_TRANSCRIPTION =     True        # Schritte 2 & 3: Transkription und Veredelung
-EXECUTE_TRANSLATION =       True        # Schritt 4: Übersetzung & Hypothesen-Auswahl
-EXECUTE_CORRECTION =        True        # Schritt 5: Veredelung, Korrektur
-EXECUTE_POLISHING =         True       # Schritt 5.5: Systematisches Polishing
-EXECUTE_VEREDELUNG =        True        # Schritt 5.75: Finale Veredelung
-EXECUTE_TTS_FORMATTING =    True        # Schritt 6: TTS-Formatierung
+EXECUTE_AUDIO_EXTRACTION =  False        # Schritt 1: Audio-Extraktion
+EXECUTE_TRANSCRIPTION =     False        # Schritte 2 & 3: Transkription und Veredelung
+EXECUTE_TRANSLATION =       False        # Schritt 4: Übersetzung & Hypothesen-Auswahl
+EXECUTE_CORRECTION =        False        # Schritt 5: Veredelung, Korrektur
+EXECUTE_POLISHING =         False       # Schritt 5.5: Systematisches Polishing
+EXECUTE_VEREDELUNG =        False        # Schritt 5.75: Finale Veredelung
+EXECUTE_TTS_FORMATTING =    False        # Schritt 6: TTS-Formatierung
 EXECUTE_TTS =               True        # Schritt 7: TTS-Synthese
 EXECUTE_VIDEO_ADJUSTMENT =  True        # Schritt 8: Video-Geschwindigkeitsanpassung
 EXECUTE_VIDEO_CREATION =    True        # Schritt 9: Finales Video
