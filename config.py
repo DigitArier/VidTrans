@@ -1,20 +1,21 @@
 # Dateipfade
-AUDIO_PATH =        "2_When God Is About to Give You Something Big, You Will SEE These 7 Signs!_HD_(Vocals).wav"
-VIDEO_PATH =        "When God Is About to Give You Something Big, You Will SEE These 7 Signs!_HD.mp4"
-FINAL_VIDEO_PATH =  "When God Is About to Give You Something Big, You Will SEE These 7 Signs!_HD_deutsch_.mp4"
+from re import S
+AUDIO_PATH =        "1_the ANTICHRIST god of FORCES (documentary)_HD_(Vocals).wav"
+VIDEO_PATH =        "the ANTICHRIST god of FORCES (documentary)_HD.mp4"
+FINAL_VIDEO_PATH =  "the ANTICHRIST god of FORCES (documentary)_HD_deutsch.mp4"
 ORIGINAL_AUDIO_PATH = "00_original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
-SAMPLE_PATH_1 = "ich_sample-01.wav"
-SAMPLE_PATH_2 = "ich_sample-02.wav"
-SAMPLE_PATH_3 = "ich_sample-03.wav"
-SAMPLE_PATH_4 = "ich_sample-04.wav"
+#SAMPLE_PATH_1 = "ich_sample-01.wav"
+#SAMPLE_PATH_2 = "ich_sample-02.wav"
+#SAMPLE_PATH_3 = "ich_sample-03.wav"
+#SAMPLE_PATH_4 = "ich_sample-04.wav"
 #SAMPLE_PATH_5 = "ich_sample-05.wav"
 #SAMPLE_PATH_6 = "ich_sample-06.wav"
-#SAMPLE_PATH_1 = "servant_sample-01.wav"
-#SAMPLE_PATH_2 = "servant_sample-02.wav"
-#SAMPLE_PATH_3 = "servant_sample-03.wav"
-#SAMPLE_PATH_4 = "servant_sample-04.wav"
+SAMPLE_PATH_1 = "servant_sample-01.wav"
+SAMPLE_PATH_2 = "servant_sample-02.wav"
+SAMPLE_PATH_3 = "servant_sample-03.wav"
+SAMPLE_PATH_4 = "servant_sample-04.wav"
 
 # ─── Qwen3-TTS Konfiguration ──────────────────────────────────────────────────
 
@@ -23,7 +24,10 @@ SAMPLE_PATH_4 = "ich_sample-04.wav"
 QWEN3_TTS_CLONE_MODEL_ID: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
 # Fallback: kleineres Modell (~1.5 GB VRAM), geringere Qualität
-QWEN3_TTS_CLONE_MODEL_ID_SMALL: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+QWEN3_TTS_MODEL_ID: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+
+# Gerät für TTS-Synthese (z.B. "cuda:0" für GPU oder "cpu" für CPU)
+QWEN3_TTS_DEVICE: str = "cuda:0"
 
 # Zielsprache für TTS-Synthese (Qwen3-TTS-konformer Bezeichner)
 QWEN3_TTS_TARGET_LANGUAGE: str = "German"

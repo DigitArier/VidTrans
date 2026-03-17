@@ -103,12 +103,16 @@ from transformers import (
     T5ForConditionalGeneration
     )
 import transformers
+from transformers.utils import is_flash_attn_2_available
+logger.info(f"Flash Attention 2 verfügbar: {is_flash_attn_2_available()}")
 import ctranslate2
 from ctranslate2 import Translator, models
 #from TTS.tts.configs.xtts_config import XttsConfig
 #from TTS.tts.models.xtts import Xtts
 #from TTS.api import TTS
+import flash_attn
 from qwen_tts import Qwen3TTSModel
+from faster_qwen3_tts import FasterQwen3TTS
 #import whisper
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from pydub.effects import(
@@ -803,6 +807,46 @@ def load_qwen3_tts(
         )
         logger.warning("Qwen3-TTS läuft im CPU-Offloading-Modus — langsamer.")
         return model
+
+def load_faster_qwen3_tts() -> FasterQwen3TTS:
+    """Lädt FasterQwen3TTS korrekt ohne device_map.
+
+    Returns:
+        FasterQwen3TTS: Geladenes Modell auf CUDA.
+
+    Raises:
+        RuntimeError: Bei CUDA-Initialisierungsfehlern.
+    """
+    # VRAM ~2.8 GB (0.6B) oder ~5.1 GB (1.7B) – vor dem Laden bereinigen
+    torch.cuda.empty_cache()
+    gc.collect()
+    # Datentyp für TTS-Modelle (bfloat16 für bessere Leistung auf unterstützter Hardware)
+    QWEN3_TTS_DTYPE: torch.dtype = torch.bfloat16
+
+    logger.info(
+        "Lade FasterQwen3TTS '%s' auf '%s' mit dtype=%s",
+        QWEN3_TTS_MODEL_ID,
+        QWEN3_TTS_DEVICE,
+        QWEN3_TTS_DTYPE,
+    )
+
+    try:
+        # KORREKTE API: 'device' statt 'device_map'; kein accelerate-Offloading
+        model: FasterQwen3TTS = FasterQwen3TTS.from_pretrained(
+            QWEN3_TTS_MODEL_ID,
+            device=QWEN3_TTS_DEVICE,   # ← FIX: war device_map="auto"
+            dtype=QWEN3_TTS_DTYPE,
+        )
+    except RuntimeError as e:
+        logger.error(
+            "FasterQwen3TTS konnte nicht geladen werden: %s",
+            e,
+            exc_info=True,
+        )
+        raise
+
+    logger.info("FasterQwen3TTS erfolgreich geladen.")
+    return model
 
 def ask_overwrite(file_path):
     """
@@ -5210,11 +5254,40 @@ def polish_all_translations(
     llm_model_name: str = "gemma2:9b",
     skip_threshold: float = None
 ) -> Tuple[str, str]:
+    """Systematisches Polishing aller Übersetzungen für maximale Natürlichkeit.
+
+    Fokus: Semantische Treue, natürliche Kürze ohne Hard-Limit.
+
+    Args:
+        source_csv_path:    Pfad zur Original-Quell-CSV (EN).
+        translated_csv_path: Pfad zur korrigierten DE-CSV (Eingabe).
+        output_csv_path:    Ziel-Pfad für die polierte CSV.
+        summary_path:       Ziel-Pfad für die TXT-Zusammenfassung.
+        model_name:         Sentence-Transformer für Similarity-Berechnung.
+        llm_model_name:     Ollama-Modell für Polishing-Vorschläge.
+        skip_threshold:     Similarity-Schwelle; Segmente darüber werden
+                            übersprungen (None → kein Skip).
+
+    Returns:
+        Tuple[output_csv_path, summary_path]
     """
-    Systematisches Polishing aller Übersetzungen für maximale Natürlichkeit.
-    
-    Fokus: Semantische Treue + natürliche Kürze (ohne Hard-Limit).
-    """
+    # ── NEU: Skip-Guard ── äquivalent zu evaluate_translation_quality ──────
+    # Existiert die polierte CSV bereits, wird der Nutzer gefragt ob neu
+    # berechnet werden soll. Bei Ablehnung sofortiger Return ohne GPU-Last.
+    if Path(output_csv_path).exists() and not ask_overwrite(output_csv_path):
+        logger.info(
+            "Verwende vorhandene polierte Übersetzung: %s", output_csv_path
+        )
+        # summary_path kann fehlen – darauf hinweisen, aber nicht abbrechen.
+        if not Path(summary_path).exists():
+            logger.warning(
+                "Polishing-Zusammenfassung nicht gefunden: %s "
+                "(Polishing-Ergebnis aber vorhanden).",
+                summary_path,
+            )
+        return output_csv_path, summary_path
+    # ────────────────────────────────────────────────────────────────────────
+
     logger.info("Starte systematisches Translation-Polishing für alle Segmente...")
     
     df_source = pd.read_csv(source_csv_path, sep='|', dtype=str).fillna('')
@@ -7845,29 +7918,254 @@ def safe_tts_inference_with_device_handling(
 #        except Exception as e:
 #            logger.critical(f"Ein schwerwiegender Fehler ist im TTS-Prozess aufgetreten: {e}", exc_info=True)
 
+#def text_to_speech_with_voice_cloning(
+#    translationfile: str,
+#    SAMPLE_PATH_1: str,
+#    SAMPLE_PATH_2: str,
+#    SAMPLE_PATH_3: str,
+#    SAMPLE_PATH_4: str,
+#    #SAMPLE_PATH_5: str,
+#    #SAMPLE_PATH_6: str,
+#    outputpath: str,
+#    speakername: Optional[str] = None,
+#) -> None:
+#    """Text-to-Speech mit Voice Cloning via Qwen3-TTS-12Hz-1.7B-Base.
+#
+#    Ersetzt die XTTS v2-Implementierung vollständig. Nutzt die beste
+#    verfügbare Referenz-Audio-Datei für Voice Cloning. Das Voice-Clone-Prompt
+#    wird einmalig erstellt und für alle Segmente wiederverwendet.
+#
+#    VRAM-Schätzung Laufzeit: ~3.5 GB (Modell) + ~0.2 GB (Inferenz) = ~3.7 GB.
+#    Bleibt unter dem 5 GB-Limit der RTX 4050 Mobile.
+#
+#    Args:
+#        translationfile: Pfad zur CSV mit übersetzten Textsegmenten.
+#        samplepath1..4: Pfade zu Referenz-Audio-Dateien (WAV, mind. 3 Sek.).
+#        outputpath: Ausgabepfad für die synthetisierte Audio-Datei.
+#        speakername: Optionaler Sprecher-Name (nur für Logging).
+#    """
+#    # ── 1. Frühe Abbruch-Bedingungen ─────────────────────────────────────────
+#    stretched_chunks_dir: str = os.path.join(TTS_TEMP_CHUNKS_DIR, "stretched")
+#    processed: set = load_existing_progress()
+#    all_segments: list = load_segments_from_file(translationfile)
+#    segments_to_process: list = filter_new_segments(all_segments, processed)
+#
+#    if not segments_to_process:
+#        logger.info("Keine neuen Segmente zu synthetisieren.")
+#        if Path(outputpath).exists():
+#            logger.info(f"Finale TTS-Audiodatei {outputpath} existiert bereits.")
+#            return
+#
+#    if Path(outputpath).exists():
+#        if not ask_overwrite(outputpath):
+#            logger.info(
+#                f"Benutzer hat Überschreiben von {outputpath} abgelehnt. Abbruch."
+#            )
+#            return
+#        else:
+#            logger.info(f"Räume alte temporäre Dateien auf vor Neusynthese.")
+#            if Path(TTS_TEMP_CHUNKS_DIR).exists():
+#                shutil.rmtree(TTS_TEMP_CHUNKS_DIR)
+#            if Path(TTS_PROGRESS_MANIFEST).exists():
+#                Path(TTS_PROGRESS_MANIFEST).unlink()
+#
+#    Path(TTS_TEMP_CHUNKS_DIR).mkdir(parents=True, exist_ok=True)
+#    Path(stretched_chunks_dir).mkdir(parents=True, exist_ok=True)
+#
+#    # ── 2. Beste Referenz-Audio für Voice Cloning auswählen ──────────────────
+#    # Nutze das erste existierende Sample als primäre Referenz.
+#    # Qwen3-TTS benötigt mind. 3 Sek. Audio — längere Clips verbessern Qualität.
+#    candidate_paths: list[str] = [
+#        SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3,
+#        SAMPLE_PATH_4, #SAMPLE_PATH_5, #SAMPLE_PATH_6,
+#    ]
+#    ref_audio_path: Optional[str] = next(
+#        (p for p in candidate_paths if p and Path(p).is_file()),
+#        None,
+#    )
+#    if ref_audio_path is None:
+#        logger.critical(
+#            "Kein gültiges Referenz-Audio für Voice Cloning gefunden. "
+#            f"Überprüfe SAMPLEPATH1–6 in config.py. Gesucht: {candidate_paths}"
+#        )
+#        raise FileNotFoundError(
+#            "Kein Referenz-Audio für Qwen3-TTS Voice Cloning verfügbar."
+#        )
+#    logger.info(f"Verwende Referenz-Audio für Voice Cloning: {ref_audio_path}")
+#
+#    # ── 3. Referenz-Text aus dem Referenz-Audio ableiten ─────────────────────
+#    # Qwen3-TTS benötigt den transkribierten Text des Referenz-Audios für
+#    # bestmögliche Stimm-Replikation. Ohne ref_text fällt das Modell auf
+#    # x_vector_only_mode zurück (geringere Klonqualität).
+#    # Strategie: Wir prüfen, ob eine gleichnamige .txt-Datei existiert.
+#    # Falls nicht, wird x_vector_only_mode=True als Fallback genutzt.
+#    ref_text_path: Path = Path(ref_audio_path).with_suffix(".txt")
+#    ref_text: Optional[str] = None
+#    use_x_vector_only: bool = False
+#
+#    if ref_text_path.is_file():
+#        with open(ref_text_path, encoding="utf-8") as f:
+#            ref_text = f.read().strip()
+#        logger.info(f"Referenz-Text geladen: {ref_text_path}")
+#    else:
+#        use_x_vector_only = True
+#        logger.warning(
+#            f"Keine Referenz-Text-Datei gefunden: {ref_text_path}. "
+#            "Fallback auf x_vector_only_mode=True (geringere Klonqualität). "
+#            "Erstelle eine gleichnamige .txt-Datei mit dem Transkript für "
+#            "bessere Ergebnisse."
+#        )
+#
+#    # ── 4. TTS-Synthese-Schleife ──────────────────────────────────────────────
+#    with gpu_context():
+#        try:
+#            print("------------------")
+#            print("Starte Qwen3-TTS")
+#            print("------------------")
+#            tts_start_time: float = time.time()
+#
+#            # Modell laden — VRAM-Schätzung: ~3.5 GB
+#            qwen_model: Qwen3TTSModel = load_qwen3_tts()
+#
+#            # OPT: cuDNN-Autotuning — wählt einmalig den schnellsten Kernel
+#            # für die auf dieser Hardware vorherrschenden Tensor-Shapes.
+#            # Kein Effekt wenn torch.backends.cudnn.benchmark in
+#            # setup_global_torch_optimizations() bereits True gesetzt ist.
+#            torch.backends.cudnn.benchmark = True
+#
+#            # Voice-Clone-Prompt EINMALIG erstellen und wiederverwenden.
+#            # Das verhindert die wiederholte Feature-Extraktion aus dem
+#            # Referenz-Audio und spart bei vielen Segmenten erheblich Zeit.
+#            logger.info("Erstelle wiederverwendbaren Voice-Clone-Prompt ...")
+#            voice_clone_prompt = qwen_model.create_voice_clone_prompt(
+#                ref_audio=ref_audio_path,
+#                ref_text=ref_text,           # None wenn x_vector_only_mode
+#                x_vector_only_mode=use_x_vector_only,
+#            )
+#            logger.info(
+#                f"Voice-Clone-Prompt erstellt — "
+#                f"x_vector_only={use_x_vector_only}, "
+#                f"Referenz: {ref_audio_path}"
+#            )
+#
+#            # OPT: torch.inference_mode() EINMAL außerhalb der Loop setzen.
+#            # Vorher: bei jedem Segment neu eintreten (GIL + Python-Frame-Overhead).
+#            # Jetzt: ein einziger Context für alle N Segmente.
+#            with torch.inference_mode():
+#                for segment_info in tqdm(
+#                    segments_to_process, desc="Synthetisiere Audio-Chunks"
+#                ):
+#                    try:
+#                        # Text-Validierung (übernommen aus Original-Pipeline)
+#                        text: str = segment_info["text"]
+#                        if not text or len(text.strip()) < MIN_TTS_TEXT_LENGTH:
+#                            logger.warning(
+#                                f"Segment {segment_info['id']} übersprungen: "
+#                                f"Text zu kurz ({len(text)} Zeichen)."
+#                            )
+#                            continue
+#
+#                        # OPT: torch.cuda.empty_cache() ENTFERNT.
+#                        # Mit ~2.3 GB VRAM-Reserve (6 GB - 3.7 GB) ist manuelles
+#                        # Cache-Leeren pro Segment unnötig. Es erzwingt bei
+#                        # jedem Aufruf eine CUDA-Synchronisation (~5 ms),
+#                        # die bei 100 Segmenten ~500 ms reinen Overhead kostet.
+#                        # gpu_context() leert den Cache einmalig am Ende der
+#                        # gesamten TTS-Schleife — das reicht vollständig aus.
+#
+#                        # Inferenz — gibt (wavs_list, sample_rate) zurück
+#                        wavs, sr = qwen_model.generate_voice_clone(
+#                            text=text,
+#                            language=QWEN3_TTS_TARGET_LANGUAGE,
+#                            voice_clone_prompt=voice_clone_prompt,
+#                            max_new_tokens=QWEN3_TTS_MAX_NEW_TOKENS,
+#                        )
+#
+#                        # wavs[0] ist ein numpy-Array (float32, mono, 24 kHz)
+#                        audio_clip: np.ndarray = wavs[0]
+#
+#                        if audio_clip is None or audio_clip.size == 0:
+#                            logger.warning(
+#                                f"Leeres Audio für Segment {segment_info['id']}."
+#                            )
+#                            continue
+#
+#                        print(
+#                            f"\n{segment_info['start']} --> "
+#                            f"{segment_info['end']}: {text}"
+#                        )
+#
+#                        # Chunk auf Disk schreiben (24 kHz, mono, float32)
+#                        chunk_filename: str = f"chunk{segment_info['id']}.wav"
+#                        chunk_path: str = os.path.join(
+#                            TTS_TEMP_CHUNKS_DIR, chunk_filename
+#                        )
+#                        sf.write(
+#                            chunk_path,
+#                            audio_clip,
+#                            QWEN3_TTS_SAMPLE_RATE,  # 24_000 Hz
+#                        )
+#                        log_progress(segment_info, chunk_path)
+#
+#                    except Exception as e:
+#                        logger.error(
+#                            f"Fehler bei TTS-Synthese für Segment "
+#                            f"{segment_info['id']}: {e}",
+#                            exc_info=True,
+#                        )
+#                        continue
+#
+#            # Finale Audio-Montage
+#            assemble_final_audio_ffmpeg_sequential(outputpath)
+#            logger.info(f"TTS-Prozess abgeschlossen. Finale Datei: {outputpath}")
+#
+#            tts_end_time: float = time.time() - tts_start_time
+#            print("---------------------------")
+#            print("Qwen3-TTS abgeschlossen!!")
+#            print("---------------------------")
+#            logger.info(
+#                f"TTS abgeschlossen in {tts_end_time:.2f} Sekunden "
+#                f"({tts_end_time / 60:.2f} Minuten)"
+#            )
+#
+#            # VRAM freigeben nach Abschluss
+#            del qwen_model
+#            del voice_clone_prompt
+#            gc.collect()
+#            torch.cuda.empty_cache()
+#            logger.info("VRAM nach TTS-Abschluss bereinigt.")
+#
+#        except Exception as e:
+#            logger.critical(
+#                f"Schwerwiegender Fehler im Qwen3-TTS-Prozess: {e}",
+#                exc_info=True,
+#            )
+#            raise
+
 def text_to_speech_with_voice_cloning(
     translationfile: str,
     SAMPLE_PATH_1: str,
     SAMPLE_PATH_2: str,
     SAMPLE_PATH_3: str,
     SAMPLE_PATH_4: str,
-    #SAMPLE_PATH_5: str,
-    #SAMPLE_PATH_6: str,
+    # SAMPLE_PATH_5: str,
+    # SAMPLE_PATH_6: str,
     outputpath: str,
     speakername: Optional[str] = None,
 ) -> None:
-    """Text-to-Speech mit Voice Cloning via Qwen3-TTS-12Hz-1.7B-Base.
+    """Text-to-Speech mit Voice Cloning via FasterQwen3TTS.
 
-    Ersetzt die XTTS v2-Implementierung vollständig. Nutzt die beste
-    verfügbare Referenz-Audio-Datei für Voice Cloning. Das Voice-Clone-Prompt
-    wird einmalig erstellt und für alle Segmente wiederverwendet.
+    Nutzt die beste verfügbare Referenz-Audio-Datei für Voice Cloning.
+    ref_audio + ref_text werden bei jedem generate_voice_clone()-Aufruf
+    übergeben; FasterQwen3TTS cached den Speaker-Embedding intern nach
+    dem ersten Aufruf automatisch (kein manuelles Prompt-Caching nötig).
 
-    VRAM-Schätzung Laufzeit: ~3.5 GB (Modell) + ~0.2 GB (Inferenz) = ~3.7 GB.
-    Bleibt unter dem 5 GB-Limit der RTX 4050 Mobile.
+    VRAM-Schätzung Laufzeit: ~5.1 GB (1.7B) | ~2.8 GB (0.6B).
+    RTX 4050 Mobile: 1.7B liegt sehr knapp unter 6 GB — Alternativ 0.6B wählen.
 
     Args:
         translationfile: Pfad zur CSV mit übersetzten Textsegmenten.
-        samplepath1..6: Pfade zu Referenz-Audio-Dateien (WAV, mind. 3 Sek.).
+        SAMPLE_PATH_1..4: Pfade zu Referenz-Audio-Dateien (WAV, mind. 3 Sek.).
         outputpath: Ausgabepfad für die synthetisierte Audio-Datei.
         speakername: Optionaler Sprecher-Name (nur für Logging).
     """
@@ -7880,17 +8178,20 @@ def text_to_speech_with_voice_cloning(
     if not segments_to_process:
         logger.info("Keine neuen Segmente zu synthetisieren.")
         if Path(outputpath).exists():
-            logger.info(f"Finale TTS-Audiodatei {outputpath} existiert bereits.")
+            logger.info(
+                "Finale TTS-Audiodatei %s existiert bereits.", outputpath
+            )
             return
 
     if Path(outputpath).exists():
         if not ask_overwrite(outputpath):
             logger.info(
-                f"Benutzer hat Überschreiben von {outputpath} abgelehnt. Abbruch."
+                "Benutzer hat Überschreiben von %s abgelehnt. Abbruch.",
+                outputpath,
             )
             return
         else:
-            logger.info(f"Räume alte temporäre Dateien auf vor Neusynthese.")
+            logger.info("Räume alte temporäre Dateien auf vor Neusynthese.")
             if Path(TTS_TEMP_CHUNKS_DIR).exists():
                 shutil.rmtree(TTS_TEMP_CHUNKS_DIR)
             if Path(TTS_PROGRESS_MANIFEST).exists():
@@ -7900,11 +8201,15 @@ def text_to_speech_with_voice_cloning(
     Path(stretched_chunks_dir).mkdir(parents=True, exist_ok=True)
 
     # ── 2. Beste Referenz-Audio für Voice Cloning auswählen ──────────────────
-    # Nutze das erste existierende Sample als primäre Referenz.
+    # Erstes existierendes Sample wird als primäre Referenz verwendet.
     # Qwen3-TTS benötigt mind. 3 Sek. Audio — längere Clips verbessern Qualität.
     candidate_paths: list[str] = [
-        SAMPLE_PATH_1, SAMPLE_PATH_2, SAMPLE_PATH_3,
-        SAMPLE_PATH_4, #SAMPLE_PATH_5, #SAMPLE_PATH_6,
+        SAMPLE_PATH_1,
+        SAMPLE_PATH_2,
+        SAMPLE_PATH_3,
+        SAMPLE_PATH_4,
+        # SAMPLE_PATH_5,
+        # SAMPLE_PATH_6,
     ]
     ref_audio_path: Optional[str] = next(
         (p for p in candidate_paths if p and Path(p).is_file()),
@@ -7913,34 +8218,36 @@ def text_to_speech_with_voice_cloning(
     if ref_audio_path is None:
         logger.critical(
             "Kein gültiges Referenz-Audio für Voice Cloning gefunden. "
-            f"Überprüfe SAMPLEPATH1–6 in config.py. Gesucht: {candidate_paths}"
+            "Überprüfe SAMPLEPATH1-4 in config.py. Gesucht: %s",
+            candidate_paths,
         )
         raise FileNotFoundError(
             "Kein Referenz-Audio für Qwen3-TTS Voice Cloning verfügbar."
         )
-    logger.info(f"Verwende Referenz-Audio für Voice Cloning: {ref_audio_path}")
+    logger.info("Verwende Referenz-Audio für Voice Cloning: %s", ref_audio_path)
 
-    # ── 3. Referenz-Text aus dem Referenz-Audio ableiten ─────────────────────
-    # Qwen3-TTS benötigt den transkribierten Text des Referenz-Audios für
-    # bestmögliche Stimm-Replikation. Ohne ref_text fällt das Modell auf
-    # x_vector_only_mode zurück (geringere Klonqualität).
-    # Strategie: Wir prüfen, ob eine gleichnamige .txt-Datei existiert.
-    # Falls nicht, wird x_vector_only_mode=True als Fallback genutzt.
+    # ── 3. Referenz-Text ableiten ─────────────────────────────────────────────
+    # xvec_only=True  → nur Speaker-Embedding, kein ref_text nötig (Default,
+    #                    sauberere Ergebnisse, kein Artefakt am Anfang)
+    # xvec_only=False → ICL-Modus: ref_text MUSS genau passen, sonst Artefakte
+    # Strategie: .txt-Datei neben dem Audio → ICL-Modus; sonst x-vector-Modus.
     ref_text_path: Path = Path(ref_audio_path).with_suffix(".txt")
     ref_text: Optional[str] = None
-    use_x_vector_only: bool = False
+    # xvec_only=True ist der sicherere Default (kein ref_text erforderlich)
+    xvec_only: bool = True
 
     if ref_text_path.is_file():
         with open(ref_text_path, encoding="utf-8") as f:
             ref_text = f.read().strip()
-        logger.info(f"Referenz-Text geladen: {ref_text_path}")
+        xvec_only = False  # ICL-Modus aktivieren wenn ref_text vorhanden
+        logger.info("Referenz-Text geladen (ICL-Modus): %s", ref_text_path)
     else:
-        use_x_vector_only = True
         logger.warning(
-            f"Keine Referenz-Text-Datei gefunden: {ref_text_path}. "
-            "Fallback auf x_vector_only_mode=True (geringere Klonqualität). "
+            "Keine Referenz-Text-Datei gefunden: %s. "
+            "Fallback auf x-vector-only-Modus (xvec_only=True). "
             "Erstelle eine gleichnamige .txt-Datei mit dem Transkript für "
-            "bessere Ergebnisse."
+            "bessere Stimm-Replikation (ICL-Modus).",
+            ref_text_path,
         )
 
     # ── 4. TTS-Synthese-Schleife ──────────────────────────────────────────────
@@ -7951,106 +8258,115 @@ def text_to_speech_with_voice_cloning(
             print("------------------")
             tts_start_time: float = time.time()
 
-            # Modell laden — VRAM-Schätzung: ~3.5 GB
-            qwen_model: Qwen3TTSModel = load_qwen3_tts()
+            # VRAM ~5.1 GB (1.7B) oder ~2.8 GB (0.6B) — VOR dem Laden bereinigen
+            torch.cuda.empty_cache()
+            gc.collect()
 
-            # Voice-Clone-Prompt EINMALIG erstellen und wiederverwenden.
-            # Das verhindert die wiederholte Feature-Extraktion aus dem
-            # Referenz-Audio und spart bei vielen Segmenten erheblich Zeit.
-            logger.info("Erstelle wiederverwendbaren Voice-Clone-Prompt ...")
-            voice_clone_prompt = qwen_model.create_voice_clone_prompt(
-                ref_audio=ref_audio_path,
-                ref_text=ref_text,           # None wenn x_vector_only_mode
-                x_vector_only_mode=use_x_vector_only,
-            )
+            # Modell laden — FasterQwen3TTS, nicht Qwen3TTSModel
+            qwen_model: FasterQwen3TTS = load_faster_qwen3_tts()
+
+            # cuDNN-Autotuning für schnellste Kernel auf dieser Hardware
+            torch.backends.cudnn.benchmark = True
+
+            # HINWEIS: FasterQwen3TTS hat kein create_voice_clone_prompt().
+            # Das interne Speaker-Embedding-Caching geschieht automatisch:
+            # Nach dem ersten Aufruf mit ref_audio wird das Embedding gecacht.
+            # Explizites Pre-Caching ist nur via examples/extract_speaker.py
+            # (externes Script) als .pt-Datei möglich — hier nicht nötig.
             logger.info(
-                f"Voice-Clone-Prompt erstellt — "
-                f"x_vector_only={use_x_vector_only}, "
-                f"Referenz: {ref_audio_path}"
+                "Voice-Cloning-Modus: %s | Referenz: %s",
+                "x-vector-only" if xvec_only else "ICL (full)",
+                ref_audio_path,
             )
 
-            for segment_info in tqdm(
-                segments_to_process, desc="Synthetisiere Audio-Chunks"
-            ):
-                try:
-                    # Text-Validierung (übernommen aus Original-Pipeline)
-                    text: str = segment_info["text"]
-                    if not text or len(text.strip()) < MIN_TTS_TEXT_LENGTH:
-                        logger.warning(
-                            f"Segment {segment_info['id']} übersprungen: "
-                            f"Text zu kurz ({len(text)} Zeichen)."
-                        )
-                        continue
+            # torch.inference_mode() EINMAL außerhalb der Loop — spart
+            # Python-Frame-Overhead bei jedem Segment (~0.1 ms/Segment).
+            with torch.inference_mode():
+                for segment_info in tqdm(
+                    segments_to_process, desc="Synthetisiere Audio-Chunks"
+                ):
+                    try:
+                        text: str = segment_info["text"]
+                        if not text or len(text.strip()) < MIN_TTS_TEXT_LENGTH:
+                            logger.warning(
+                                "Segment %s übersprungen: Text zu kurz (%d Zeichen).",
+                                segment_info["id"],
+                                len(text),
+                            )
+                            continue
 
-                    # VRAM-Safety vor jedem Inferenz-Aufruf
-                    torch.cuda.empty_cache()
-
-                    # Inferenz — gibt (wavs_list, sample_rate) zurück
-                    with torch.inference_mode():
+                        # FIX: generate_voice_clone() direkt aufrufen.
+                        # ref_audio + ref_text werden jedes Mal übergeben —
+                        # FasterQwen3TTS cached den Speaker-Embedding intern
+                        # nach dem ersten Aufruf automatisch (kein Overhead).
+                        # VRAM ~5.1 GB (1.7B) Inferenz läuft im selben Budget.
+                        # xvec_only=True  → sauber, kein ref_text nötig
+                        # xvec_only=False → ICL, bessere Timbre-Replikation
+                        wavs: list[np.ndarray]
+                        sr: int
                         wavs, sr = qwen_model.generate_voice_clone(
                             text=text,
                             language=QWEN3_TTS_TARGET_LANGUAGE,
-                            voice_clone_prompt=voice_clone_prompt,
-                            max_new_tokens=QWEN3_TTS_MAX_NEW_TOKENS,
+                            ref_audio=ref_audio_path,
+                            ref_text=ref_text,     # None wenn xvec_only=True
+                            xvec_only=xvec_only,   # FIX: war x_vector_only_mode
                         )
 
-                    # wavs[0] ist ein numpy-Array (float32, mono, 24 kHz)
-                    audio_clip: np.ndarray = wavs[0]
+                        # wavs[0] ist numpy-Array (float32, mono, 24 kHz)
+                        audio_clip: np.ndarray = wavs[0]
 
-                    if audio_clip is None or audio_clip.size == 0:
-                        logger.warning(
-                            f"Leeres Audio für Segment {segment_info['id']}."
+                        if audio_clip is None or audio_clip.size == 0:
+                            logger.warning(
+                                "Leeres Audio für Segment %s.", segment_info["id"]
+                            )
+                            continue
+
+                        print(
+                            f"\n{segment_info['start']} --> "
+                            f"{segment_info['end']}: {text}"
+                        )
+
+                        # Chunk auf Disk schreiben (24 kHz, mono, float32)
+                        chunk_filename: str = f"chunk{segment_info['id']}.wav"
+                        chunk_path: str = os.path.join(
+                            TTS_TEMP_CHUNKS_DIR, chunk_filename
+                        )
+                        sf.write(chunk_path, audio_clip, QWEN3_TTS_SAMPLE_RATE)
+                        log_progress(segment_info, chunk_path)
+
+                    except Exception as e:
+                        logger.error(
+                            "Fehler bei TTS-Synthese für Segment %s: %s",
+                            segment_info["id"],
+                            e,
+                            exc_info=True,
                         )
                         continue
 
-                    print(
-                        f"{segment_info['start']} --> "
-                        f"{segment_info['end']}: {text}"
-                    )
-
-                    # Chunk auf Disk schreiben (24 kHz, mono, float32)
-                    chunk_filename: str = f"chunk{segment_info['id']}.wav"
-                    chunk_path: str = os.path.join(
-                        TTS_TEMP_CHUNKS_DIR, chunk_filename
-                    )
-                    sf.write(
-                        chunk_path,
-                        audio_clip,
-                        QWEN3_TTS_SAMPLE_RATE,  # 24_000 Hz
-                    )
-                    log_progress(segment_info, chunk_path)
-
-                except Exception as e:
-                    logger.error(
-                        f"Fehler bei TTS-Synthese für Segment "
-                        f"{segment_info['id']}: {e}",
-                        exc_info=True,
-                    )
-                    continue
-
             # Finale Audio-Montage
             assemble_final_audio_ffmpeg_sequential(outputpath)
-            logger.info(f"TTS-Prozess abgeschlossen. Finale Datei: {outputpath}")
+            logger.info("TTS-Prozess abgeschlossen. Finale Datei: %s", outputpath)
 
             tts_end_time: float = time.time() - tts_start_time
             print("---------------------------")
             print("Qwen3-TTS abgeschlossen!!")
             print("---------------------------")
             logger.info(
-                f"TTS abgeschlossen in {tts_end_time:.2f} Sekunden "
-                f"({tts_end_time / 60:.2f} Minuten)"
+                "TTS abgeschlossen in %.2f Sekunden (%.2f Minuten)",
+                tts_end_time,
+                tts_end_time / 60,
             )
 
-            # VRAM freigeben nach Abschluss
+            # VRAM nach Abschluss freigeben
             del qwen_model
-            del voice_clone_prompt
             gc.collect()
             torch.cuda.empty_cache()
             logger.info("VRAM nach TTS-Abschluss bereinigt.")
 
         except Exception as e:
             logger.critical(
-                f"Schwerwiegender Fehler im Qwen3-TTS-Prozess: {e}",
+                "Schwerwiegender Fehler im Qwen3-TTS-Prozess: %s",
+                e,
                 exc_info=True,
             )
             raise
@@ -8587,13 +8903,13 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
 
 # Setzen Sie diese Flags, um Schritte gezielt zu überspringen
 USE_GGUF =                  False        # Ob GGUF-optimierte Modelle verwendet werden sollen
-EXECUTE_AUDIO_EXTRACTION =  False        # Schritt 1: Audio-Extraktion
-EXECUTE_TRANSCRIPTION =     False        # Schritte 2 & 3: Transkription und Veredelung
-EXECUTE_TRANSLATION =       False        # Schritt 4: Übersetzung & Hypothesen-Auswahl
-EXECUTE_CORRECTION =        False        # Schritt 5: Veredelung, Korrektur
-EXECUTE_POLISHING =         False       # Schritt 5.5: Systematisches Polishing
-EXECUTE_VEREDELUNG =        False        # Schritt 5.75: Finale Veredelung
-EXECUTE_TTS_FORMATTING =    False        # Schritt 6: TTS-Formatierung
+EXECUTE_AUDIO_EXTRACTION =  True        # Schritt 1: Audio-Extraktion
+EXECUTE_TRANSCRIPTION =     True        # Schritte 2 & 3: Transkription und Veredelung
+EXECUTE_TRANSLATION =       True        # Schritt 4: Übersetzung & Hypothesen-Auswahl
+EXECUTE_CORRECTION =        True        # Schritt 5: Veredelung, Korrektur
+EXECUTE_POLISHING =         True       # Schritt 5.5: Systematisches Polishing
+EXECUTE_VEREDELUNG =        True        # Schritt 5.75: Finale Veredelung
+EXECUTE_TTS_FORMATTING =    True        # Schritt 6: TTS-Formatierung
 EXECUTE_TTS =               True        # Schritt 7: TTS-Synthese
 EXECUTE_VIDEO_ADJUSTMENT =  True        # Schritt 8: Video-Geschwindigkeitsanpassung
 EXECUTE_VIDEO_CREATION =    True        # Schritt 9: Finales Video
@@ -8793,6 +9109,7 @@ def main():
             time.sleep(2)
 
         if EXECUTE_TTS:
+            print(f"Flash Attention 2 verfügbar: {is_flash_attn_2_available()}")
             text_to_speech_with_voice_cloning(
                 TTS_FORMATTED_TRANSLATION_FILE,
                 SAMPLE_PATH_1,
