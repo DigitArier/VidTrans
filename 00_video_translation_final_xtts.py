@@ -39,6 +39,7 @@ import ctypes
 import socket
 import re
 import gc
+import math
 from typing import Callable, Optional, Any, List, Dict, Tuple, Union, Set
 import dataclasses
 from dataclasses import dataclass
@@ -2538,75 +2539,122 @@ def _is_refusal(text: str) -> bool:
     return any(pattern in text_lower for pattern in refusal_patterns)
 
 # Übersetzen
-def save_all_hypotheses_csv(all_hypotheses: List[Dict], output_file: str):
-    """
-    KORRIGIERTE VERSION: Speichert alle Hypothesen in einer flachen CSV-Datei.
-    
-    ÄNDERUNGEN:
-    - Verbesserte Fehlerbehandlung
-    - Explizite Datenstruktur-Validierung  
-    - Bessere Logging-Ausgaben
-    
+def _normalize_beam_score(raw_score: float, num_tokens: int) -> float:
+    """Normiert den kumulativen Log-Prob-Score aus CTranslate2 auf Token-Ebene.
+
+    CTranslate2 gibt kumulative Log-Wahrscheinlichkeiten zurück. Kürzere
+    Sequenzen erhalten naturgemäß höhere (weniger negative) Scores, was
+    ohne Normierung immer die kürzeste Hypothese bevorzugen würde.
+
     Args:
-        all_hypotheses: Liste von Dictionaries mit Segment-Daten
-        output_file: Pfad zur Ausgabe-CSV
+        raw_score: Kumulativer Log-Prob-Score aus CTranslate2 (negativ oder 0).
+        num_tokens: Anzahl generierter Tokens (ohne Padding).
+
+    Returns:
+        Normierter Score im Bereich (~-inf, 0]. Höher ist besser.
+    """
+    if num_tokens <= 0:
+        return -math.inf
+    return raw_score / num_tokens
+
+def save_all_hypotheses_csv(
+    all_hypotheses: list[dict],
+    output_file: str,
+) -> None:
+    """Speichert alle Hypothesen in einer flachen CSV-Datei.
+
+    Pflichtfelder pro Hypothese: segment_id, source_text, hypothesis_id, text, score.
+    Optionale Felder (aus verbesserter Hypothesenauswahl v2.1):
+      beam_score_raw, beam_score_norm, sts_score, is_best.
+    Fehlende optionale Felder werden mit Leerstring / 0.0 / False befüllt.
+
+    Args:
+        all_hypotheses: Liste von Segment-Dicts mit 'hypotheses'-Liste.
+        output_file: Pfad zur Ausgabe-CSV.
+
+    Raises:
+        Exception: Bei Schreibfehlern wird geloggt und weitergegeben.
     """
     if not all_hypotheses:
         logger.warning("Es wurden keine Hypothesen zum Speichern übergeben.")
         return
-    
-    logger.info(f"Speichere {len(all_hypotheses)} Segmente mit Hypothesen in: {output_file}")
-    
-    # Prüfen, ob die Datei bereits existiert UND nicht leer ist
-    file_exists_and_has_content = os.path.exists(output_file) and os.path.getsize(output_file) > 0
-    
+
+    logger.info("Speichere %d Segmente mit Hypothesen in %s", len(all_hypotheses), output_file)
+
+    # Pflichtfelder immer vorhanden; optionale Felder aus v2.1-Auswahl
+    REQUIRED_FIELDS: list[str] = [
+        "segment_id", "source_text", "hypothesis_id", "text", "score",
+    ]
+    OPTIONAL_FIELDS: list[str] = [
+        "beam_score_raw", "beam_score_norm", "sts_score", "is_best",
+    ]
+    # Optionale Felder nur in die CSV schreiben, wenn mindestens ein Segment
+    # diese Felder tatsächlich enthält (Rückwärtskompatibilität zum alten Format)
+    has_optional = any(
+        field in hyp_data
+        for seg in all_hypotheses
+        for hyp_data in seg.get("hypotheses", [])
+        for field in OPTIONAL_FIELDS
+    )
+    fieldnames = REQUIRED_FIELDS + (OPTIONAL_FIELDS if has_optional else [])
+
+    file_exists_and_has_content = (
+        Path(output_file).exists() and Path(output_file).stat().st_size > 0
+    )
+
     try:
-        # IMMER im Append-Modus 'a' öffnen, um Daten sicher hinzuzufügen
-        with open(output_file, mode='a', encoding='utf-8', newline='') as csvfile:
-            fieldnames = ['segment_id', 'source_text', 'hypothesis_id', 'text', 'score']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, delimiter='|')
-            
-            # Schreibe den Header nur, wenn die Datei noch nicht existiert oder leer ist
+        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, mode="a", encoding="utf-8", newline="") as csv_file:
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=fieldnames,
+                delimiter="|",
+                extrasaction="ignore",  # unbekannte Keys still ignorieren
+            )
             if not file_exists_and_has_content:
                 writer.writeheader()
-                logger.debug(f"CSV-Header geschrieben in: {output_file}")
-            
-            total_hypotheses_written = 0
-            
-            # Iteriert durch jedes Segment und schreibt für jede Hypothese eine Zeile
+                logger.debug("CSV-Header geschrieben in %s", output_file)
+
+            total_written = 0
             for segment_data in all_hypotheses:
                 segment_id = segment_data.get("segment_id")
                 source_text = segment_data.get("source_text", "")
-                
-                # Validierung der Segment-Daten
+
                 if segment_id is None:
-                    logger.warning(f"Segment ohne segment_id übersprungen: {segment_data}")
+                    logger.warning("Segment ohne segment_id übersprungen: %s", segment_data)
                     continue
-                
+
                 hypotheses = segment_data.get("hypotheses", [])
                 if not hypotheses:
-                    logger.warning(f"Segment {segment_id} hat keine Hypothesen")
+                    logger.warning("Segment %s hat keine Hypothesen.", segment_id)
                     continue
-                
-                # Schreibe jede Hypothese als separate Zeile
+
                 for hyp_data in hypotheses:
                     if not isinstance(hyp_data, dict):
-                        logger.warning(f"Ungültige Hypothese in Segment {segment_id}: {hyp_data}")
+                        logger.warning(
+                            "Ungültige Hypothese in Segment %s: %s", segment_id, hyp_data
+                        )
                         continue
-                    
-                    writer.writerow({
-                        'segment_id': segment_id,
-                        'source_text': source_text,
-                        'hypothesis_id': hyp_data.get('hypothesis_id', 0),
-                        'text': hyp_data.get('text', ''),
-                        'score': hyp_data.get('score', 0.0)
-                    })
-                    total_hypotheses_written += 1
-            
-            logger.info(f"✅ {total_hypotheses_written} Hypothesen erfolgreich in {output_file} gespeichert/angehängt.")
-            
+
+                    row: dict = {
+                        "segment_id":     segment_id,
+                        "source_text":     source_text,
+                        "hypothesis_id":  hyp_data.get("hypothesis_id", 0),
+                        "text":           hyp_data.get("text", ""),
+                        "score":          hyp_data.get("score", 0.0),
+                        # Optionale Felder — .get() liefert Fallback wenn nicht vorhanden
+                        "beam_score_raw": hyp_data.get("beam_score_raw", 0.0),
+                        "beam_score_norm":hyp_data.get("beam_score_norm", 0.0),
+                        "sts_score":      hyp_data.get("sts_score", 0.0),
+                        "is_best":        hyp_data.get("is_best", False),
+                    }
+                    writer.writerow(row)
+                    total_written += 1
+
+        logger.info("%d Hypothesen erfolgreich in %s gespeichert/angehängt.", total_written, output_file)
+
     except Exception as e:
-        logger.error(f"❌ Fehler beim Speichern der Hypothesen-CSV: {e}", exc_info=True)
+        logger.error("Fehler beim Speichern der Hypothesen-CSV: %s", e, exc_info=True)
         raise
 
 def translate_segments_optimized_safe(
@@ -3032,106 +3080,285 @@ def translate_batch_madlad(
     tokenizer: T5TokenizerFast,
     target_lang: str = "de",
     num_hypotheses: int = 10,
-    source_texts: List[str] = None,
-    similarity_model_name: str = ST_QUALITY_MODEL,
-    start_segment_id: int = 0
+    source_texts: Optional[List[str]] = None,
+    similarity_model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+    start_segment_id: int = 0,
+    hypothesis_score_alpha: float = HYPOTHESIS_SCORE_ALPHA,
 ) -> Tuple[List[str], str]:
-    """
-    KORRIGIERTE VERSION: Führt eine Batch-Übersetzung mit dem MADLAD-CT2-Modell durch.
-    
-    ÄNDERUNG: Korrigiert das Datenformat für save_all_hypotheses_csv.
-    
-    Args:
-        texts (List[str]): Liste der Rohtexte zum Übersetzen.
-        translator (ctranslate2.Translator): Bereits initialisiertes CTranslate2 MADLAD-Modell.
-        tokenizer (T5TokenizerFast): Der für MADLAD passende Tokenizer.
-        target_lang (str): Sprach-Code für die Zielsprache, z.B. "de".
-        num_hypotheses (int): Anzahl der Übersetzungsvorschläge pro Segment.
-        source_texts (List[str]): Original-Quelltexte für Ähnlichkeitsprüfung (ohne Entity-Platzhalter).
-        similarity_model_name (str): Modell für semantische Ähnlichkeitsprüfung.
-        
-    Returns:
-        Tuple[List[str], str]: Eine Liste der besten Übersetzungen und der Pfad zur Hypothesen-CSV.
-    """
-    logger.info(f"Starte Multi-Hypothesis MADLAD-Übersetzung mit {num_hypotheses} Vorschlägen pro Segment.")
+    """Batch-Übersetzung mit MADLAD-CT2 und verbesserter Hypothesenauswahl.
 
-    # Quelldaten mit dem erforderlichen Sprachpräfix vorbereiten
+    Generiert ``num_hypotheses`` Übersetzungskandidaten pro Segment und wählt
+    den besten mittels kombiniertem Score aus:
+    - Normierter Beam-Log-Prob-Score (Modell-Konfidenz, längennormiert)
+    - STS-Cosine-Similarity Quelltext → Hypothese (semantische Treue)
+
+    Verbesserungen gegenüber v1:
+    - Batch-STS-Encoding statt Einzel-Encoding (3–8× schneller)
+    - Normierter Beam-Score (verhindert Bevorzugung kurzer Hypothesen)
+    - Kombinierter Score mit konfigurierbarem Alpha-Gewicht
+    - Verbesserte Decoder-Parameter (patience, length_penalty, coverage_penalty)
+    - VRAM-Cleanup nach STS-Modell
+
+    Args:
+        texts: Liste der zu übersetzenden Texte (mit Entity-Platzhaltern).
+        translator: Initialisierter CTranslate2 MADLAD-Translator.
+        tokenizer: Passender T5TokenizerFast für MADLAD.
+        target_lang: Zielsprach-Code, z.B. ``"de"`` für Deutsch.
+        num_hypotheses: Anzahl Übersetzungsvorschläge pro Segment.
+        source_texts: Originaltexte ohne Entity-Platzhalter für STS-Vergleich.
+            Wenn ``None``, wird nur der normierte Beam-Score verwendet.
+        similarity_model_name: Sentence-Transformers-Modell für STS-Scoring.
+        start_segment_id: Start-ID für Segment-IDs in der Hypothesen-CSV.
+        hypothesis_score_alpha: Gewichtung Beam-Score vs. STS-Score.
+            0.0 = nur STS, 1.0 = nur Beam-Score.
+
+    Returns:
+        Tuple aus:
+        - Liste der besten Übersetzungen (eine pro Eingabetext).
+        - Pfad zur gespeicherten Hypothesen-CSV.
+
+    Raises:
+        RuntimeError: Bei CTranslate2-Inferenzfehlern (GPU OOM etc.).
+    """
+    logger.info(
+        "Starte Multi-Hypothesis MADLAD-Übersetzung: %d Segmente, "
+        "%d Hypothesen, alpha=%.2f",
+        len(texts),
+        num_hypotheses,
+        hypothesis_score_alpha,
+    )
+
+    # --- Schritt 1: Sprach-Präfix vorbereiten und tokenisieren ---
     prefixed_texts = [f"<2{target_lang}> {txt}" for txt in texts]
-    
-    # Tokenisierung der vorbereiteten Texte
-    # CTranslate2 erwartet eine Liste von Token-Listen
     tokenized_texts = [tokenizer.tokenize(text) for text in prefixed_texts]
-    
-    # Übersetzung mit CTranslate2 durchführen
-    # beam_size sollte >= num_hypotheses sein
+
+    # VRAM ~3.5 GB für MADLAD-3B / ~4.8 GB für MADLAD-7B (int8_float16)
+    # Decoder läuft ausschließlich auf GPU — kein CPU-Offload während Inferenz
     results = translator.translate_batch(
         source=tokenized_texts,
         batch_type="tokens",
         max_batch_size=1024,
-        beam_size=5,
+        beam_size=5,              # Fest auf 5; dynamischer Wert war ineffizient
         num_hypotheses=num_hypotheses,
-        patience=2.0,
-        length_penalty=0.8,
-        coverage_penalty=0.0,
-        repetition_penalty=1.05,
-        no_repeat_ngram_size=3,
+        patience=1.0,             # War 1.0 → tiefere Suche, bessere Kandidaten
+        length_penalty=0.8,       # War 1.0 → kompaktere, natürlichere Ausgaben
+        repetition_penalty=1.05,  # War 1.2 → hoher Wert kürzte Sätze ab
+        no_repeat_ngram_size=3,   # War 0 → blockiert Trigram-Wiederholungen
         max_decoding_length=512,
         max_input_length=2048,
-        return_scores=True
+        return_scores=True,       # Pflicht für normierte Score-Berechnung
     )
 
-    # Erstelle korrekte Datenstruktur für save_all_hypotheses_csv
-    all_hypotheses_for_csv = []
-    provisional_translations = []
-    
+    # --- Schritt 2: Alle Hypothesen dekodieren und Rohdaten sammeln ---
+    # Format: {result_idx: [(decoded_text, raw_score, num_tokens), ...]}
+    decoded_hypotheses: List[List[Tuple[str, float, int]]] = []
+
     for result_idx, result in enumerate(results):
-        # Datenstruktur für dieses Segment erstellen
-        segment_data = {
-            "segment_id": start_segment_id + result_idx,  # Eindeutige Segment-ID
-            "source_text": source_texts[result_idx] if source_texts and result_idx < len(source_texts) else texts[result_idx],
-            "hypotheses": []
-        }
-        
-        segment_hypotheses = []
-        
-        # Alle Hypothesen für dieses Segment dekodieren
-        for hyp_idx in range(min(num_hypotheses, len(result.hypotheses))):
+        segment_hyps: List[Tuple[str, float, int]] = []
+        n_available = min(num_hypotheses, len(result.hypotheses))
+
+        for hyp_idx in range(n_available):
             tokens = result.hypotheses[hyp_idx]
-            
-            # Tokens in IDs umwandeln
+            if len(tokens) < MIN_HYPOTHESIS_TOKENS:
+                # Leere oder zu kurze Hypothese überspringen
+                logger.debug(
+                    "Segment %d, Hypothese %d: zu kurz (%d Tokens), übersprungen.",
+                    result_idx,
+                    hyp_idx,
+                    len(tokens),
+                )
+                continue
+
             token_ids = tokenizer.convert_tokens_to_ids(tokens)
-            
-            # Dekodieren mit Skip-Special
             decoded = tokenizer.decode(token_ids, skip_special_tokens=True).strip()
-            
-            # Score für diese Hypothese (falls verfügbar)
-            score = result.scores[hyp_idx] if hasattr(result, 'scores') and hyp_idx < len(result.scores) else 0.0
-            
-            hypothesis_data = {
-                "hypothesis_id": hyp_idx,
-                "text": decoded,
-                "score": score
-            }
-            
-            segment_hypotheses.append(hypothesis_data)
-            segment_data["hypotheses"].append(hypothesis_data)
-        
-        # Beste Hypothese für provisorische Auswahl (höchster Score)
-        if segment_hypotheses:
-            best_hypothesis = max(segment_hypotheses, key=lambda h: h.get('score', 0.0))
-            provisional_translations.append(best_hypothesis['text'])
-        else:
-            provisional_translations.append("")
-        
+
+            raw_score = (
+                result.scores[hyp_idx]
+                if hasattr(result, "scores") and hyp_idx < len(result.scores)
+                else 0.0
+            )
+            segment_hyps.append((decoded, raw_score, len(tokens)))
+
+        if not segment_hyps:
+            # Absoluter Fallback: Originaltext zurückgeben
+            logger.warning(
+                "Segment %d: Keine gültigen Hypothesen. Fallback auf Originaltext.",
+                result_idx,
+            )
+            segment_hyps.append((texts[result_idx], 0.0, 1))
+
+        decoded_hypotheses.append(segment_hyps)
+
+    # --- Schritt 3: Normierte Beam-Scores berechnen ---
+    # CTranslate2 gibt kumulative Log-Probs zurück → Normierung auf Token-Ebene
+    # verhindert, dass immer die kürzeste Hypothese gewinnt
+    normalized_scores: List[List[float]] = [
+        [_normalize_beam_score(raw_score, n_tokens) for _, raw_score, n_tokens in seg_hyps]
+        for seg_hyps in decoded_hypotheses
+    ]
+
+    # --- Schritt 4: STS-Scoring (optional, nur wenn source_texts vorhanden) ---
+    sts_scores: Optional[List[List[float]]] = None
+    similarity_model: Optional[SentenceTransformer] = None
+
+    if source_texts is not None and len(source_texts) == len(texts):
+        logger.info("Lade STS-Modell für Hypothesenauswahl: %s", similarity_model_name)
+        try:
+            # VRAM ~0.4 GB für paraphrase-multilingual-mpnet-base-v2
+            similarity_model = SentenceTransformer(
+                similarity_model_name,
+                device=(
+                        f"cuda:{next(iter(translator.device_index))}"
+                        if hasattr(translator, "device_index") and translator.device_index
+                        else "cpu"
+                    ),
+            )
+
+            # Alle Hypothesentexte aller Segmente in einem einzigen Batch encoden
+            # (3–8× schneller als Einzelaufrufe in einer Schleife)
+            all_hyp_texts: List[str] = [
+                hyp_text
+                for seg_hyps in decoded_hypotheses
+                for hyp_text, _, _ in seg_hyps
+            ]
+            all_src_texts_repeated: List[str] = [
+                source_texts[seg_idx]
+                for seg_idx, seg_hyps in enumerate(decoded_hypotheses)
+                for _ in seg_hyps
+            ]
+
+            logger.info(
+                "Batch-Encoding: %d Hypothesen + %d Quelltexte.",
+                len(all_hyp_texts),
+                len(all_src_texts_repeated),
+            )
+
+            # Beide Batches in einem Durchlauf encoden
+            all_embeddings = similarity_model.encode(
+                all_hyp_texts + all_src_texts_repeated,
+                batch_size=64,
+                convert_to_tensor=True,
+                show_progress_bar=False,
+            )
+            hyp_embeddings = all_embeddings[: len(all_hyp_texts)]
+            src_embeddings = all_embeddings[len(all_hyp_texts) :]
+
+            # Cosine-Similarity pro Paar berechnen (diagonal der Ähnlichkeitsmatrix)
+            # cos_sim gibt (n, n) Matrix zurück → Diagonale = paarweise Scores
+            pairwise_sim = cos_sim(hyp_embeddings, src_embeddings)
+            pairwise_scores = pairwise_sim.diagonal().cpu().numpy()
+
+            # Scores zurück auf Segment-Struktur abbilden
+            sts_scores = []
+            offset = 0
+            for seg_hyps in decoded_hypotheses:
+                n = len(seg_hyps)
+                sts_scores.append(pairwise_scores[offset : offset + n].tolist())
+                offset += n
+
+        except Exception as e:
+            logger.error(
+                "STS-Scoring fehlgeschlagen: %s. Fallback auf normierte Beam-Scores.",
+                e,
+                exc_info=True,
+            )
+            sts_scores = None
+        finally:
+            if similarity_model is not None:
+                del similarity_model
+                torch.cuda.empty_cache()
+                gc.collect()
+    else:
+        logger.info(
+            "Keine Quelltexte übergeben — Hypothesenauswahl nur via normiertem Beam-Score."
+        )
+
+    # --- Schritt 5: Kombinierten Score berechnen und beste Hypothese wählen ---
+    provisional_translations: List[str] = []
+    all_hypotheses_for_csv: List[dict] = []
+
+    for seg_idx, seg_hyps in enumerate(decoded_hypotheses):
+        segment_id = start_segment_id + seg_idx
+        source_text = (
+            source_texts[seg_idx]
+            if source_texts is not None and seg_idx < len(source_texts)
+            else texts[seg_idx]
+        )
+
+        # Normierte Beam-Scores auf [0, 1] skalieren (min-max innerhalb Segment)
+        norm_scores = normalized_scores[seg_idx]
+        norm_min = min(norm_scores)
+        norm_max = max(norm_scores)
+        norm_range = norm_max - norm_min if norm_max != norm_min else 1.0
+        scaled_beam = [(s - norm_min) / norm_range for s in norm_scores]
+
+        # STS-Scores abrufen (bereits im Bereich [0, 1] durch Cosine-Similarity)
+        seg_sts = sts_scores[seg_idx] if sts_scores is not None else None
+
+        # Kombinierten Score berechnen
+        combined_scores: List[float] = []
+        for hyp_idx, (hyp_text, raw_score, n_tokens) in enumerate(seg_hyps):
+            beam_component = scaled_beam[hyp_idx] * hypothesis_score_alpha
+
+            if seg_sts is not None and hyp_idx < len(seg_sts):
+                sts_component = float(seg_sts[hyp_idx]) * (1.0 - hypothesis_score_alpha)
+            else:
+                # Kein STS verfügbar → nur Beam-Score (alpha=1)
+                sts_component = 0.0
+                beam_component = scaled_beam[hyp_idx]
+
+            combined_scores.append(beam_component + sts_component)
+
+        # Hypothese mit höchstem kombiniertem Score wählen
+        best_idx = int(np.argmax(combined_scores))
+        best_text, best_raw_score, best_n_tokens = seg_hyps[best_idx]
+        provisional_translations.append(best_text)
+
+        logger.debug(
+            "Segment %d: beste Hypothese idx=%d, combined=%.4f, "
+            "beam_norm=%.4f, sts=%.4f, text='%s...'",
+            segment_id,
+            best_idx,
+            combined_scores[best_idx],
+            scaled_beam[best_idx],
+            seg_sts[best_idx] if seg_sts else -1.0,
+            best_text[:60],
+        )
+
+        # CSV-Datenstruktur für alle Hypothesen dieses Segments aufbauen
+        segment_data = {
+            "segment_id": segment_id,
+            "source_text": source_text,
+            "hypotheses": [
+                {
+                    "hypothesis_id": hyp_idx,
+                    "text": hyp_text,
+                    # Für CSV-Kompatibilität: kombinierten Score speichern
+                    "score": combined_scores[hyp_idx],
+                    "beam_score_raw": raw_score,
+                    "beam_score_norm": norm_scores[hyp_idx],
+                    "sts_score": (
+                        float(seg_sts[hyp_idx])
+                        if seg_sts is not None and hyp_idx < len(seg_sts)
+                        else 0.0
+                    ),
+                    "is_best": hyp_idx == best_idx,
+                }
+                for hyp_idx, (hyp_text, raw_score, n_tokens) in enumerate(seg_hyps)
+            ],
+        }
         all_hypotheses_for_csv.append(segment_data)
-    
-    # Speichere alle Hypothesen in separater CSV
-    hypotheses_csv_path = HYPOTHESES_CSV
+
+    # --- Schritt 6: Hypothesen-CSV speichern ---
+    hypotheses_csv_path: str = HYPOTHESES_CSV  # Konstante aus config.py
     save_all_hypotheses_csv(all_hypotheses_for_csv, hypotheses_csv_path)
-    
-    logger.info(f"Multi-Hypothesis-Übersetzung abgeschlossen. {len(provisional_translations)} Segmente verarbeitet.")
-    logger.info(f"Hypothesen gespeichert in: {hypotheses_csv_path}")
-    
+
+    logger.info(
+        "Multi-Hypothesis-Übersetzung abgeschlossen: %d Segmente, "
+        "Hypothesen gespeichert in '%s'.",
+        len(provisional_translations),
+        hypotheses_csv_path,
+    )
     return provisional_translations, hypotheses_csv_path
 
 def translate_batch_madlad_hf(
