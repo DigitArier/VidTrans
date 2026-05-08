@@ -1,0 +1,40 @@
+{
+  	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"terminal.integrated.gpuAcceleration": "on",
+    "terminal.integrated.shellIntegration.enabled": true,
+		"git.ignoreLimitWarning": true,
+    "python.terminal.activateEnvironment": true,  
+    "terminal.integrated.profiles.windows": {
+      "VS Developer CMD": {
+          "path": "cmd.exe",
+          "args": [
+              "/k", 
+              "D:\\Program Files\\Microsoft Visual Studio\\2022\\VC\\Auxiliary\\Build\\vcvars64.bat",
+              "D:\\VideoTranslator\\venv_310\\Scripts\\activate.bat"
+    ],
+          "icon": "terminal-cmd",
+      },
+      "Custom CMD": {
+        "path": "cmd.exe",
+        "args": [
+          "/k",
+          "D:\\VideoTranslator\\venv_310\\Scripts\\activate.bat",
+        ],
+      },
+      "Custom PS": {
+        "path": "powershell.exe",
+        "args": [
+          "-NoExit",
+          "-Command",
+          "D:\\VideoTranslator\\venv_310\\Scripts\\activate.ps1",
+        ]
+      }
+  },
+    "terminal.integrated.defaultProfile.windows": "Custom PS",
+  }
+}
