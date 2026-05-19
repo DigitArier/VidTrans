@@ -1,9 +1,7 @@
-import torch
-
 # Dateipfade
-AUDIO_PATH =        "1_BABYLON the DECAPITATOR (DOCUMENTARY) 'RUN...NOAH, HIDE' (They have taken th_Full-HD_(Vocals).wav"
-VIDEO_PATH =        "BABYLON the DECAPITATOR (DOCUMENTARY) 'RUN...NOAH, HIDE' (They have taken th_Full-HD.mp4"
-FINAL_VIDEO_PATH =  "BABYLON the DECAPITATOR (DOCUMENTARY) 'RUN...NOAH, HIDE' (They have taken th_Full-HD_deutsch.mp4"
+AUDIO_PATH =        "2_BLOOD on the ALTAR (We did this for YEARS without knowing WHY)_Full-HD_(Vocals).wav"
+VIDEO_PATH =        "BLOOD on the ALTAR (We did this for YEARS without knowing WHY)_Full-HD.mp4"
+FINAL_VIDEO_PATH =  "BLOOD on the ALTAR (We did this for YEARS without knowing WHY)_Full-HD_deutsch_.mp4"
 ORIGINAL_AUDIO_PATH = "00_original_audio.wav"
 PROCESSED_AUDIO_PATH = "processed_audio.wav"
 PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
@@ -16,23 +14,7 @@ PROCESSED_AUDIO_PATH_SPEED = "processed_audio_speed.wav"
 SAMPLE_PATH_1 = "servant_sample-01.wav"
 SAMPLE_PATH_2 = "servant_sample-02.wav"
 SAMPLE_PATH_3 = "servant_sample-03.wav"
-#SAMPLE_PATH_4 = "servant_sample-04.wav"
-
-# HuggingFace-ID des OmniVoice-Modells (lokal cachen nach erstem Download)
-OMNIVOICE_MODEL_ID: str = "k2-fsa/OmniVoice"
-
-# BF16 halbiert den VRAM-Bedarf vs. FP32; auf RTX 4050 (Ampere) nativ unterstützt.
-# VRAM ~3.3 GB (Modellgewichte) + ~0.5–1 GB (Aktivierungen) = ~4 GB gesamt.
-OMNIVOICE_DTYPE = torch.bfloat16
-
-# Diffusion-Schritte: 16 = schnell+gut; 32 = beste Qualität (langsamer)
-OMNIVOICE_NUM_STEPS: int = 50
-
-# Sprechgeschwindigkeit – identisch zum bisherigen XTTS-Wert speed=1.05
-OMNIVOICE_SPEED: float = None
-
-# Zielsprache der Synthese
-OMNIVOICE_LANGUAGE: str = "de"
+SAMPLE_PATH_4 = "servant_sample-04.wav"
 
 # Sampling-Rate – identisch zu XTTS (24 kHz)
 OMNIVOICE_SAMPLE_RATE: int = 24_000

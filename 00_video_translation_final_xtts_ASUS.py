@@ -2898,170 +2898,7 @@ def translate_segments_optimized_safe(
 
     return translation_output_file, cleaned_source_output_file, hypotheses_csv_path
 
-def translate_segments_optimized_safe_hf(
-    refined_transcription_path: str,
-    master_entity_map,  # Dict[int, Dict[str, EntityInfo]]
-    translation_output_file: str,
-    cleaned_source_output_file: str,
-    source_lang: str = "en",
-    target_lang: str = "de",
-    model_repo: str = "enacimie/madlad400-3b-mt-Q4_K_M-GGUF",
-    gguf_file: str = "madlad400-3b-mt-q4_k_m.gguf",
-    device: str = "cuda",
-    batch_size: int = 1,
-    num_hypotheses: int = 10,
-    offload_folder: str = "madlad_weights"
-) -> Tuple[str, str, str]:
-    """
-    Übersetzt Segmente mit MADLAD-400 GGUF-Modell (HF Transformers).
-    
-    Diese Funktion ist ein Drop-in-Ersatz für die CTranslate2-basierte
-    translate_segments_optimized_safe-Funktion, nutzt aber GGUF via HF Transformers.
-    
-    Args:
-        refined_transcription_path (str): Pfad zur veredelten Quell-CSV
-        master_entity_map: Entity-Mapping von refine_text_pipeline
-        translation_output_file (str): Zieldatei für Übersetzung
-        cleaned_source_output_file (str): Zieldatei für bereinigten Quelltext
-        source_lang (str): Quellsprache
-        target_lang (str): Zielsprache
-        model_repo (str): HuggingFace Repository des GGUF-Modells
-        gguf_file (str): Dateiname des GGUF-Modells
-        device (str): Zielgerät ("cuda" oder "cpu")
-        batch_size (int): Batch-Größe (empfohlen: 1 für VRAM-Beschränkungen)
-        num_hypotheses (int): Anzahl Übersetzungshypothesen
-    
-    Returns:
-        Tuple[str, str, str]: Pfade zu Übersetzung, bereinigtem Quelltext, Hypothesen-CSV
-    """
 
-    if os.path.exists(translation_output_file) and not ask_overwrite(translation_output_file):
-        logger.info(f"Verwende vorhandenen Übersetzungsbericht: {translation_output_file}")
-        return translation_output_file, cleaned_source_output_file, HYPOTHESES_CSV
-    else:
-        # Der Benutzer möchte überschreiben, also räumen wir auf.
-        logger.info(f"Benutzer hat dem Überschreiben von '{translation_output_file}' zugestimmt. Alte temporäre Dateien werden entfernt.")
-        if os.path.exists(cleaned_source_output_file): os.remove(cleaned_source_output_file)
-        if os.path.exists(translation_output_file): os.remove(translation_output_file)
-        if os.path.exists(HYPOTHESES_CSV): os.remove(HYPOTHESES_CSV)
-
-    should_continue_translation, processed_keys = handle_key_based_continuation(
-        translation_output_file, refined_transcription_path, key_column_index=0
-    )
-
-    # Zusätzliche Abfrage, falls die Datei vollständig ist
-    if not should_continue_translation:
-        logger.info("Übersetzung wird übersprungen, da die Zieldatei vollständig ist.")
-        return translation_output_file, cleaned_source_output_file, ""
-
-    df_source = pd.read_csv(refined_transcription_path, sep='|', dtype=str).fillna('')
-
-    segments_to_process = []
-    source_texts_for_similarity = []
-    
-    for i, row in df_source.iterrows():
-        if row['startzeit'] not in processed_keys:
-            entity_map_str = row.get('entity_map', '{}')
-            current_entity_map = _json_str_to_entity_map(entity_map_str)
-            # Der Text aus der Veredelungs-Pipeline enthält bereits die Platzhalter.
-            protected_text = row['text']
-            clean_source = restore_entities_final(protected_text, current_entity_map)
-            segments_to_process.append({
-                "id": i,
-                "startzeit": row['startzeit'],
-                "endzeit": row['endzeit'],
-                "original_text": row['text'],
-                "protected_text": protected_text,
-                "entity_mapping": current_entity_map,
-                "clean_source_text": clean_source
-            })
-            source_texts_for_similarity.append(clean_source)
-
-
-    if not segments_to_process:
-        logger.info("Keine Segmente zu übersetzen")
-        return translation_output_file, cleaned_source_output_file, "hypotheses_madlad_hf.csv"
-
-
-    logger.info(f"Übersetze {len(segments_to_process)} Segmente...")
-
-
-    # Übersetzung durchführen
-    all_translations = [] if not os.path.exists(translation_output_file) else pd.read_csv(translation_output_file, sep='|', dtype=str).to_dict('records')
-    all_cleaned_sources = [] if not os.path.exists(cleaned_source_output_file) else pd.read_csv(cleaned_source_output_file, sep='|', dtype=str).to_dict('records')
-
-    translate_start_time = time.time()
-
-    # Modell und Tokenizer laden
-    logger.info(f"Verwende MADLAD-400 GGUF via HF Transformers für die Übersetzung")
-    model, tokenizer = load_madlad400_translator_hf(
-        model_repo=model_repo,
-        gguf_file=gguf_file,
-        device=device,
-        offload_folder=offload_folder
-    )
-
-    for idx in tqdm(range(0, len(segments_to_process), batch_size), desc="Übersetze Batches"):
-        batch_data = segments_to_process[idx:idx + batch_size]
-        texts_to_translate = [item["protected_text"] for item in batch_data]
-        batch_source_texts = source_texts_for_similarity[idx:idx + batch_size]
-        
-        # Batch übersetzen
-        best_translations = translate_batch_madlad_hf(
-            texts=texts_to_translate,
-            model=model,
-            tokenizer=tokenizer,
-            target_lang=target_lang
-        )
-        
-        # Ergebnisse speichern
-        for j, translated_text in enumerate(best_translations):
-            segment_data = batch_data[j]
-            current_entity_map = segment_data.get("entity_mapping", {})
-            
-            if not current_entity_map:
-                logger.warning(f"Kein Mapping für Segment {segment_data['id']}")
-                current_entity_map = {}
-            
-            # Entity-Wiederherstellung
-            final_translated_text = restore_entities_final(translated_text, current_entity_map)
-            
-            logger.debug(f"Segment {segment_data['id']}: {len(current_entity_map)} Entities")
-            print(f"{segment_data['startzeit']} -- {segment_data['endzeit']}")
-            print(f"{final_translated_text}")
-            print(f"Entities: {len(current_entity_map)} gefunden")
-            
-            all_translations.append({
-                "startzeit": segment_data["startzeit"],
-                "endzeit": segment_data["endzeit"],
-                "text": sanitize_for_csv_and_tts(final_translated_text)
-            })
-            
-            all_cleaned_sources.append({
-                "startzeit": segment_data["startzeit"],
-                "endzeit": segment_data["endzeit"],
-                "text": sanitize_for_csv_and_tts(segment_data["original_text"])
-            })
-        
-        # Fortschritt speichern
-        save_progress_csv(all_translations, translation_output_file)
-        save_progress_csv(all_cleaned_sources, cleaned_source_output_file)
-
-
-    # Ressourcen freigeben
-    del model
-    del tokenizer
-    torch.cuda.empty_cache()
-
-
-    translate_end_time = time.time() - translate_start_time
-    logger.info(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden")
-    print("---------------------------------")
-    print("Übersetzung abgeschlossen!")
-    print("---------------------------------")
-    print(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden = {translate_end_time/60:.2f} Minuten")
-    
-    return translation_output_file, cleaned_source_output_file, translation_output_file
 
 def translate_batch_madlad(
     texts: List[str],
@@ -3119,15 +2956,15 @@ def translate_batch_madlad(
         source=tokenized_texts,
         batch_type="tokens",
         max_batch_size=1024,
-        beam_size=10,           # ÄNDERUNG: 5 → 6; beam_size >= num_hypotheses empfohlen [cite:3][cite:9]
+        beam_size=10,           # ÄNDERUNG: 5 → 6; beam_size >= num_hypotheses empfohlen
         num_hypotheses=num_hypotheses,
         patience=2,            # unverändert: tiefe Suche, diverse Kandidaten
-        length_penalty=1.0,    # ÄNDERUNG: 0.8 → 1.0; neutrale Längenstrafe [cite:3][cite:4]
-        repetition_penalty=1.1,  # ÄNDERUNG: 1.0 → 1.1; sanfte Wiederholungsunterdrückung [cite:3]
-        coverage_penalty=0.2,  # NEU: bestraft unübersetzte Quell-Token [cite:4][cite:24]
-        #allow_early_exit=False,  # NEU: kein vorzeitiger Abbruch, alle Hypothesen vollständig dekodieren [cite:22]
+        length_penalty=1.0,    # ÄNDERUNG: 0.8 → 1.0; neutrale Längenstrafe
+        repetition_penalty=1.1,  # ÄNDERUNG: 1.0 → 1.1; sanfte Wiederholungsunterdrückung
+        coverage_penalty=0.2,  # NEU: bestraft unübersetzte Quell-Token
+        #allow_early_exit=False,  # NEU: kein vorzeitiger Abbruch, alle Hypothesen vollständig dekodieren
         no_repeat_ngram_size=3,  # unverändert: Trigram-Blockierung
-        min_decoding_length=3,   # NEU: verhindert leere/1-Token-Ausgaben bei Kurzsegmenten [cite:9]
+        min_decoding_length=3,   # NEU: verhindert leere/1-Token-Ausgaben bei Kurzsegmenten
         max_decoding_length=512,
         max_input_length=2048,
         return_scores=True,    # unverändert: Pflicht für normierten Beam-Score
@@ -3664,7 +3501,7 @@ def select_best_hypotheses_post_translation(
         logger.info(f"Lade Similarity-Modell: {similarity_model_name}")
         try:
             similarity_model = SentenceTransformer(
-                similarity_model_name, device=device, local_files_only=False
+                similarity_model_name, device=device, local_files_only=True
             )
 
             logger.info(
@@ -4258,62 +4095,6 @@ def create_vocabulary_support() -> str:
 
     return "\n".join(lines)
 
-def save_polishing_summary(
-    polishing_results: List[Dict],
-    stats: Dict,
-    summary_path: str
-) -> str:
-    """
-    Erstellt Polishing-Zusammenfassung als TXT (analog evaluate_translation_quality).
-    
-    Returns:
-        str: summary_path
-    """
-    
-    # Similarity-Statistiken
-    similarities_before = [r['similarity_before'] for r in polishing_results]
-    similarities_after = [r['similarity_after'] for r in polishing_results]
-    avg_sim_before = sum(similarities_before) / len(similarities_before) if similarities_before else 0
-    avg_sim_after = sum(similarities_after) / len(similarities_after) if similarities_after else 0
-    
-    # Polierte Segmente extrahieren
-    polished_segments = [r for r in polishing_results if r['status'] == 'POLISHED']
-    
-    # ========== SUMMARY-TEXT (exakt wie evaluate_translation_quality) ==========
-    summary_content = (
-        f"Polishing der Übersetzung - Zusammenfassung\n"
-        f"====================================================\n"
-        f"Datum der Prüfung: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"Quell-Segmente: {len(polishing_results)}\n"
-        f"Übersprungen (Ähnlichkeit > {stats['skip_threshold']}): {stats['skipped_count']}\n"
-        f"Poliert: {stats['polished_count']}\n"
-        f"Abgelehnt: {stats['rejected_count']}\n"
-        f"Unverändert: {stats['unchanged_count']}\n"
-        f"Durchschnittliche Ähnlichkeit (vorher): {avg_sim_before:.4f}\n"
-        f"Durchschnittliche Ähnlichkeit (nachher): {avg_sim_after:.4f}\n"
-        f"Verbesserung: {((avg_sim_after - avg_sim_before) / avg_sim_before * 100) if avg_sim_before > 0 else 0:.1f}%\n"
-        f"====================================================\n"
-        f"\nPolierte Segmente\n"
-        f"--------------------------------\n"
-    )
-    
-    if polished_segments:
-        for item in polished_segments:
-            summary_content += (
-                f"- Segment {item['index']}: {item['similarity_before']:.3f} -> {item['similarity_after']:.3f}\n"
-                f"  EN Original : {item['source_text']}\n"
-                f"  DE vorher   : {item['text_before']}\n"
-                f"  DE nachher  : {item['text_after']}\n\n"
-            )
-    else:
-        summary_content += "- (keine)\n"
-    
-    with open(summary_path, "w", encoding="utf-8") as f:
-        f.write(summary_content)
-    logger.info(f"Polishing-Zusammenfassung gespeichert: {summary_path}")
-    
-    return summary_path
-
 def evaluate_translation_quality(
     source_csv_path: str,
     translated_csv_path: str,
@@ -4402,7 +4183,7 @@ def evaluate_translation_quality(
                 model = SentenceTransformer(
                     model_name,
                     device=device,
-                    local_files_only=False,
+                    local_files_only=True,
                 )
                 pbar.update(1)
 
@@ -4873,6 +4654,62 @@ OUTPUT FORMAT
         )
         raise
 
+def save_polishing_summary(
+    polishing_results: List[Dict],
+    stats: Dict,
+    summary_path: str
+) -> str:
+    """
+    Erstellt Polishing-Zusammenfassung als TXT (analog evaluate_translation_quality).
+    
+    Returns:
+        str: summary_path
+    """
+    
+    # Similarity-Statistiken
+    similarities_before = [r['similarity_before'] for r in polishing_results]
+    similarities_after = [r['similarity_after'] for r in polishing_results]
+    avg_sim_before = sum(similarities_before) / len(similarities_before) if similarities_before else 0
+    avg_sim_after = sum(similarities_after) / len(similarities_after) if similarities_after else 0
+    
+    # Polierte Segmente extrahieren
+    polished_segments = [r for r in polishing_results if r['status'] == 'POLISHED']
+    
+    # ========== SUMMARY-TEXT (exakt wie evaluate_translation_quality) ==========
+    summary_content = (
+        f"Polishing der Übersetzung - Zusammenfassung\n"
+        f"====================================================\n"
+        f"Datum der Prüfung: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Quell-Segmente: {len(polishing_results)}\n"
+        f"Übersprungen (Ähnlichkeit > {stats['skip_threshold']}): {stats['skipped_count']}\n"
+        f"Poliert: {stats['polished_count']}\n"
+        f"Abgelehnt: {stats['rejected_count']}\n"
+        f"Unverändert: {stats['unchanged_count']}\n"
+        f"Durchschnittliche Ähnlichkeit (vorher): {avg_sim_before:.4f}\n"
+        f"Durchschnittliche Ähnlichkeit (nachher): {avg_sim_after:.4f}\n"
+        f"Verbesserung: {((avg_sim_after - avg_sim_before) / avg_sim_before * 100) if avg_sim_before > 0 else 0:.1f}%\n"
+        f"====================================================\n"
+        f"\nPolierte Segmente\n"
+        f"--------------------------------\n"
+    )
+    
+    if polished_segments:
+        for item in polished_segments:
+            summary_content += (
+                f"- Segment {item['index']}: {item['similarity_before']:.3f} -> {item['similarity_after']:.3f}\n"
+                f"  EN Original : {item['source_text']}\n"
+                f"  DE vorher   : {item['text_before']}\n"
+                f"  DE nachher  : {item['text_after']}\n\n"
+            )
+    else:
+        summary_content += "- (keine)\n"
+    
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(summary_content)
+    logger.info(f"Polishing-Zusammenfassung gespeichert: {summary_path}")
+    
+    return summary_path
+
 def polish_all_translations(
     source_csv_path: str,
     translated_csv_path: str,
@@ -4938,7 +4775,7 @@ def polish_all_translations(
                 model = SentenceTransformer(
                     model_name,
                     device=device,
-                    local_files_only=False,
+                    local_files_only=True,
                 )
                 pbar.update(1)
 
@@ -5516,7 +5353,7 @@ def generate_semantic_embeddings(input_csv_path, output_npz_path, output_csv_pat
         # Sentence Transformer Modell laden
         with gpu_context():
             logger.info(f"Lade Sentence Transformer Modell: {model_name}")
-            st_model = SentenceTransformer(model_name, device=device, local_files_only=False)
+            st_model = SentenceTransformer(model_name, device=device, local_files_only=True)
 
             # Embeddings berechnen
             logger.info(f"Berechne Embeddings für {len(texts)} Segmente...")
@@ -5930,7 +5767,7 @@ def refine_text_pipeline(
                 legacy=False, 
                 extra_ids=0, 
                 additional_special_tokens=_special_tokens_to_add, 
-                local_files_only=False
+                local_files_only=True
             )
 
             logger.info("Stufe 1/4: Interpunktion im Batch wiederherstellen...")
@@ -6394,7 +6231,7 @@ def format_for_tts_splitting(
         # ✅ GEÄNDERT: Entferne Punkte statt hinzuzufügen
         cleaned_text = seg['text'].strip()
         # Entferne alle abschließenden Punkte (., !, ?)
-        cleaned_text = re.sub(r'[.]+$', '.', cleaned_text).strip()
+        cleaned_text = re.sub(r'[.]+$', '...', cleaned_text).strip()
         seg['text'] = cleaned_text
 
     # Speichern des Ergebnisses
@@ -7915,7 +7752,6 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
 # ==============================================================================
 
 # Setzen Sie diese Flags, um Schritte gezielt zu überspringen
-USE_GGUF =                  False        # Ob GGUF-optimierte Modelle verwendet werden sollen
 EXECUTE_AUDIO_EXTRACTION =  True        # Schritt 1: Audio-Extraktion
 EXECUTE_TRANSCRIPTION =     True        # Schritte 2 & 3: Transkription und Veredelung
 EXECUTE_TRANSLATION =       True        # Schritt 4: Übersetzung & Hypothesen-Auswahl
@@ -8011,26 +7847,16 @@ def main():
         if EXECUTE_TRANSLATION:
             # SCHRITT 3: ÜBERSETZUNG
             if os.path.exists(REFINED_TRANSCRIPTION_FILE) or ask_overwrite(REFINED_TRANSCRIPTION_FILE):
-                if USE_GGUF:
-                    translate_segments_optimized_safe_hf(
-                        refined_transcription_path=REFINED_TRANSCRIPTION_FILE,
-                        master_entity_map=master_entity_map_en,
-                        translation_output_file=TRANSLATION_FILE,
-                        cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
-                        source_lang=source_lang,
-                        target_lang=target_lang
-                    )
-                else:
-                    translate_segments_optimized_safe(
-                        refined_transcription_path=REFINED_TRANSCRIPTION_FILE,
-                        master_entity_map=master_entity_map_en,
-                        translation_output_file=TRANSLATION_FILE,
-                        cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
-                        source_lang=source_lang,
-                        target_lang=target_lang,
-                        num_hypotheses=10,
-                        batch_size=8
-                    )
+                translate_segments_optimized_safe(
+                    refined_transcription_path=REFINED_TRANSCRIPTION_FILE,
+                    master_entity_map=master_entity_map_en,
+                    translation_output_file=TRANSLATION_FILE,
+                    cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    num_hypotheses=10,
+                    batch_size=8
+                )
             else:
                 logger.warning(f'Skipping Übersetzung: {REFINED_TRANSCRIPTION_FILE} nicht gefunden.')
 

@@ -40,6 +40,7 @@ import socket
 import re
 import gc
 import math
+import compat_patches
 from typing import Callable, Optional, Any, List, Dict, Tuple, Union, Set
 import dataclasses
 from dataclasses import dataclass
@@ -62,7 +63,7 @@ from spacy.tokens import Span
 import torch
 from torch.cuda import Stream
 torch.set_num_threads(6)
-#import deepspeed
+import deepspeed
 from accelerate import Accelerator
 import torch.nn as nn
 from audiostretchy.stretch import stretch_audio
@@ -100,7 +101,6 @@ from transformers import (
     GenerationMixin,
     QuantoConfig,
     T5Tokenizer,
-    T5TokenizerFast,
     T5ForConditionalGeneration
     )
 import transformers
@@ -112,7 +112,7 @@ from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
 from TTS.api import TTS
 from omnivoice import OmniVoice
-#import flash_attn
+import flash_attn
 #import whisper
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from pydub.effects import(
@@ -175,21 +175,21 @@ def setup_global_torch_optimizations():
         torch.backends.cuda.enable_math_sdp(False)
         logger.info("Optimierte Attention-Backends (Flash Attention) aktiviert.") # Loggt die Aktivierung.
 
-        logger.info("Konfiguriere Ollama für RTX 4050...")
+        logger.info("Konfiguriere Ollama für RTX 5070Ti...")
         
         # Erzwinge GPU-Nutzung für Ollama
         os.environ["OLLAMA_GPU"] = "1"
         os.environ["OLLAMA_FLASH_ATTENTION"] = "1"
         os.environ["OLLAMA_KV_CACHE_TYPE"] = "f16"
         os.environ["OLLAMA_NUM_GPU"] = "1"
-        os.environ["OLLAMA_MAX_VRAM"] = "10200"
+        os.environ["OLLAMA_MAX_VRAM"] = "11200"
         
-        # RTX 4050 spezifische Optimierungen
-        os.environ["OLLAMA_CUDA_ARCH"] = "12.0"  # Ada Lovelace Architektur
+        # RTX 5070Ti spezifische Optimierungen
+        os.environ["OLLAMA_CUDA_ARCH"] = "12.0"  # Blackwell Architektur
         os.environ["OLLAMA_CUDA_STREAMS"] = "4"  # Parallele CUDA-Streams
         os.environ["OLLAMA_CUDA_MEMORY_FRACTION"] = "0.85"  # 85% des VRAM nutzen
 
-        logger.info("Ollama-GPU-Konfiguration für RTX 4050 aktiviert.")
+        logger.info("Ollama-GPU-Konfiguration für RTX 5070Ti aktiviert.")
 
         # Erlaubt PyTorch, den TensorFloat-32 (TF32) Datentyp auf Ampere-GPUs (wie der RTX 4050) für MatMul zu nutzen. Beschleunigt stark.
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -332,7 +332,7 @@ src_lang="eng_Latn"
 target_lang="de"
 tgt_lang="deu_Latn"
 
-def start_language_tool_server(lt_path: str = "D:\\LanguageTool-6.6", port: int = 8010) -> Optional[subprocess.Popen]:
+def start_language_tool_server(lt_path: str = "C:\\Users\\regme\\Desktop\\VideoTranslator\\LanguageTool-6.6", port: int = 8010) -> Optional[subprocess.Popen]:
     """
     Startet den LanguageTool-Server als Subprozess und wartet, bis er bereit ist.
 
@@ -635,7 +635,7 @@ def load_whisper_model():
     """Lädt das Faster-Whisper-Modell (large-v3) für die Transkription."""
     model_size = "large-v3"
     # compute_type="int8_float16" nutzt INT8-Gewichte + FP16-Aktivierungen für Speed & geringen Speicher
-    fw_model = WhisperModel(model_size, device="auto", compute_type="float32", cpu_threads=6, local_files_only=True)
+    fw_model = WhisperModel(model_size, device="auto", compute_type="bfloat16", cpu_threads=16, local_files_only=True)
     pipeline = BatchedInferencePipeline(model=fw_model)
     return pipeline
 
@@ -652,13 +652,13 @@ def load_madlad400_translator_ct2(model_path: str = MADLAD400_MODEL_DIR, device:
     """
     logger.info(f"Lade CTranslate2-Modell von: {model_path}")
     # Der Translator wird direkt von CTranslate2 geladen.
-    translator = ctranslate2.Translator(model_path, device=device, compute_type="int8_float32")
+    translator = ctranslate2.Translator(model_path, device=device, compute_type="bfloat16")
     logger.info(f"Lade originalen Tokenizer von: {model_path}")
 
     special_tokens_to_add = [f"<extra_id_{i}>" for i in range(100)]
 
     # Der Tokenizer wird nun mit der Kenntnis über die speziellen Platzhalter initialisiert.
-    tokenizer = transformers.T5TokenizerFast.from_pretrained(
+    tokenizer = transformers.T5Tokenizer.from_pretrained(
         model_path,
         local_files_only=True,
         extra_ids=0,  # Wird durch die Liste unten abgedeckt, zur Sicherheit auf 0.
@@ -669,8 +669,8 @@ def load_madlad400_translator_ct2(model_path: str = MADLAD400_MODEL_DIR, device:
     return translator, tokenizer
 
 def load_madlad400_translator_hf(
-    model_repo: str = "enacimie/madlad400-7b-mt-Q4_K_M-GGUF",
-    gguf_file: str = "madlad400-7b-mt-q4_k_m.gguf",
+    model_repo: str = "enacimie/madlad400-3b-mt-Q4_K_M-GGUF",
+    gguf_file: str = "madlad400-3b-mt-q4_k_m.gguf",
     device: str = "cuda",
     offload_folder: str = "madlad_weights"
 ) -> Tuple[T5ForConditionalGeneration, T5Tokenizer]:
@@ -714,7 +714,7 @@ def load_madlad400_translator_hf(
         special_tokens_to_add = [f"<extra_id_{i}>" for i in range(100)]
 
         # Der Tokenizer wird nun mit der Kenntnis über die speziellen Platzhalter initialisiert.
-        tokenizer = transformers.T5TokenizerFast.from_pretrained(
+        tokenizer = transformers.T5Tokenizer.from_pretrained(
             MADLAD400_MODEL_DIR, 
             local_files_only=True,
             extra_ids=0,  # Wird durch die Liste unten abgedeckt, zur Sicherheit auf 0.
@@ -865,7 +865,6 @@ def load_omnivoice() -> OmniVoice:
     # VRAM ~3.3 GB für BF16-Gewichte werden reserviert
     logger.info(
         "Lade OmniVoice-Modell "
-        f"(ID='{OMNIVOICE_MODEL_ID}', dtype={OMNIVOICE_DTYPE})..."
     )
 
     if torch.cuda.is_available():
@@ -890,9 +889,9 @@ def load_omnivoice() -> OmniVoice:
     try:
         # VRAM ~3.3 GB (BF16): Modell laden
         omnivoice_model = OmniVoice.from_pretrained(
-            OMNIVOICE_MODEL_ID,
+            "k2-fsa/OmniVoice",
             device_map="auto",       # automatisches CPU-Offloading bei VRAM-Engpass
-            dtype=OMNIVOICE_DTYPE,   # torch.bfloat16 = halber VRAM vs. FP32
+            dtype=torch.bfloat16,   # torch.bfloat16 = halber VRAM vs. FP32
         )
         omnivoice_model.eval()
 
@@ -1664,7 +1663,7 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
             segments_generator, info = pipeline.transcribe(
                 audio_file,
                 # === Bestehende Parameter beibehalten ===
-                batch_size=2,                              # Für deine 6GB VRAM
+                batch_size=12,                              # Für deine 12GB VRAM
                 beam_size=10,                              # Bereits optimal
                 patience=2.0,                              # Bereits vorhanden
                 
@@ -1675,13 +1674,13 @@ def transcribe_audio_with_timestamps(audio_file, transcription_file, batch_save_
                 # === HALLUZINATIONS-REDUKTION ===
                 hallucination_silence_threshold=0.15,     # Frühe Erkennung
                 compression_ratio_threshold=2.5,           # Verschärft von 2.8
-                log_prob_threshold=-0.15,                  # Höhere Schwelle
+                log_prob_threshold=-0.35,                  # Höhere Schwelle
                 no_speech_threshold=0.6,                   # Konservativer
                 
                 # === QUALITÄTS-VERBESSERUNGEN ===  
                 repetition_penalty=1.08,                   # Wiederholungen reduzieren
                 no_repeat_ngram_size=6,                    # 6-Gram Filter
-                temperature=0.15,                          # Kontrollierte Variation
+                temperature=0,                          # Kontrollierte Variation
                 word_timestamps=True,                      # Präzise Zeitstempel
                 condition_on_previous_text=False,           # Kontext zwischen Segmenten
                 
@@ -2826,7 +2825,7 @@ def translate_segments_optimized_safe(
     src_lang: str = "eng_Latn",
     tgt_lang: str = "deu_Latn",
     batch_size: int = 2,
-    num_hypotheses: int = 10
+    num_hypotheses: int = 5
 ) -> Tuple[str, str]:
     """
     Übersetzt Segmente mit verbesserter Entity-Behandlung und Multi-Hypothesis-Unterstützung.
@@ -2965,175 +2964,12 @@ def translate_segments_optimized_safe(
 
     return translation_output_file, cleaned_source_output_file, hypotheses_csv_path
 
-def translate_segments_optimized_safe_hf(
-    refined_transcription_path: str,
-    master_entity_map,  # Dict[int, Dict[str, EntityInfo]]
-    translation_output_file: str,
-    cleaned_source_output_file: str,
-    source_lang: str = "en",
-    target_lang: str = "de",
-    model_repo: str = "enacimie/madlad400-7b-mt-Q4_K_M-GGUF",
-    gguf_file: str = "madlad400-7b-mt-q4_k_m.gguf",
-    device: str = "cuda",
-    batch_size: int = 1,
-    num_hypotheses: int = 10,
-    offload_folder: str = "madlad_weights"
-) -> Tuple[str, str, str]:
-    """
-    Übersetzt Segmente mit MADLAD-400 GGUF-Modell (HF Transformers).
-    
-    Diese Funktion ist ein Drop-in-Ersatz für die CTranslate2-basierte
-    translate_segments_optimized_safe-Funktion, nutzt aber GGUF via HF Transformers.
-    
-    Args:
-        refined_transcription_path (str): Pfad zur veredelten Quell-CSV
-        master_entity_map: Entity-Mapping von refine_text_pipeline
-        translation_output_file (str): Zieldatei für Übersetzung
-        cleaned_source_output_file (str): Zieldatei für bereinigten Quelltext
-        source_lang (str): Quellsprache
-        target_lang (str): Zielsprache
-        model_repo (str): HuggingFace Repository des GGUF-Modells
-        gguf_file (str): Dateiname des GGUF-Modells
-        device (str): Zielgerät ("cuda" oder "cpu")
-        batch_size (int): Batch-Größe (empfohlen: 1 für VRAM-Beschränkungen)
-        num_hypotheses (int): Anzahl Übersetzungshypothesen
-    
-    Returns:
-        Tuple[str, str, str]: Pfade zu Übersetzung, bereinigtem Quelltext, Hypothesen-CSV
-    """
 
-    if os.path.exists(translation_output_file) and not ask_overwrite(translation_output_file):
-        logger.info(f"Verwende vorhandenen Übersetzungsbericht: {translation_output_file}")
-        return translation_output_file, cleaned_source_output_file, HYPOTHESES_CSV
-    else:
-        # Der Benutzer möchte überschreiben, also räumen wir auf.
-        logger.info(f"Benutzer hat dem Überschreiben von '{translation_output_file}' zugestimmt. Alte temporäre Dateien werden entfernt.")
-        if os.path.exists(cleaned_source_output_file): os.remove(cleaned_source_output_file)
-        if os.path.exists(translation_output_file): os.remove(translation_output_file)
-        if os.path.exists(HYPOTHESES_CSV): os.remove(HYPOTHESES_CSV)
-
-    should_continue_translation, processed_keys = handle_key_based_continuation(
-        translation_output_file, refined_transcription_path, key_column_index=0
-    )
-
-    # Zusätzliche Abfrage, falls die Datei vollständig ist
-    if not should_continue_translation:
-        logger.info("Übersetzung wird übersprungen, da die Zieldatei vollständig ist.")
-        return translation_output_file, cleaned_source_output_file, ""
-
-    df_source = pd.read_csv(refined_transcription_path, sep='|', dtype=str).fillna('')
-
-    segments_to_process = []
-    source_texts_for_similarity = []
-    
-    for i, row in df_source.iterrows():
-        if row['startzeit'] not in processed_keys:
-            entity_map_str = row.get('entity_map', '{}')
-            current_entity_map = _json_str_to_entity_map(entity_map_str)
-            # Der Text aus der Veredelungs-Pipeline enthält bereits die Platzhalter.
-            protected_text = row['text']
-            clean_source = restore_entities_final(protected_text, current_entity_map)
-            segments_to_process.append({
-                "id": i,
-                "startzeit": row['startzeit'],
-                "endzeit": row['endzeit'],
-                "original_text": row['text'],
-                "protected_text": protected_text,
-                "entity_mapping": current_entity_map,
-                "clean_source_text": clean_source
-            })
-            source_texts_for_similarity.append(clean_source)
-
-
-    if not segments_to_process:
-        logger.info("Keine Segmente zu übersetzen")
-        return translation_output_file, cleaned_source_output_file, "hypotheses_madlad_hf.csv"
-
-
-    logger.info(f"Übersetze {len(segments_to_process)} Segmente...")
-
-
-    # Übersetzung durchführen
-    all_translations = [] if not os.path.exists(translation_output_file) else pd.read_csv(translation_output_file, sep='|', dtype=str).to_dict('records')
-    all_cleaned_sources = [] if not os.path.exists(cleaned_source_output_file) else pd.read_csv(cleaned_source_output_file, sep='|', dtype=str).to_dict('records')
-
-    translate_start_time = time.time()
-
-    # Modell und Tokenizer laden
-    logger.info(f"Verwende MADLAD-400 GGUF via HF Transformers für die Übersetzung")
-    model, tokenizer = load_madlad400_translator_hf(
-        model_repo=model_repo,
-        gguf_file=gguf_file,
-        device=device,
-        offload_folder=offload_folder
-    )
-
-    for idx in tqdm(range(0, len(segments_to_process), batch_size), desc="Übersetze Batches"):
-        batch_data = segments_to_process[idx:idx + batch_size]
-        texts_to_translate = [item["protected_text"] for item in batch_data]
-        batch_source_texts = source_texts_for_similarity[idx:idx + batch_size]
-        
-        # Batch übersetzen
-        best_translations = translate_batch_madlad_hf(
-            texts=texts_to_translate,
-            model=model,
-            tokenizer=tokenizer,
-            target_lang=target_lang
-        )
-        
-        # Ergebnisse speichern
-        for j, translated_text in enumerate(best_translations):
-            segment_data = batch_data[j]
-            current_entity_map = segment_data.get("entity_mapping", {})
-            
-            if not current_entity_map:
-                logger.warning(f"Kein Mapping für Segment {segment_data['id']}")
-                current_entity_map = {}
-            
-            # Entity-Wiederherstellung
-            final_translated_text = restore_entities_final(translated_text, current_entity_map)
-            
-            logger.debug(f"Segment {segment_data['id']}: {len(current_entity_map)} Entities")
-            print(f"{segment_data['startzeit']} -- {segment_data['endzeit']}")
-            print(f"{final_translated_text}")
-            print(f"Entities: {len(current_entity_map)} gefunden")
-            
-            all_translations.append({
-                "startzeit": segment_data["startzeit"],
-                "endzeit": segment_data["endzeit"],
-                "text": sanitize_for_csv_and_tts(final_translated_text)
-            })
-            
-            all_cleaned_sources.append({
-                "startzeit": segment_data["startzeit"],
-                "endzeit": segment_data["endzeit"],
-                "text": sanitize_for_csv_and_tts(segment_data["original_text"])
-            })
-        
-        # Fortschritt speichern
-        save_progress_csv(all_translations, translation_output_file)
-        save_progress_csv(all_cleaned_sources, cleaned_source_output_file)
-
-
-    # Ressourcen freigeben
-    del model
-    del tokenizer
-    torch.cuda.empty_cache()
-
-
-    translate_end_time = time.time() - translate_start_time
-    logger.info(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden")
-    print("---------------------------------")
-    print("Übersetzung abgeschlossen!")
-    print("---------------------------------")
-    print(f"Übersetzung abgeschlossen in {translate_end_time:.2f} Sekunden = {translate_end_time/60:.2f} Minuten")
-    
-    return translation_output_file, cleaned_source_output_file, translation_output_file
 
 def translate_batch_madlad(
     texts: List[str],
     translator: ctranslate2.Translator,
-    tokenizer: T5TokenizerFast,
+    tokenizer: T5Tokenizer,
     target_lang: str = "de",
     num_hypotheses: int = 10,
     source_texts: Optional[List[str]] = None,
@@ -3155,7 +2991,7 @@ def translate_batch_madlad(
     Args:
         texts: Liste der zu übersetzenden Texte (mit Entity-Platzhaltern).
         translator: Initialisierter CTranslate2 MADLAD-Translator.
-        tokenizer: Passender T5TokenizerFast für MADLAD.
+        tokenizer: Passender T5Tokenizer für MADLAD.
         target_lang: Zielsprach-Code, z.B. ``"de"`` für Deutsch.
         num_hypotheses: Anzahl Übersetzungsvorschläge pro Segment.
         source_texts: Originaltexte ohne Entity-Platzhalter (für CSV-Referenz).
@@ -3186,15 +3022,15 @@ def translate_batch_madlad(
         source=tokenized_texts,
         batch_type="tokens",
         max_batch_size=1024,
-        beam_size=7,           # ÄNDERUNG: 5 → 6; beam_size >= num_hypotheses empfohlen [cite:3][cite:9]
+        beam_size=10,           # ÄNDERUNG: 5 → 6; beam_size >= num_hypotheses empfohlen
         num_hypotheses=num_hypotheses,
         patience=2,            # unverändert: tiefe Suche, diverse Kandidaten
-        length_penalty=1.0,    # ÄNDERUNG: 0.8 → 1.0; neutrale Längenstrafe [cite:3][cite:4]
-        repetition_penalty=1.1,  # ÄNDERUNG: 1.0 → 1.1; sanfte Wiederholungsunterdrückung [cite:3]
-        coverage_penalty=0.2,  # NEU: bestraft unübersetzte Quell-Token [cite:4][cite:24]
-        #allow_early_exit=False,  # NEU: kein vorzeitiger Abbruch, alle Hypothesen vollständig dekodieren [cite:22]
+        length_penalty=1.0,    # ÄNDERUNG: 0.8 → 1.0; neutrale Längenstrafe
+        repetition_penalty=1.1,  # ÄNDERUNG: 1.0 → 1.1; sanfte Wiederholungsunterdrückung
+        coverage_penalty=0.2,  # NEU: bestraft unübersetzte Quell-Token
+        #allow_early_exit=False,  # NEU: kein vorzeitiger Abbruch, alle Hypothesen vollständig dekodieren
         no_repeat_ngram_size=3,  # unverändert: Trigram-Blockierung
-        min_decoding_length=3,   # NEU: verhindert leere/1-Token-Ausgaben bei Kurzsegmenten [cite:9]
+        min_decoding_length=3,   # NEU: verhindert leere/1-Token-Ausgaben bei Kurzsegmenten
         max_decoding_length=512,
         max_input_length=2048,
         return_scores=True,    # unverändert: Pflicht für normierten Beam-Score
@@ -4469,8 +4305,8 @@ def evaluate_translation_quality(
             desc="Korrektur markierter Segmente",
         )
 
-        # Temperaturen: erster Versuch konservativer (0.3), dann lockerer
-        temperatures: tuple[float, ...] = (0.3, 0.45, 0.6)
+        # Temperaturen: erster Versuch konservativer (0.4), dann lockerer
+        temperatures: tuple[float, ...] = (0.4, 0.45, 0.6)
 
         CLIFFHANGER_ENDINGS: tuple[str, ...] = (
             "dass.", "weil.", "und.", "oder.", "aber.", "denn.",
@@ -4670,11 +4506,10 @@ OUTPUT FORMAT
                             ],
                             options={
                                 "temperature": current_temperature,
-                                "num_ctx": 6144,       # erhöht für Few-Shot
-                                "num_gpu": 33,         # RTX 4050 ~70 %
-                                "num_thread": 6,
+                                "num_ctx": 8192,       # erhöht für Few-Shot
+                                "num_gpu": -1,         # RTX 5070Ti ~70 %
+                                "num_thread": 16,
                                 "main_gpu": 0,
-                                "tensorsplit": [1.0],
                                 "use_mmap": True,
                                 "use_mlock": False,
                             },
@@ -4738,7 +4573,7 @@ OUTPUT FORMAT
                             embeddings_source[i : i + 1], new_embedding
                         ).item()
 
-                        if new_similarity > best_similarity + 0.002:
+                        if new_similarity >= best_similarity - 0.001:
                             tqdm.write(
                                 f"  Bessere Version gefunden: "
                                 f"{best_similarity:.3f} → {new_similarity:.3f}"
@@ -5215,12 +5050,11 @@ OUTPUT FORMAT
                         {"role": "user", "content": user_prompt},
                     ],
                     options={
-                        "temperature": 0.4,
-                        "num_ctx": 6144,       # erhöht für Few-Shot-Prompt
-                        "num_gpu": 33,
-                        "num_thread": 6,
+                        "temperature": 0.45,
+                        "num_ctx": 8192,       # erhöht für Few-Shot-Prompt
+                        "num_gpu": -1,
+                        "num_thread": 16,
                         "main_gpu": 0,
-                        "tensorsplit": [1.0],
                         "use_mmap": True,
                         "use_mlock": False,
                     },
@@ -7539,7 +7373,7 @@ def text_to_speech_with_voice_cloning_omnivoice(
 
     # ref_text=None → OmniVoice transkribiert intern via eingebautem Whisper-ASR.
     # Für deterministischere Ergebnisse kann hier ein String übergeben werden.
-    ref_text: Optional[str] = "Drei weiße Eulen bauen heute ein neues Haus auf dem hohen Baum, während die Sonne scheint."
+    ref_text: Optional[str] = None #"Drei weiße Eulen bauen heute ein neues Haus auf dem hohen Baum, während die Sonne scheint."
 
     # ── SCHRITT 4: Synthese-Schleife ──────────────────────────────────────────
     with gpu_context():
@@ -7555,11 +7389,7 @@ def text_to_speech_with_voice_cloning_omnivoice(
             # VRAM ~3.3 GB: OmniVoice BF16 laden
             omnivoice_model = load_omnivoice()
 
-            print(
-                f"✅ OmniVoice geladen "
-                f"(dtype=bfloat16, num_steps={OMNIVOICE_NUM_STEPS}, "
-                f"speed={OMNIVOICE_SPEED})"
-            )
+            print(f"✅ OmniVoice geladen ")
             print(f"🎤 Referenz-Audio: {Path(ref_audio_path).name}")
 
             # Synthese der einzelnen Segmente
@@ -7574,9 +7404,9 @@ def text_to_speech_with_voice_cloning_omnivoice(
                             text=segment_info["text"],
                             ref_audio=ref_audio_path,  # ersetzt gpt_cond_latent + speaker_embedding
                             ref_text=ref_text,          # None = internes Whisper-ASR
-                            num_step=OMNIVOICE_NUM_STEPS,
-                            speed=OMNIVOICE_SPEED,
-                            language=OMNIVOICE_LANGUAGE,
+                            num_step=50,                # Standard: 50 Schritte (kürzere Texte können mit weniger auskommen)
+                            speed=None,                   # Standard: 1.0 (kann je nach Textlänge angepasst werden)
+                            language="de",
                         )
 
                     print(
@@ -8191,7 +8021,7 @@ def combine_video_audio_ffmpeg(adjusted_video_path, translated_audio_path, final
 # ==============================================================================
 
 # Setzen Sie diese Flags, um Schritte gezielt zu überspringen
-USE_GGUF =                  False        # Ob GGUF-optimierte Modelle verwendet werden sollen
+XTTS =                      False       # Wenn True, wird die XTTS-Synthese ausgeführt; wenn False, wird sie übersprungen 
 EXECUTE_AUDIO_EXTRACTION =  True        # Schritt 1: Audio-Extraktion
 EXECUTE_TRANSCRIPTION =     True        # Schritte 2 & 3: Transkription und Veredelung
 EXECUTE_TRANSLATION =       True        # Schritt 4: Übersetzung & Hypothesen-Auswahl
@@ -8287,26 +8117,16 @@ def main():
         if EXECUTE_TRANSLATION:
             # SCHRITT 3: ÜBERSETZUNG
             if os.path.exists(REFINED_TRANSCRIPTION_FILE) or ask_overwrite(REFINED_TRANSCRIPTION_FILE):
-                if USE_GGUF:
-                    translate_segments_optimized_safe_hf(
-                        refined_transcription_path=REFINED_TRANSCRIPTION_FILE,
-                        master_entity_map=master_entity_map_en,
-                        translation_output_file=TRANSLATION_FILE,
-                        cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
-                        source_lang=source_lang,
-                        target_lang=target_lang
-                    )
-                else:
-                    translate_segments_optimized_safe(
-                        refined_transcription_path=REFINED_TRANSCRIPTION_FILE,
-                        master_entity_map=master_entity_map_en,
-                        translation_output_file=TRANSLATION_FILE,
-                        cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
-                        source_lang=source_lang,
-                        target_lang=target_lang,
-                        num_hypotheses=7,
-                        batch_size=1
-                    )
+                translate_segments_optimized_safe(
+                    refined_transcription_path=REFINED_TRANSCRIPTION_FILE,
+                    master_entity_map=master_entity_map_en,
+                    translation_output_file=TRANSLATION_FILE,
+                    cleaned_source_output_file=CLEANED_SOURCE_FOR_QUALITY_CHECK,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    num_hypotheses=10,
+                    batch_size=8
+                )
             else:
                 logger.warning(f'Skipping Übersetzung: {REFINED_TRANSCRIPTION_FILE} nicht gefunden.')
 
@@ -8358,7 +8178,7 @@ def main():
                 output_csv_path=POLISHED_TRANSLATION_CSV,
                 summary_path=POLISHED_TRANSLATION_SUMMARY,
                 model_name=ST_BETTER_MODEL,
-                llm_model_name=QWEN3,
+                llm_model_name=QWEN3_8,
                 skip_threshold=SIMILARITY_THRESHOLD_POLISHING
             )
 
@@ -8375,7 +8195,7 @@ def main():
                 output_file=REFINED_TRANSLATION_FILE,
                 model_name="de_dep_news_trf",
                 lang_code='de-DE',
-                tokenizer_path="madlad400-7b-mt-int8",
+                tokenizer_path="madlad400-3b-mt-bfloat16",
                 min_words=20,
                 language='de',
                 enable_grammar_correction=False
@@ -8397,17 +8217,28 @@ def main():
             time.sleep(2)
 
         if EXECUTE_TTS:
-            print(f"Flash Attention 2 verfügbar: {is_flash_attn_2_available()}")
-            text_to_speech_with_voice_cloning(
-                TTS_FORMATTED_TRANSLATION_FILE,
-                #SAMPLE_PATH_1,
-                #SAMPLE_PATH_2,
-                SAMPLE_PATH_3,
-                #SAMPLE_PATH_4,
-                #SAMPLE_PATH_5,
-                #SAMPLE_PATH_6,
-                TRANSLATED_AUDIO_WITH_PAUSES
-            )
+            if XTTS:
+                text_to_speech_with_voice_cloning(
+                    TTS_FORMATTED_TRANSLATION_FILE,
+                    SAMPLE_PATH_1,
+                    SAMPLE_PATH_2,
+                    SAMPLE_PATH_3,
+                    #SAMPLE_PATH_4,
+                    #SAMPLE_PATH_5,
+                    #SAMPLE_PATH_6,
+                    TRANSLATED_AUDIO_WITH_PAUSES
+                )
+            else:
+                text_to_speech_with_voice_cloning_omnivoice(
+                    TTS_FORMATTED_TRANSLATION_FILE,
+                    #SAMPLE_PATH_1,
+                    #SAMPLE_PATH_2,
+                    #SAMPLE_PATH_3,
+                    SAMPLE_PATH_4,
+                    #SAMPLE_PATH_5,
+                    #SAMPLE_PATH_6,
+                    TRANSLATED_AUDIO_WITH_PAUSES
+                )
 
             clear_spacy_cache_and_free_vram()
             time.sleep(2)
